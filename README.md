@@ -137,19 +137,6 @@ The SQLite store keeps four main record types:
 - `contradictions`
   Resolution logs for stale or replaced assumptions
 
-## Publishing Notes
-
-The plugin source is safe to publish as code.
-
-Do not publish your live Hermes profile files such as:
-
-- `~/.hermes/config.yaml`
-- `~/.hermes/.env`
-- `~/.hermes/consolidating_memory.db`
-- backup config files created during local installation
-
-Those may contain local endpoints, credentials, or extracted private memory.
-
 ## Development
 
 Quick syntax check:
