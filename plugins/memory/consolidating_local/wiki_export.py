@@ -280,7 +280,7 @@ def _render_preferences_index(
     ]
     if preferences:
         for item in preferences:
-            session_id = str(dict(item.get("metadata") or {}).get("session_id") or "")
+            session_id = str(item.get("source_session_id") or dict(item.get("metadata") or {}).get("session_id") or "")
             session_suffix = ""
             if session_id and session_id in session_paths:
                 session_suffix = f" ({_bullet_link(session_id, session_paths[session_id], from_rel=rel)})"
@@ -305,7 +305,7 @@ def _render_policies_index(
     ]
     if policies:
         for item in policies:
-            session_id = str(dict(item.get("metadata") or {}).get("session_id") or "")
+            session_id = str(item.get("source_session_id") or dict(item.get("metadata") or {}).get("session_id") or "")
             session_suffix = ""
             if session_id and session_id in session_paths:
                 session_suffix = f" ({_bullet_link(session_id, session_paths[session_id], from_rel=rel)})"

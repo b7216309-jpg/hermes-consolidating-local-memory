@@ -325,6 +325,7 @@ class MemoryStore:
                 value TEXT NOT NULL,
                 content TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
+                source_session_id TEXT NOT NULL DEFAULT '',
                 importance INTEGER NOT NULL DEFAULT 8,
                 salience REAL NOT NULL DEFAULT 0.9,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
@@ -340,6 +341,7 @@ class MemoryStore:
                 label TEXT NOT NULL,
                 content TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
+                source_session_id TEXT NOT NULL DEFAULT '',
                 importance INTEGER NOT NULL DEFAULT 9,
                 salience REAL NOT NULL DEFAULT 0.95,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
@@ -389,7 +391,14 @@ class MemoryStore:
         self._ensure_column("topics", "source_session_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("topics", "last_recalled_at", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("topics", "decay_half_life_days", "REAL NOT NULL DEFAULT 60")
+        self._ensure_column("memory_preferences", "source_session_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("memory_policies", "source_session_id", "TEXT NOT NULL DEFAULT ''")
         self._execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(source_session_id, updated_at DESC)")
+        self._execute("CREATE INDEX IF NOT EXISTS idx_memory_preferences_session ON memory_preferences(source_session_id, updated_at DESC)")
+        self._execute("CREATE INDEX IF NOT EXISTS idx_memory_policies_session ON memory_policies(source_session_id, updated_at DESC)")
+        self._backfill_source_sessions("memory_preferences")
+        self._backfill_source_sessions("memory_policies")
+        self._backfill_memory_sessions()
         self._init_fts()
 
     def _init_fts(self) -> None:
@@ -429,6 +438,43 @@ class MemoryStore:
         if column in existing:
             return
         self._execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+    def _backfill_source_sessions(self, table: str) -> None:
+        rows = self._fetchall(
+            f"""
+            SELECT id, metadata_json
+            FROM {table}
+            WHERE COALESCE(source_session_id, '') = ''
+            """
+        )
+        for row in rows:
+            metadata = dict(row.get("metadata") or {})
+            session_id = normalize_whitespace(str(metadata.get("session_id") or ""))
+            if not session_id:
+                continue
+            self._execute(
+                f"UPDATE {table} SET source_session_id = ? WHERE id = ?",
+                (session_id, int(row["id"])),
+            )
+
+    def _backfill_memory_sessions(self) -> None:
+        session_ids = set()
+        queries = [
+            "SELECT DISTINCT source_session_id AS session_id FROM facts WHERE COALESCE(source_session_id, '') != ''",
+            "SELECT DISTINCT source_session_id AS session_id FROM memory_preferences WHERE COALESCE(source_session_id, '') != ''",
+            "SELECT DISTINCT source_session_id AS session_id FROM memory_policies WHERE COALESCE(source_session_id, '') != ''",
+            "SELECT DISTINCT session_id FROM memory_traces WHERE COALESCE(session_id, '') != ''",
+            "SELECT DISTINCT session_id FROM memory_journals WHERE COALESCE(session_id, '') != ''",
+            "SELECT DISTINCT session_id FROM memory_summaries WHERE COALESCE(session_id, '') != ''",
+            "SELECT DISTINCT session_id FROM episodes WHERE COALESCE(session_id, '') != ''",
+        ]
+        for sql in queries:
+            for row in self._fetchall(sql):
+                session_id = normalize_whitespace(str(row.get("session_id") or ""))
+                if session_id:
+                    session_ids.add(session_id)
+        for session_id in sorted(session_ids):
+            self.ensure_memory_session(session_id, label=session_id)
 
     def get_state(self, key: str, default: str = "") -> str:
         row = self._fetchone("SELECT value FROM provider_state WHERE key = ?", (key,))
@@ -616,6 +662,7 @@ class MemoryStore:
 
     def get_session_artifacts(self, session_id: str, *, limit: int = 20) -> Dict[str, Any]:
         clean_id = normalize_whitespace(session_id)
+        like_session = f'%\"session_id\": \"{clean_id}\"%'
         return {
             "session": self._fetchone("SELECT * FROM memory_sessions WHERE session_id = ?", (clean_id,)) or {},
             "episodes": self._fetchall(
@@ -660,27 +707,29 @@ class MemoryStore:
             ),
             "preferences": self._fetchall(
                 """
-                SELECT id, preference_key, label, value, content, importance, salience, updated_at
+                SELECT id, preference_key, label, value, content, source_session_id, importance, salience, updated_at
                 FROM memory_preferences
-                WHERE active = 1 AND metadata_json LIKE ?
+                WHERE active = 1
+                  AND (source_session_id = ? OR (source_session_id = '' AND metadata_json LIKE ?))
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (f'%\"session_id\": \"{clean_id}\"%', int(limit)),
+                (clean_id, like_session, int(limit)),
             ),
             "policies": self._fetchall(
                 """
-                SELECT id, policy_key, label, content, importance, salience, updated_at
+                SELECT id, policy_key, label, content, source_session_id, importance, salience, updated_at
                 FROM memory_policies
-                WHERE active = 1 AND metadata_json LIKE ?
+                WHERE active = 1
+                  AND (source_session_id = ? OR (source_session_id = '' AND metadata_json LIKE ?))
                 ORDER BY updated_at DESC
                 LIMIT ?
                 """,
-                (f'%\"session_id\": \"{clean_id}\"%', int(limit)),
+                (clean_id, like_session, int(limit)),
             ),
             "facts": self._fetchall(
                 """
-                SELECT id, content, category, topic, importance, salience, updated_at, subject_key, value_key
+                SELECT id, content, category, topic, importance, salience, updated_at, subject_key, value_key, source_session_id
                 FROM facts
                 WHERE source_session_id = ? AND active = 1
                 ORDER BY updated_at DESC
@@ -715,7 +764,7 @@ class MemoryStore:
     def list_preferences(self, *, limit: int = 100) -> List[Dict[str, Any]]:
         return self._fetchall(
             """
-            SELECT id, preference_key, label, value, content, metadata_json, importance, salience, updated_at
+            SELECT id, preference_key, label, value, content, metadata_json, source_session_id, importance, salience, updated_at
             FROM memory_preferences
             WHERE active = 1
             ORDER BY salience DESC, importance DESC, updated_at DESC, preference_key ASC
@@ -727,7 +776,7 @@ class MemoryStore:
     def list_policies(self, *, limit: int = 100) -> List[Dict[str, Any]]:
         return self._fetchall(
             """
-            SELECT id, policy_key, label, content, metadata_json, importance, salience, updated_at
+            SELECT id, policy_key, label, content, metadata_json, source_session_id, importance, salience, updated_at
             FROM memory_policies
             WHERE active = 1
             ORDER BY salience DESC, importance DESC, updated_at DESC, policy_key ASC
@@ -1029,11 +1078,16 @@ class MemoryStore:
         now = now_ts()
         existing = self._fetchone("SELECT * FROM memory_preferences WHERE preference_key = ?", (pref_key,))
         meta = _merge_json_dict(existing.get("metadata") if existing else {}, metadata)
+        source_session_id = normalize_whitespace(
+            str(meta.get("session_id") or (existing.get("source_session_id") if existing else "") or "")
+        )
+        if source_session_id:
+            self.ensure_memory_session(source_session_id)
         if existing:
             self._execute(
                 """
                 UPDATE memory_preferences
-                SET label = ?, value = ?, content = ?, metadata_json = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
+                SET label = ?, value = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
                 WHERE preference_key = ?
                 """,
                 (
@@ -1041,6 +1095,7 @@ class MemoryStore:
                     pref_value,
                     pref_content,
                     json.dumps(meta, sort_keys=True),
+                    source_session_id,
                     int(importance),
                     float(salience),
                     now,
@@ -1052,8 +1107,8 @@ class MemoryStore:
         else:
             cur = self._execute(
                 """
-                INSERT INTO memory_preferences(preference_key, label, value, content, metadata_json, importance, salience, last_recalled_at, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                INSERT INTO memory_preferences(preference_key, label, value, content, metadata_json, source_session_id, importance, salience, last_recalled_at, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                 """,
                 (
                     pref_key,
@@ -1061,6 +1116,7 @@ class MemoryStore:
                     pref_value,
                     pref_content,
                     json.dumps(meta, sort_keys=True),
+                    source_session_id,
                     int(importance),
                     float(salience),
                     now,
@@ -1071,6 +1127,8 @@ class MemoryStore:
             action = "inserted"
         row = self._fetchone("SELECT * FROM memory_preferences WHERE id = ?", (pref_id,)) or {}
         self._upsert_preference_fts(row)
+        if source_session_id:
+            self.add_link("preference", pref_id, "session", source_session_id, "captured_in")
         self.record_history(
             entity_kind="preference",
             entity_id=pref_id,
@@ -1101,17 +1159,23 @@ class MemoryStore:
         now = now_ts()
         existing = self._fetchone("SELECT * FROM memory_policies WHERE policy_key = ?", (policy_key,))
         meta = _merge_json_dict(existing.get("metadata") if existing else {}, metadata)
+        source_session_id = normalize_whitespace(
+            str(meta.get("session_id") or (existing.get("source_session_id") if existing else "") or "")
+        )
+        if source_session_id:
+            self.ensure_memory_session(source_session_id)
         if existing:
             self._execute(
                 """
                 UPDATE memory_policies
-                SET label = ?, content = ?, metadata_json = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
+                SET label = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
                 WHERE policy_key = ?
                 """,
                 (
                     policy_label,
                     clean_content,
                     json.dumps(meta, sort_keys=True),
+                    source_session_id,
                     int(importance),
                     float(salience),
                     now,
@@ -1123,14 +1187,15 @@ class MemoryStore:
         else:
             cur = self._execute(
                 """
-                INSERT INTO memory_policies(policy_key, label, content, metadata_json, importance, salience, last_recalled_at, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                INSERT INTO memory_policies(policy_key, label, content, metadata_json, source_session_id, importance, salience, last_recalled_at, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
                 """,
                 (
                     policy_key,
                     policy_label,
                     clean_content,
                     json.dumps(meta, sort_keys=True),
+                    source_session_id,
                     int(importance),
                     float(salience),
                     now,
@@ -1141,6 +1206,8 @@ class MemoryStore:
             action = "inserted"
         row = self._fetchone("SELECT * FROM memory_policies WHERE id = ?", (policy_id,)) or {}
         self._upsert_policy_fts(row)
+        if source_session_id:
+            self.add_link("policy", policy_id, "session", source_session_id, "captured_in")
         self.record_history(
             entity_kind="policy",
             entity_id=policy_id,
@@ -1353,6 +1420,8 @@ class MemoryStore:
         polarity = -1 if str(meta.get("polarity", 1)).strip() in {"-1", "false", "neg"} else 1
         exclusive = 1 if subject_key and bool(meta.get("exclusive")) else 0
         source_session = normalize_whitespace(source_session_id or str(meta.get("source_session_id") or ""))
+        if source_session:
+            self.ensure_memory_session(source_session)
         salience_value = float(salience if salience is not None else self._default_fact_salience(category, meta))
         half_life = float(
             decay_half_life_days if decay_half_life_days is not None else self._default_fact_half_life(category, meta)
@@ -2145,7 +2214,7 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT p.id, p.preference_key, p.label, p.value, p.content, p.importance, p.salience, p.updated_at
+                    SELECT p.id, p.preference_key, p.label, p.value, p.content, p.source_session_id, p.importance, p.salience, p.updated_at
                     FROM memory_preferences_fts idx
                     JOIN memory_preferences p ON p.id = idx.preference_id
                     WHERE memory_preferences_fts MATCH ?
@@ -2161,7 +2230,7 @@ class MemoryStore:
         active_sql = "" if include_inactive else "AND active = 1"
         return self._fetchall(
             f"""
-            SELECT id, preference_key, label, value, content, importance, salience, updated_at
+            SELECT id, preference_key, label, value, content, source_session_id, importance, salience, updated_at
             FROM memory_preferences
             WHERE (preference_key LIKE ? OR label LIKE ? OR value LIKE ? OR content LIKE ?)
               {active_sql}
@@ -2177,7 +2246,7 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT p.id, p.policy_key, p.label, p.content, p.importance, p.salience, p.updated_at
+                    SELECT p.id, p.policy_key, p.label, p.content, p.source_session_id, p.importance, p.salience, p.updated_at
                     FROM memory_policies_fts idx
                     JOIN memory_policies p ON p.id = idx.policy_id
                     WHERE memory_policies_fts MATCH ?
@@ -2193,7 +2262,7 @@ class MemoryStore:
         active_sql = "" if include_inactive else "AND active = 1"
         return self._fetchall(
             f"""
-            SELECT id, policy_key, label, content, importance, salience, updated_at
+            SELECT id, policy_key, label, content, source_session_id, importance, salience, updated_at
             FROM memory_policies
             WHERE (policy_key LIKE ? OR label LIKE ? OR content LIKE ?)
               {active_sql}
@@ -2291,6 +2360,7 @@ class MemoryStore:
 
     def apply_decay(self, *, half_life_days: float, min_salience: float) -> Dict[str, Any]:
         now = now_ts()
+        last_decay_at = float(self.get_state("last_decay_at", "0") or 0)
         half_life = max(float(half_life_days), 0.01)
         threshold = max(float(min_salience), 0.0)
         stats = {
@@ -2314,7 +2384,12 @@ class MemoryStore:
             WHERE active = 1
             """
         ):
-            anchor = max(float(row.get("updated_at") or 0), float(row.get("last_seen_at") or 0), float(row.get("last_recalled_at") or 0))
+            anchor = max(
+                float(row.get("updated_at") or 0),
+                float(row.get("last_seen_at") or 0),
+                float(row.get("last_recalled_at") or 0),
+                last_decay_at,
+            )
             age_days = max((now - anchor) / 86400.0, 0.0)
             item_half_life = max(float(row.get("decay_half_life_days") or half_life), 0.01)
             next_salience = max(0.01, float(row.get("salience") or 0.0) * math.pow(0.5, age_days / item_half_life))
@@ -2324,15 +2399,15 @@ class MemoryStore:
                 if self.deactivate_fact(int(row["id"]), reason="decay", source="decay"):
                     stats["facts_deactivated"] += 1
 
-        stats["topics_decayed"] = self._decay_table("topics", now=now, half_life=half_life, threshold=threshold)
-        journal_stats = self._decay_table("memory_journals", now=now, half_life=half_life, threshold=threshold, deactivate=True, max_keep_importance=5)
-        trace_stats = self._decay_table("memory_traces", now=now, half_life=half_life, threshold=threshold, deactivate=True, max_keep_importance=4)
-        summary_stats = self._decay_table("memory_summaries", now=now, half_life=half_life, threshold=threshold, deactivate=True, max_keep_importance=5)
+        stats["topics_decayed"] = self._decay_table("topics", now=now, half_life=half_life, threshold=threshold, last_decay_at=last_decay_at)
+        journal_stats = self._decay_table("memory_journals", now=now, half_life=half_life, threshold=threshold, last_decay_at=last_decay_at, deactivate=True, max_keep_importance=5)
+        trace_stats = self._decay_table("memory_traces", now=now, half_life=half_life, threshold=threshold, last_decay_at=last_decay_at, deactivate=True, max_keep_importance=4)
+        summary_stats = self._decay_table("memory_summaries", now=now, half_life=half_life, threshold=threshold, last_decay_at=last_decay_at, deactivate=True, max_keep_importance=5)
         stats["journals_decayed"], stats["journals_deactivated"] = journal_stats
         stats["traces_decayed"], stats["traces_deactivated"] = trace_stats
         stats["summaries_decayed"], stats["summaries_deactivated"] = summary_stats
-        stats["preferences_decayed"] = self._decay_table("memory_preferences", now=now, half_life=max(half_life * 2.0, 1.0), threshold=0.0)
-        stats["policies_decayed"] = self._decay_table("memory_policies", now=now, half_life=max(half_life * 3.0, 1.0), threshold=0.0)
+        stats["preferences_decayed"] = self._decay_table("memory_preferences", now=now, half_life=max(half_life * 2.0, 1.0), threshold=0.0, last_decay_at=last_decay_at)
+        stats["policies_decayed"] = self._decay_table("memory_policies", now=now, half_life=max(half_life * 3.0, 1.0), threshold=0.0, last_decay_at=last_decay_at)
         self.set_state("last_decay_at", now)
         self.set_state("last_decay_stats", json.dumps(stats, sort_keys=True))
         return stats
@@ -2344,6 +2419,7 @@ class MemoryStore:
         now: float,
         half_life: float,
         threshold: float,
+        last_decay_at: float,
         deactivate: bool = False,
         max_keep_importance: int = 0,
     ) -> int | tuple[int, int]:
@@ -2360,7 +2436,7 @@ class MemoryStore:
         changed = 0
         deactivated = 0
         for row in rows:
-            anchor = max(float(row.get("updated_at") or 0), float(row.get("last_recalled_at") or 0))
+            anchor = max(float(row.get("updated_at") or 0), float(row.get("last_recalled_at") or 0), float(last_decay_at or 0))
             age_days = max((now - anchor) / 86400.0, 0.0)
             next_salience = max(0.01, float(row.get("salience") or 0.0) * math.pow(0.5, age_days / max(half_life, 0.01)))
             self._execute(f"UPDATE {table} SET salience = ? WHERE id = ?", (next_salience, int(row["id"])))

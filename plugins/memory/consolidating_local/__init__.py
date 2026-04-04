@@ -1132,7 +1132,28 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not content:
             return
         if action == "remove":
-            self._store.deactivate_matching(content, limit=10)
+            clean = normalize_whitespace(content)
+            self._store.deactivate_matching(clean, limit=10)
+            if target == "user":
+                matches = self._store.search(clean, scope="preferences", limit=10).get("preferences", [])
+                for row in matches:
+                    values = {
+                        normalize_whitespace(str(row.get("content") or "")),
+                        normalize_whitespace(str(row.get("label") or "")),
+                        normalize_whitespace(str(row.get("value") or "")),
+                    }
+                    if clean not in values or row.get("id") is None:
+                        continue
+                    self._store.deactivate_memory_item(
+                        "preference",
+                        int(row["id"]),
+                        reason="mirror_memory_remove",
+                        source="builtin_memory",
+                    )
+            self._store.rebuild_topics(
+                max_facts=self._cfg()["max_topic_facts"],
+                max_chars=self._cfg()["topic_summary_chars"],
+            )
         else:
             category = "user_pref" if target == "user" else "workflow"
             topic = "user-profile" if target == "user" else "builtin-memory"

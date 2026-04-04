@@ -108,6 +108,34 @@ class ConsolidatingLocalMemoryTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_store_backfills_missing_memory_sessions_from_existing_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "memory.db"
+            store = MemoryStore(db_path=db_path)
+            try:
+                store.upsert_fact(
+                    content="Project uses SQLite.",
+                    category="project",
+                    topic="database",
+                    source="test",
+                    importance=6,
+                    confidence=0.8,
+                    source_session_id="orphan-session",
+                )
+                store._execute("DELETE FROM memory_sessions WHERE session_id = ?", ("orphan-session",))
+            finally:
+                store.close()
+
+            reopened = MemoryStore(db_path=db_path)
+            try:
+                session = reopened._fetchone(
+                    "SELECT session_id FROM memory_sessions WHERE session_id = ?",
+                    ("orphan-session",),
+                )
+                self.assertIsNotNone(session)
+            finally:
+                reopened.close()
+
     def test_lifecycle_creates_traces_summaries_history_and_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             provider = self.make_provider(tmpdir)
@@ -276,6 +304,122 @@ class ConsolidatingLocalMemoryTests(unittest.TestCase):
                 self.assertTrue(store.get_state("last_decay_at", ""))
             finally:
                 provider.shutdown()
+
+    def test_session_scoped_tool_writes_create_real_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = self.make_provider(tmpdir)
+            try:
+                remember_fact = json.loads(
+                    provider.handle_tool_call(
+                        "consolidating_memory",
+                        {
+                            "action": "remember",
+                            "content": "Project uses Redis.",
+                            "category": "project",
+                            "topic": "infra",
+                            "session_id": "fact-session",
+                        },
+                    )
+                )
+                remember_pref = json.loads(
+                    provider.handle_tool_call(
+                        "consolidating_memory",
+                        {
+                            "action": "remember",
+                            "memory_type": "preference",
+                            "label": "Tone",
+                            "value": "Concise",
+                            "session_id": "pref-session",
+                        },
+                    )
+                )
+                policy = json.loads(
+                    provider.handle_tool_call(
+                        "consolidating_memory",
+                        {
+                            "action": "policy",
+                            "key": "retention",
+                            "label": "Retention",
+                            "content": "Keep summaries.",
+                            "session_id": "policy-session",
+                        },
+                    )
+                )
+                self.assertTrue(remember_fact["success"])
+                self.assertTrue(remember_pref["success"])
+                self.assertTrue(policy["success"])
+
+                store = provider._store
+                assert store is not None
+                session_rows = store._fetchall("SELECT session_id FROM memory_sessions ORDER BY session_id ASC")
+                self.assertEqual(
+                    [row["session_id"] for row in session_rows],
+                    ["fact-session", "policy-session", "pref-session", "test-session"],
+                )
+                fact_artifacts = store.get_session_artifacts("fact-session")
+                pref_artifacts = store.get_session_artifacts("pref-session")
+                policy_artifacts = store.get_session_artifacts("policy-session")
+                self.assertEqual(len(fact_artifacts["facts"]), 1)
+                self.assertEqual(fact_artifacts["facts"][0]["source_session_id"], "fact-session")
+                self.assertEqual(len(pref_artifacts["preferences"]), 1)
+                self.assertEqual(pref_artifacts["preferences"][0]["source_session_id"], "pref-session")
+                self.assertEqual(len(policy_artifacts["policies"]), 1)
+                self.assertEqual(policy_artifacts["policies"][0]["source_session_id"], "policy-session")
+            finally:
+                provider.shutdown()
+
+    def test_mirror_remove_rebuilds_topics_and_preferences(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            provider = self.make_provider(tmpdir)
+            try:
+                provider.on_memory_write("write", "user", "User likes jasmine tea.")
+                flush_provider(provider)
+
+                store = provider._store
+                assert store is not None
+                self.assertEqual(store.counts()["topics"], 1)
+                self.assertEqual(store.counts()["preferences"], 1)
+
+                provider.on_memory_write("remove", "user", "User likes jasmine tea.")
+                flush_provider(provider)
+
+                counts = store.counts()
+                self.assertEqual(counts["facts"], 0)
+                self.assertEqual(counts["topics"], 0)
+                self.assertEqual(counts["preferences"], 0)
+            finally:
+                provider.shutdown()
+
+    def test_decay_uses_incremental_anchor_instead_of_compounding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = MemoryStore(db_path=Path(tmpdir) / "memory.db")
+            try:
+                observed_at = time.time() - (10 * 86400)
+                store.upsert_fact(
+                    content="Temporary note about a minor detail.",
+                    category="general",
+                    topic="notes",
+                    source="test",
+                    importance=3,
+                    confidence=0.5,
+                    observed_at=observed_at,
+                    salience=1.0,
+                    decay_half_life_days=10,
+                )
+
+                first = store.apply_decay(half_life_days=10, min_salience=0.0)
+                self.assertEqual(first["facts_decayed"], 1)
+                first_salience = float(store._fetchone("SELECT salience FROM facts WHERE id = 1")["salience"])
+
+                second = store.apply_decay(half_life_days=10, min_salience=0.0)
+                self.assertEqual(second["facts_decayed"], 1)
+                second_salience = float(store._fetchone("SELECT salience FROM facts WHERE id = 1")["salience"])
+
+                self.assertGreater(first_salience, 0.45)
+                self.assertLess(first_salience, 0.55)
+                self.assertGreater(second_salience, first_salience * 0.95)
+            finally:
+                store.close()
 
     def test_blank_scoped_search_and_forget_are_safe(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
