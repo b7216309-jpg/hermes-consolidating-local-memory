@@ -114,6 +114,29 @@ def _merge_json_dict(existing: Any, update: Dict[str, Any] | None) -> Dict[str, 
     return merged
 
 
+def _first_review_offset_seconds(review_intervals_days: Sequence[float] | None) -> float:
+    if not review_intervals_days:
+        return 86400.0
+    for value in review_intervals_days:
+        try:
+            clean = float(value)
+        except Exception:
+            continue
+        if clean > 0:
+            return clean * 86400.0
+    return 86400.0
+
+
+def _next_review_offset_seconds(review_count: int, review_intervals_days: Sequence[float] | None) -> float:
+    if not review_intervals_days:
+        return 86400.0
+    clean_intervals = [float(value) for value in review_intervals_days if float(value) > 0]
+    if not clean_intervals:
+        return 86400.0
+    index = max(0, min(int(review_count), len(clean_intervals) - 1))
+    return clean_intervals[index] * 86400.0
+
+
 class MemoryStore:
     SEARCH_SCOPES = (
         "facts",
@@ -178,6 +201,9 @@ class MemoryStore:
                 exclusive INTEGER NOT NULL DEFAULT 0,
                 source_session_id TEXT NOT NULL DEFAULT '',
                 last_recalled_at REAL NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                next_review_at REAL NOT NULL DEFAULT 0,
+                reconsolidation_until REAL NOT NULL DEFAULT 0,
                 decay_half_life_days REAL NOT NULL DEFAULT 45,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
@@ -291,6 +317,9 @@ class MemoryStore:
                 importance INTEGER NOT NULL DEFAULT 6,
                 salience REAL NOT NULL DEFAULT 0.6,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                next_review_at REAL NOT NULL DEFAULT 0,
+                reconsolidation_until REAL NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -310,6 +339,9 @@ class MemoryStore:
                 importance INTEGER NOT NULL DEFAULT 7,
                 salience REAL NOT NULL DEFAULT 0.65,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                next_review_at REAL NOT NULL DEFAULT 0,
+                reconsolidation_until REAL NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -329,6 +361,9 @@ class MemoryStore:
                 importance INTEGER NOT NULL DEFAULT 8,
                 salience REAL NOT NULL DEFAULT 0.9,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                next_review_at REAL NOT NULL DEFAULT 0,
+                reconsolidation_until REAL NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -345,6 +380,9 @@ class MemoryStore:
                 importance INTEGER NOT NULL DEFAULT 9,
                 salience REAL NOT NULL DEFAULT 0.95,
                 last_recalled_at REAL NOT NULL DEFAULT 0,
+                review_count INTEGER NOT NULL DEFAULT 0,
+                next_review_at REAL NOT NULL DEFAULT 0,
+                reconsolidation_until REAL NOT NULL DEFAULT 0,
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -386,19 +424,35 @@ class MemoryStore:
         self._ensure_column("facts", "salience", "REAL NOT NULL DEFAULT 0.55")
         self._ensure_column("facts", "source_session_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("facts", "last_recalled_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("facts", "review_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("facts", "next_review_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("facts", "reconsolidation_until", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("facts", "decay_half_life_days", "REAL NOT NULL DEFAULT 45")
         self._ensure_column("topics", "salience", "REAL NOT NULL DEFAULT 0.55")
         self._ensure_column("topics", "source_session_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("topics", "last_recalled_at", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("topics", "decay_half_life_days", "REAL NOT NULL DEFAULT 60")
+        self._ensure_column("memory_journals", "review_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("memory_journals", "next_review_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("memory_journals", "reconsolidation_until", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("memory_summaries", "review_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("memory_summaries", "next_review_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("memory_summaries", "reconsolidation_until", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("memory_preferences", "source_session_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("memory_preferences", "review_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("memory_preferences", "next_review_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("memory_preferences", "reconsolidation_until", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("memory_policies", "source_session_id", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("memory_policies", "review_count", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("memory_policies", "next_review_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("memory_policies", "reconsolidation_until", "REAL NOT NULL DEFAULT 0")
         self._execute("CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(source_session_id, updated_at DESC)")
         self._execute("CREATE INDEX IF NOT EXISTS idx_memory_preferences_session ON memory_preferences(source_session_id, updated_at DESC)")
         self._execute("CREATE INDEX IF NOT EXISTS idx_memory_policies_session ON memory_policies(source_session_id, updated_at DESC)")
         self._backfill_source_sessions("memory_preferences")
         self._backfill_source_sessions("memory_policies")
         self._backfill_memory_sessions()
+        self._backfill_review_schedule()
         self._init_fts()
 
     def _init_fts(self) -> None:
@@ -475,6 +529,23 @@ class MemoryStore:
                     session_ids.add(session_id)
         for session_id in sorted(session_ids):
             self.ensure_memory_session(session_id, label=session_id)
+
+    def _backfill_review_schedule(self) -> None:
+        default_offset = _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0))
+        tables = {
+            "facts": "SELECT id, COALESCE(last_seen_at, updated_at, created_at, 0) AS anchor FROM facts WHERE COALESCE(next_review_at, 0) <= 0",
+            "memory_journals": "SELECT id, COALESCE(updated_at, created_at, 0) AS anchor FROM memory_journals WHERE COALESCE(next_review_at, 0) <= 0",
+            "memory_summaries": "SELECT id, COALESCE(updated_at, created_at, 0) AS anchor FROM memory_summaries WHERE COALESCE(next_review_at, 0) <= 0",
+            "memory_preferences": "SELECT id, COALESCE(updated_at, created_at, 0) AS anchor FROM memory_preferences WHERE COALESCE(next_review_at, 0) <= 0",
+            "memory_policies": "SELECT id, COALESCE(updated_at, created_at, 0) AS anchor FROM memory_policies WHERE COALESCE(next_review_at, 0) <= 0",
+        }
+        for table, sql in tables.items():
+            for row in self._fetchall(sql):
+                anchor = float(row.get("anchor") or now_ts())
+                self._execute(
+                    f"UPDATE {table} SET next_review_at = ? WHERE id = ?",
+                    (anchor + default_offset, int(row["id"])),
+                )
 
     def get_state(self, key: str, default: str = "") -> str:
         row = self._fetchone("SELECT value FROM provider_state WHERE key = ?", (key,))
@@ -908,10 +979,11 @@ class MemoryStore:
         if clean_session:
             self.ensure_memory_session(clean_session)
         now = now_ts()
+        next_review_at = now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0))
         cur = self._execute(
             """
-            INSERT INTO memory_journals(session_id, label, content, journal_type, metadata_json, importance, salience, last_recalled_at, active, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+            INSERT INTO memory_journals(session_id, label, content, journal_type, metadata_json, importance, salience, last_recalled_at, review_count, next_review_at, reconsolidation_until, active, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 1, ?, ?)
             """,
             (
                 clean_session,
@@ -921,6 +993,7 @@ class MemoryStore:
                 json.dumps(dict(metadata or {}), sort_keys=True),
                 int(importance),
                 float(salience),
+                next_review_at,
                 now,
                 now,
             ),
@@ -999,10 +1072,11 @@ class MemoryStore:
         else:
             meta.pop("source_refs", None)
         if existing:
+            action = "reconsolidated" if float(existing.get("reconsolidation_until") or 0.0) > now else "updated"
             self._execute(
                 """
                 UPDATE memory_summaries
-                SET session_id = ?, label = ?, summary = ?, content = ?, summary_type = ?, metadata_json = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
+                SET session_id = ?, label = ?, summary = ?, content = ?, summary_type = ?, metadata_json = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), next_review_at = ?, active = 1, updated_at = ?
                 WHERE source_hash = ?
                 """,
                 (
@@ -1014,17 +1088,17 @@ class MemoryStore:
                     json.dumps(meta, sort_keys=True),
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     source_hash,
                 ),
             )
             summary_id = int(existing["id"])
-            action = "updated"
         else:
             cur = self._execute(
                 """
-                INSERT INTO memory_summaries(session_id, label, summary, content, summary_type, source_hash, metadata_json, importance, salience, last_recalled_at, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                INSERT INTO memory_summaries(session_id, label, summary, content, summary_type, source_hash, metadata_json, importance, salience, last_recalled_at, review_count, next_review_at, reconsolidation_until, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 1, ?, ?)
                 """,
                 (
                     clean_session,
@@ -1036,6 +1110,7 @@ class MemoryStore:
                     json.dumps(meta, sort_keys=True),
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     now,
                 ),
@@ -1084,10 +1159,11 @@ class MemoryStore:
         if source_session_id:
             self.ensure_memory_session(source_session_id)
         if existing:
+            action = "reconsolidated" if float(existing.get("reconsolidation_until") or 0.0) > now else "updated"
             self._execute(
                 """
                 UPDATE memory_preferences
-                SET label = ?, value = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
+                SET label = ?, value = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), next_review_at = ?, active = 1, updated_at = ?
                 WHERE preference_key = ?
                 """,
                 (
@@ -1098,17 +1174,17 @@ class MemoryStore:
                     source_session_id,
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     pref_key,
                 ),
             )
             pref_id = int(existing["id"])
-            action = "updated"
         else:
             cur = self._execute(
                 """
-                INSERT INTO memory_preferences(preference_key, label, value, content, metadata_json, source_session_id, importance, salience, last_recalled_at, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                INSERT INTO memory_preferences(preference_key, label, value, content, metadata_json, source_session_id, importance, salience, last_recalled_at, review_count, next_review_at, reconsolidation_until, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 1, ?, ?)
                 """,
                 (
                     pref_key,
@@ -1119,6 +1195,7 @@ class MemoryStore:
                     source_session_id,
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     now,
                 ),
@@ -1165,10 +1242,11 @@ class MemoryStore:
         if source_session_id:
             self.ensure_memory_session(source_session_id)
         if existing:
+            action = "reconsolidated" if float(existing.get("reconsolidation_until") or 0.0) > now else "updated"
             self._execute(
                 """
                 UPDATE memory_policies
-                SET label = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), active = 1, updated_at = ?
+                SET label = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), next_review_at = ?, active = 1, updated_at = ?
                 WHERE policy_key = ?
                 """,
                 (
@@ -1178,17 +1256,17 @@ class MemoryStore:
                     source_session_id,
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     policy_key,
                 ),
             )
             policy_id = int(existing["id"])
-            action = "updated"
         else:
             cur = self._execute(
                 """
-                INSERT INTO memory_policies(policy_key, label, content, metadata_json, source_session_id, importance, salience, last_recalled_at, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?)
+                INSERT INTO memory_policies(policy_key, label, content, metadata_json, source_session_id, importance, salience, last_recalled_at, review_count, next_review_at, reconsolidation_until, active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, 1, ?, ?)
                 """,
                 (
                     policy_key,
@@ -1198,6 +1276,7 @@ class MemoryStore:
                     source_session_id,
                     int(importance),
                     float(salience),
+                    now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     now,
                 ),
@@ -1428,6 +1507,7 @@ class MemoryStore:
         )
         metadata_json = json.dumps(meta, sort_keys=True)
         if existing:
+            history_action = "reconsolidated" if float(existing.get("reconsolidation_until") or 0.0) > observed_at else "updated"
             next_subject = subject_key or str(existing.get("subject_key") or "")
             next_value = value_key or str(existing.get("value_key") or "")
             next_polarity = polarity if subject_key else int(existing.get("polarity") or 1)
@@ -1435,6 +1515,7 @@ class MemoryStore:
             next_salience = max(float(existing.get("salience") or 0.0), salience_value)
             next_half_life = max(float(existing.get("decay_half_life_days") or 0.0), half_life)
             next_session = source_session or str(existing.get("source_session_id") or "")
+            next_review_at = observed_at + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0))
             self._execute(
                 """
                 UPDATE facts
@@ -1450,6 +1531,7 @@ class MemoryStore:
                     polarity = ?,
                     exclusive = ?,
                     source_session_id = ?,
+                    next_review_at = ?,
                     decay_half_life_days = ?
                 WHERE id = ?
                 """,
@@ -1465,6 +1547,7 @@ class MemoryStore:
                     next_polarity,
                     next_exclusive,
                     next_session,
+                    next_review_at,
                     next_half_life,
                     int(existing["id"]),
                 ),
@@ -1478,7 +1561,7 @@ class MemoryStore:
                 entity_kind="fact",
                 entity_id=updated["id"],
                 subject_key=next_subject,
-                action="updated",
+                action=history_action,
                 reason=history_reason or source,
                 source=source,
                 payload=updated,
@@ -1511,12 +1594,15 @@ class MemoryStore:
                 exclusive,
                 source_session_id,
                 last_recalled_at,
+                review_count,
+                next_review_at,
+                reconsolidation_until,
                 decay_half_life_days,
                 created_at,
                 updated_at,
                 last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?, ?, ?)
             """,
             (
                 clean,
@@ -1535,6 +1621,7 @@ class MemoryStore:
                 int(polarity),
                 int(exclusive),
                 source_session,
+                observed_at + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                 half_life,
                 observed_at,
                 observed_at,
@@ -2272,34 +2359,84 @@ class MemoryStore:
             (like, like, like, int(limit)),
         )
 
-    def touch_recall(self, kind: str, ids: Sequence[Any], *, session_id: str = "") -> None:
+    def touch_recall(
+        self,
+        kind: str,
+        ids: Sequence[Any],
+        *,
+        session_id: str = "",
+        review_intervals_days: Sequence[float] | None = None,
+        reconsolidation_window_hours: float = 6.0,
+        cues: Dict[str, Any] | None = None,
+    ) -> None:
         if not ids:
             return
         now = now_ts()
         clean_kind = normalize_whitespace(kind)
         clean_session = normalize_whitespace(session_id)
         table_map = {
-            "fact": ("facts", "id"),
-            "topic": ("topics", "id"),
-            "summary": ("memory_summaries", "id"),
-            "journal": ("memory_journals", "id"),
-            "preference": ("memory_preferences", "id"),
-            "policy": ("memory_policies", "id"),
-            "trace": ("memory_traces", "id"),
+            "fact": ("facts", "id", True),
+            "topic": ("topics", "id", False),
+            "summary": ("memory_summaries", "id", True),
+            "journal": ("memory_journals", "id", True),
+            "preference": ("memory_preferences", "id", True),
+            "policy": ("memory_policies", "id", True),
+            "trace": ("memory_traces", "id", False),
         }
         table_info = table_map.get(clean_kind)
         if not table_info:
             return
-        table, id_col = table_info
-        unique_ids = [str(item) for item in ids if str(item)]
+        table, id_col, reviewable = table_info
+        unique_ids = list(dict.fromkeys(str(item) for item in ids if str(item)))
         if not unique_ids:
             return
+        reconsolidation_until = now + max(float(reconsolidation_window_hours), 0.0) * 3600.0
         for raw_id in unique_ids:
-            self._execute(f"UPDATE {table} SET last_recalled_at = ? WHERE {id_col} = ?", (now, raw_id))
+            row: Dict[str, Any] | None = None
+            if reviewable:
+                row = self._fetchone(
+                    f"SELECT {id_col} AS id, salience, review_count FROM {table} WHERE {id_col} = ?",
+                    (raw_id,),
+                )
+                if not row:
+                    continue
+                review_count = int(row.get("review_count") or 0) + 1
+                next_review_at = now + _next_review_offset_seconds(review_count, review_intervals_days)
+                boosted_salience = min(1.0, float(row.get("salience") or 0.0) + 0.04)
+                self._execute(
+                    f"""
+                    UPDATE {table}
+                    SET last_recalled_at = ?, salience = ?, review_count = ?, next_review_at = ?, reconsolidation_until = ?
+                    WHERE {id_col} = ?
+                    """,
+                    (now, boosted_salience, review_count, next_review_at, reconsolidation_until, raw_id),
+                )
+            else:
+                row = self._fetchone(f"SELECT {id_col} AS id FROM {table} WHERE {id_col} = ?", (raw_id,))
+                if not row:
+                    continue
+                self._execute(f"UPDATE {table} SET last_recalled_at = ? WHERE {id_col} = ?", (now, raw_id))
             if clean_session:
                 self.add_link("session", clean_session, clean_kind, raw_id, "recalls")
+            if reviewable:
+                self.record_history(
+                    entity_kind=clean_kind,
+                    entity_id=raw_id,
+                    action="recalled",
+                    reason="retrieval_practice",
+                    source="recall",
+                    payload={"session_id": clean_session, "cues": dict(cues or {})},
+                )
 
-    def touch_recall_batch(self, results: Dict[str, List[Dict[str, Any]]], *, session_id: str = "") -> None:
+    def touch_recall_batch(
+        self,
+        results: Dict[str, List[Dict[str, Any]]],
+        *,
+        session_id: str = "",
+        review_intervals_days: Sequence[float] | None = None,
+        reconsolidation_window_hours: float = 6.0,
+        cues: Dict[str, Any] | None = None,
+    ) -> None:
         mapping = {
             "facts": "fact",
             "topics": "topic",
@@ -2310,7 +2447,86 @@ class MemoryStore:
         }
         for section, kind in mapping.items():
             ids = [row.get("id") for row in results.get(section, []) if row.get("id") is not None]
-            self.touch_recall(kind, ids, session_id=session_id)
+            self.touch_recall(
+                kind,
+                ids,
+                session_id=session_id,
+                review_intervals_days=review_intervals_days,
+                reconsolidation_window_hours=reconsolidation_window_hours,
+                cues=cues,
+            )
+
+    def review_due(self, *, scope: str = "all", limit: int = 8) -> Dict[str, List[Dict[str, Any]]]:
+        now = now_ts()
+        sections = ("facts", "summaries", "journals", "preferences", "policies")
+        if scope != "all":
+            sections = tuple(section for section in sections if section == scope)
+        results = {name: [] for name in self.SEARCH_SCOPES}
+        queries = {
+            "facts": """
+                SELECT id, content, category, topic, subject_key, source_session_id, importance, salience, review_count, next_review_at, updated_at
+                FROM facts
+                WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?
+                ORDER BY next_review_at ASC, salience DESC, importance DESC, updated_at DESC
+                LIMIT ?
+            """,
+            "summaries": """
+                SELECT id, session_id, label, summary, summary_type, importance, salience, review_count, next_review_at, updated_at
+                FROM memory_summaries
+                WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?
+                ORDER BY next_review_at ASC, salience DESC, importance DESC, updated_at DESC
+                LIMIT ?
+            """,
+            "journals": """
+                SELECT id, session_id, label, content, journal_type, importance, salience, review_count, next_review_at, updated_at
+                FROM memory_journals
+                WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?
+                ORDER BY next_review_at ASC, salience DESC, importance DESC, updated_at DESC
+                LIMIT ?
+            """,
+            "preferences": """
+                SELECT id, preference_key, label, value, content, source_session_id, importance, salience, review_count, next_review_at, updated_at
+                FROM memory_preferences
+                WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?
+                ORDER BY next_review_at ASC, salience DESC, importance DESC, updated_at DESC
+                LIMIT ?
+            """,
+            "policies": """
+                SELECT id, policy_key, label, content, source_session_id, importance, salience, review_count, next_review_at, updated_at
+                FROM memory_policies
+                WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?
+                ORDER BY next_review_at ASC, salience DESC, importance DESC, updated_at DESC
+                LIMIT ?
+            """,
+        }
+        for section in sections:
+            rows = self._fetchall(queries[section], (now, int(limit)))
+            for row in rows:
+                row["review_overdue_days"] = round(max((now - float(row.get("next_review_at") or 0.0)) / 86400.0, 0.0), 3)
+            results[section] = rows
+        return results
+
+    def review_status(self) -> Dict[str, Any]:
+        now = now_ts()
+        sections = {
+            "facts": "SELECT COUNT(*) AS count, MIN(next_review_at) AS next_due_at FROM facts WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?",
+            "summaries": "SELECT COUNT(*) AS count, MIN(next_review_at) AS next_due_at FROM memory_summaries WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?",
+            "journals": "SELECT COUNT(*) AS count, MIN(next_review_at) AS next_due_at FROM memory_journals WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?",
+            "preferences": "SELECT COUNT(*) AS count, MIN(next_review_at) AS next_due_at FROM memory_preferences WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?",
+            "policies": "SELECT COUNT(*) AS count, MIN(next_review_at) AS next_due_at FROM memory_policies WHERE active = 1 AND next_review_at > 0 AND next_review_at <= ?",
+        }
+        results: Dict[str, Any] = {"due_counts": {}, "total_due": 0, "next_due_at": 0.0}
+        next_due_values: List[float] = []
+        for name, sql in sections.items():
+            row = self._fetchone(sql, (now,)) or {"count": 0, "next_due_at": 0}
+            count = int(row.get("count") or 0)
+            next_due = float(row.get("next_due_at") or 0.0)
+            results["due_counts"][name] = count
+            results["total_due"] += count
+            if next_due > 0:
+                next_due_values.append(next_due)
+        results["next_due_at"] = min(next_due_values) if next_due_values else 0.0
+        return results
 
     def last_consolidation(self) -> Dict[str, Any] | None:
         row = self._fetchone(

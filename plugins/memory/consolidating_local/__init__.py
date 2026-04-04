@@ -25,7 +25,7 @@ from .consolidator import (
     run_consolidation,
 )
 from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank, load_hermes_model_defaults
-from .store import MemoryStore, normalize_whitespace, slugify
+from .store import MemoryStore, normalize_whitespace, pretty_topic, slugify
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ TOOL_SCHEMA = {
         "- distill: create or refresh a summary.\n"
         "- history: inspect append-only memory history.\n"
         "- policy: set or get a memory policy.\n"
+        "- review: inspect and advance due spaced-review items.\n"
         "- decay: apply salience decay now.\n"
         "- export: write the compiled markdown wiki mirror."
     ),
@@ -55,7 +56,7 @@ TOOL_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "remember", "forget", "recent", "contradictions", "status", "consolidate", "journal", "distill", "history", "policy", "decay", "export"],
+                "enum": ["search", "remember", "forget", "recent", "contradictions", "status", "consolidate", "journal", "distill", "history", "policy", "review", "decay", "export"],
             },
             "query": {"type": "string", "description": "Search or forget query."},
             "scope": {
@@ -189,6 +190,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "key": "decay_half_life_days",
                 "description": "Default salience half life in days",
                 "default": "90",
+            },
+            {
+                "key": "reconsolidation_window_hours",
+                "description": "How long a recalled memory stays open to reconsolidation updates",
+                "default": "6",
+            },
+            {
+                "key": "review_intervals_days",
+                "description": "Comma-separated spaced review intervals in days",
+                "default": "1,3,7,14,30",
             },
             {
                 "key": "decay_min_salience",
@@ -489,12 +500,14 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 scope = str(args.get("scope") or "all")
                 if scope not in valid_scopes:
                     return json.dumps({"success": False, "error": f"Unsupported scope: {scope}"})
+                cues = self._build_retrieval_cues(query=query, args=args, session_id=session_id)
                 results = self._search_memory(
                     query,
                     scope=scope,
                     limit=limit,
                     session_id=session_id,
                     include_inactive=include_inactive,
+                    cues=cues,
                 )
                 return json.dumps({"success": True, "action": action, "results": results})
 
@@ -533,7 +546,14 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         section = "preferences"
                     elif memory_type == "policy":
                         section = "policies"
-                    results = self._search_memory(query, scope=section, limit=limit, session_id=session_id, include_inactive=include_inactive)
+                    results = self._search_memory(
+                        query,
+                        scope=section,
+                        limit=limit,
+                        session_id=session_id,
+                        include_inactive=include_inactive,
+                        touch_recall=False,
+                    )
                     removed_count = 0
                     for row in results.get(section, []):
                         if row.get("id") is None:
@@ -562,6 +582,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     min_hours=self._cfg()["min_hours"],
                     min_sessions=self._cfg()["min_sessions"],
                 )
+                review_status = self._store.review_status()
                 return json.dumps(
                     {
                         "success": True,
@@ -579,6 +600,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         "embedding_enabled": bool(self._embedder and self._embedder.enabled),
                         "last_decay_at": self._store.get_state("last_decay_at", ""),
                         "latest_session_summaries": self._store.latest_session_summaries(limit=3),
+                        "review": review_status,
                         "wiki_export": {
                             "enabled": self._cfg()["wiki_export_enabled"],
                             "on_consolidate": self._cfg()["wiki_export_on_consolidate"],
@@ -643,6 +665,27 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 results = self._search_memory(key, scope="policies", limit=limit, session_id=session_id, include_inactive=include_inactive)
                 return json.dumps({"success": True, "action": action, "results": results.get("policies", [])})
 
+            if action == "review":
+                scope = str(args.get("scope") or "all").strip()
+                if scope not in valid_scopes:
+                    return json.dumps({"success": False, "error": f"Unsupported scope: {scope}"})
+                if scope not in {"all", "facts", "summaries", "journals", "preferences", "policies"}:
+                    return json.dumps({"success": False, "error": f"Scope {scope} is not reviewable"})
+                review_scope = scope
+                due = self._store.review_due(scope=review_scope, limit=limit)
+                cues = self._build_retrieval_cues(query=str(args.get("query") or "").strip(), args=args, session_id=session_id)
+                for section, rows in due.items():
+                    for row in rows:
+                        row["review_prompt"] = self._review_prompt(section, row)
+                self._store.touch_recall_batch(
+                    due,
+                    session_id=session_id,
+                    review_intervals_days=self._review_intervals_days(),
+                    reconsolidation_window_hours=float(self._cfg()["reconsolidation_window_hours"]),
+                    cues={**cues, "mode": "review"},
+                )
+                return json.dumps({"success": True, "action": action, "results": due, "reviewed": True})
+
             if action == "decay":
                 result = self._store.apply_decay(
                     half_life_days=float(self._cfg()["decay_half_life_days"]),
@@ -684,6 +727,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "prune_after_days": int(self._config.get("prune_after_days", 90)),
             "episode_body_retention_hours": float(self._config.get("episode_body_retention_hours", 24)),
             "decay_half_life_days": float(self._config.get("decay_half_life_days", 90)),
+            "reconsolidation_window_hours": float(self._config.get("reconsolidation_window_hours", 6)),
+            "review_intervals_days": str(self._config.get("review_intervals_days", "1,3,7,14,30")),
             "decay_min_salience": float(self._config.get("decay_min_salience", 0.15)),
             "wiki_export_enabled": self._cfg_bool("wiki_export_enabled", False),
             "wiki_export_dir": str(self._config.get("wiki_export_dir", "$HERMES_HOME/consolidating_memory_wiki")),
@@ -727,6 +772,78 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _section_limit(self, section: str, limit: int) -> int:
         return int(limit) if section == "facts" else max(1, min(int(limit), 6))
 
+    def _review_intervals_days(self) -> List[float]:
+        raw = str(self._cfg()["review_intervals_days"] or "1,3,7,14,30")
+        values: List[float] = []
+        for chunk in raw.split(","):
+            clean = normalize_whitespace(chunk)
+            if not clean:
+                continue
+            try:
+                value = float(clean)
+            except Exception:
+                continue
+            if value > 0:
+                values.append(value)
+        return values or [1.0, 3.0, 7.0, 14.0, 30.0]
+
+    def _build_retrieval_cues(self, *, query: str, args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+        subject_key = normalize_whitespace(str(args.get("subject_key") or ""))
+        category = normalize_whitespace(str(args.get("category") or ""))
+        topic = normalize_whitespace(str(args.get("topic") or ""))
+        if query and not category:
+            inferred_category = infer_category(query)
+            if inferred_category in {"user_pref", "project", "environment", "workflow"}:
+                category = inferred_category
+        if query and not topic:
+            inferred_topic = infer_topic(query, category or "general", subject_key) or ""
+            if inferred_topic and slugify(inferred_topic) not in {"general", "notes", "memory"}:
+                topic = inferred_topic
+        return {
+            "query": normalize_whitespace(query),
+            "session_id": normalize_whitespace(session_id),
+            "subject_key": subject_key,
+            "category": category,
+            "topic": slugify(topic) if topic else "",
+        }
+
+    def _cue_bonus(self, section: str, row: Dict[str, Any], cues: Dict[str, Any]) -> float:
+        bonus = 0.0
+        session_cue = str(cues.get("session_id") or "")
+        topic_cue = str(cues.get("topic") or "")
+        category_cue = str(cues.get("category") or "")
+        subject_key_cue = str(cues.get("subject_key") or "")
+        row_session = normalize_whitespace(str(row.get("source_session_id") or row.get("session_id") or ""))
+        if session_cue and row_session and row_session == session_cue:
+            bonus += 0.22
+        row_topic = slugify(str(row.get("topic") or row.get("slug") or ""))
+        if topic_cue and row_topic and row_topic == topic_cue:
+            bonus += 0.16
+        row_category = normalize_whitespace(str(row.get("category") or ""))
+        if category_cue and row_category and row_category == category_cue:
+            bonus += 0.08
+        row_subject = normalize_whitespace(str(row.get("subject_key") or row.get("preference_key") or row.get("policy_key") or ""))
+        if subject_key_cue and row_subject and row_subject == subject_key_cue:
+            bonus += 0.2
+        return bonus
+
+    def _review_prompt(self, section: str, row: Dict[str, Any]) -> str:
+        if section == "facts":
+            subject_key = normalize_whitespace(str(row.get("subject_key") or ""))
+            if subject_key:
+                return f"What is the current memory for `{subject_key}`?"
+            topic = pretty_topic(str(row.get("topic") or "memory"))
+            return f"What key fact should we remember about {topic}?"
+        if section == "summaries":
+            return f"What is the current summary for {str(row.get('label') or 'this session')}?"
+        if section == "journals":
+            return f"What note matters from {str(row.get('label') or 'this journal entry')}?"
+        if section == "preferences":
+            return f"What preference do we hold for {str(row.get('label') or row.get('preference_key') or 'this item')}?"
+        if section == "policies":
+            return f"What policy should guide {str(row.get('label') or row.get('policy_key') or 'this workflow')}?"
+        return f"What should we recall about {section}?"
+
     def _memory_text(self, section: str, row: Dict[str, Any]) -> str:
         if section == "topics":
             return f"{row.get('title', '')} {row.get('summary', '')}".strip()
@@ -764,10 +881,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         limit: int,
         session_id: str,
         include_inactive: bool = False,
+        cues: Dict[str, Any] | None = None,
+        touch_recall: bool = True,
     ) -> Dict[str, List[Dict[str, Any]]]:
         if not self._store:
             return {}
         clean = normalize_whitespace(query)
+        cue_map = dict(cues or {})
+        if session_id and not cue_map.get("session_id"):
+            cue_map["session_id"] = normalize_whitespace(session_id)
         candidate_limit = self._cfg()["embedding_candidate_limit"] if self._effective_retrieval_backend() == "hybrid" else limit
         results = self._store.search(clean, scope=scope, limit=int(candidate_limit), include_inactive=include_inactive)
         if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.enabled:
@@ -782,23 +904,48 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     if not vectors or len(vectors) != len(rows):
                         continue
                     scored: List[Dict[str, Any]] = []
-                    for row, vector in zip(rows, vectors):
+                    for index, (row, vector) in enumerate(zip(rows, vectors)):
                         similarity = self._cosine_similarity(query_embedding, vector)
                         salience = float(row.get("salience") or 0.4)
                         importance = float(row.get("importance") or 5) / 10.0
                         updated_at = float(row.get("updated_at") or row.get("created_at") or time.time())
                         age_days = max((time.time() - updated_at) / 86400.0, 0.0)
                         recency = 1.0 / (1.0 + age_days / 7.0)
-                        score = (0.55 * similarity) + (0.25 * salience) + (0.1 * importance) + (0.1 * recency)
+                        rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
+                        cue_bonus = self._cue_bonus(section, row, cue_map)
+                        score = (0.5 * similarity) + (0.2 * salience) + (0.1 * importance) + (0.08 * recency) + (0.07 * rank_prior) + cue_bonus
                         item = dict(row)
                         item["hybrid_score"] = round(score, 5)
+                        item["cue_match_score"] = round(cue_bonus, 5)
                         scored.append(item)
                     scored.sort(key=lambda item: float(item.get("hybrid_score") or 0.0), reverse=True)
                     results[section] = scored[: self._section_limit(section, limit)]
         else:
             for section, rows in list(results.items()):
-                results[section] = rows[: self._section_limit(section, limit)]
-        self._store.touch_recall_batch(results, session_id=session_id)
+                scored: List[Dict[str, Any]] = []
+                for index, row in enumerate(rows):
+                    salience = float(row.get("salience") or 0.4)
+                    importance = float(row.get("importance") or 5) / 10.0
+                    updated_at = float(row.get("updated_at") or row.get("created_at") or time.time())
+                    age_days = max((time.time() - updated_at) / 86400.0, 0.0)
+                    recency = 1.0 / (1.0 + age_days / 7.0)
+                    rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
+                    cue_bonus = self._cue_bonus(section, row, cue_map)
+                    score = (0.38 * rank_prior) + (0.3 * salience) + (0.16 * importance) + (0.16 * recency) + cue_bonus
+                    item = dict(row)
+                    item["heuristic_score"] = round(score, 5)
+                    item["cue_match_score"] = round(cue_bonus, 5)
+                    scored.append(item)
+                scored.sort(key=lambda item: float(item.get("heuristic_score") or 0.0), reverse=True)
+                results[section] = scored[: self._section_limit(section, limit)]
+        if touch_recall and clean:
+            self._store.touch_recall_batch(
+                results,
+                session_id=session_id,
+                review_intervals_days=self._review_intervals_days(),
+                reconsolidation_window_hours=float(self._cfg()["reconsolidation_window_hours"]),
+                cues=cue_map,
+            )
         return results
 
     def _candidate_to_preference(self, candidate: Dict[str, Any], fact: Dict[str, Any]) -> None:
