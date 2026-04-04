@@ -36,6 +36,10 @@ class ConsolidatingLocalMemoryTests(unittest.TestCase):
             "retrieval_backend": "fts",
             "llm_timeout_seconds": 10,
             "llm_max_input_chars": 2000,
+            "wiki_export_enabled": False,
+            "wiki_export_on_consolidate": True,
+            "wiki_export_session_limit": 50,
+            "wiki_export_topic_limit": 100,
         }
         config.update(overrides)
         provider = ConsolidatingLocalMemoryProvider(config=config)
@@ -371,6 +375,98 @@ class ConsolidatingLocalMemoryTests(unittest.TestCase):
             finally:
                 provider.shutdown()
 
+    def test_export_writes_compiled_wiki_and_prunes_stale_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki_dir = Path(tmpdir) / "wiki"
+            provider = self.make_provider(
+                tmpdir,
+                wiki_export_enabled=True,
+                wiki_export_dir=str(wiki_dir),
+            )
+            try:
+                provider.sync_turn(
+                    "I prefer concise answers and the project uses PostgreSQL.",
+                    "Noted, I will keep replies concise.",
+                )
+                flush_provider(provider)
+                provider.on_session_end(
+                    [
+                        {"role": "user", "content": "I prefer concise answers and the project uses PostgreSQL."},
+                        {"role": "assistant", "content": "Noted."},
+                    ]
+                )
+                flush_provider(provider)
+                provider.handle_tool_call(
+                    "consolidating_memory",
+                    {"action": "policy", "key": "retention", "label": "Retention", "content": "Keep handoff summaries longer than raw buffers."},
+                )
+
+                export = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "export"}))
+                self.assertTrue(export["success"])
+                result = export["result"]
+                self.assertGreater(result["generated_files"], 0)
+
+                index_path = wiki_dir / "index.md"
+                session_pages = sorted((wiki_dir / "sessions").glob("*.md"))
+                topic_pages = sorted((wiki_dir / "topics").glob("*.md"))
+                self.assertTrue(index_path.exists())
+                self.assertTrue(session_pages)
+                self.assertTrue(topic_pages)
+                self.assertTrue((wiki_dir / "preferences" / "index.md").exists())
+                self.assertTrue((wiki_dir / "policies" / "index.md").exists())
+                self.assertTrue((wiki_dir / "contradictions" / "index.md").exists())
+
+                index_text = index_path.read_text(encoding="utf-8")
+                self.assertIn("Compiled Memory Wiki", index_text)
+                self.assertIn("topics/", index_text)
+                self.assertIn("sessions/", index_text)
+
+                session_text = session_pages[0].read_text(encoding="utf-8")
+                self.assertIn("## Facts", session_text)
+                self.assertIn("../topics/", session_text)
+
+                topic_text = topic_pages[0].read_text(encoding="utf-8")
+                self.assertIn("## Related Sessions", topic_text)
+                self.assertIn("../sessions/", topic_text)
+
+                stale = wiki_dir / "topics" / "stale.md"
+                stale.write_text("old page\n", encoding="utf-8")
+                second = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "export"}))
+                self.assertTrue(second["success"])
+                self.assertEqual(second["result"]["written_files"], 0)
+                self.assertEqual(second["result"]["pruned_files"], 1)
+                self.assertFalse(stale.exists())
+            finally:
+                provider.shutdown()
+
+    def test_consolidation_auto_exports_and_status_reports_wiki_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            wiki_dir = Path(tmpdir) / "wiki"
+            provider = self.make_provider(
+                tmpdir,
+                wiki_export_enabled=True,
+                wiki_export_on_consolidate=True,
+                wiki_export_dir=str(wiki_dir),
+            )
+            try:
+                provider.sync_turn("I like jasmine tea.", "Noted.")
+                flush_provider(provider)
+
+                consolidate = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "consolidate"}))
+                self.assertTrue(consolidate["success"])
+                self.assertIn("wiki_export", consolidate["result"])
+                self.assertTrue((wiki_dir / "index.md").exists())
+
+                status = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "status"}))
+                self.assertTrue(status["success"])
+                wiki_status = status["wiki_export"]
+                self.assertTrue(wiki_status["enabled"])
+                self.assertEqual(Path(wiki_status["root"]), wiki_dir)
+                self.assertTrue(wiki_status["last_export_at"])
+                self.assertGreater(wiki_status["last_export_stats"]["generated_files"], 0)
+            finally:
+                provider.shutdown()
+
     def test_tool_schema_exposes_v2_actions_and_scopes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             provider = self.make_provider(tmpdir)
@@ -394,6 +490,7 @@ class ConsolidatingLocalMemoryTests(unittest.TestCase):
                         "history",
                         "policy",
                         "decay",
+                        "export",
                     }.issubset(actions)
                 )
                 self.assertTrue(

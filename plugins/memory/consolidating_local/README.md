@@ -1,46 +1,176 @@
 # consolidating_local
 
-`consolidating_local` is a Hermes memory provider scaffold built around a practical layered long-term memory pattern:
+`consolidating_local` is a Hermes memory provider built around a layered local-memory model.
 
-- keep a tiny always-on memory surface
-- keep only short-lived raw turn buffers locally
-- distill sessions into durable facts, preferences, policies, and summaries
-- periodically consolidate them into topic summaries and contradiction-aware state
-- retrieve only the relevant slices back into the prompt
+It is meant to complement Hermes, not replace it.
 
-This version is local-first and dependency-light:
+Hermes keeps:
 
-- SQLite backend
-- background worker for non-blocking turn sync
-- bounded episodic buffers (`episodes`)
-- session records, traces, journals, and summaries
-- durable facts, preferences, and policies
-- merged topic summaries (`topics`)
-- contradiction log plus append-only history and provenance links
-- auto-consolidation gate (`min_hours` + `min_sessions`)
-- optional hybrid retrieval with OpenAI-compatible embeddings
+- bounded built-in prompt memory
+- full session history
 
-## What it does
+This provider keeps:
 
-Hermes already has built-in `MEMORY.md` and `USER.md`. This provider runs alongside them and adds:
+- short-lived raw turn buffers for consolidation
+- durable distilled memory
+- contradiction-aware state updates
+- provenance and history
+- an optional compiled markdown wiki mirror
 
-- `prefetch(query)`: injects relevant topic summaries and matching facts before each turn
-- `sync_turn(user, assistant)`: appends each turn to episodic memory and a lightweight trace row
-- `on_turn_start(...)`: checks whether background consolidation should run
-- `on_session_end(...)`: extracts durable signal, updates preferences, creates a session summary, and requests consolidation
-- `on_pre_compress(...)`: salvages useful facts before compression drops raw context and writes a handoff summary
-- `on_memory_write(...)`: mirrors built-in Hermes memory writes into the provider and upgrades user memory into preferences when appropriate
-- `consolidating_memory`: one richer tool for search, journaling, distillation, history, policies, decay, and fact writes
+## Mental Model
 
-## Install into Hermes
+The system has three layers:
 
-Copy this directory into your Hermes checkout:
+1. Raw capture
+
+- `episodes`
+- `traces`
+
+2. Distilled memory
+
+- `facts`
+- `summaries`
+- `preferences`
+- `policies`
+- `topics`
+- `contradictions`
+
+3. Derived output
+
+- compiled markdown wiki pages exported from SQLite
+
+The important rule is:
+
+- SQLite is the source of truth
+- markdown is generated output
+
+## What It Does
+
+Hook behavior:
+
+- `prefetch(query)`
+  Recalls relevant memory before a turn
+
+- `sync_turn(user, assistant)`
+  Stores a bounded episode buffer and a trace row
+
+- `on_turn_start(...)`
+  Checks the consolidation gate
+
+- `on_session_end(...)`
+  Extracts durable memory, refreshes session summaries, and requests consolidation
+
+- `on_pre_compress(...)`
+  Salvages durable signal and writes a handoff summary
+
+- `on_memory_write(...)`
+  Mirrors Hermes memory writes into the provider
+
+- `on_delegation(...)`
+  Stores delegation outcomes as workflow memory
+
+## Stored Objects
+
+- `episodes`
+  Short-lived raw turn buffers
+
+- `facts`
+  Durable extracted memories
+
+- `topics`
+  Topic summaries rebuilt from active facts
+
+- `memory_sessions`
+  Session metadata
+
+- `memory_traces`
+  Lightweight turn traces
+
+- `memory_journals`
+  Narrative notes
+
+- `memory_summaries`
+  Session, handoff, and derived summaries
+
+- `memory_preferences`
+  Stable user preferences
+
+- `memory_policies`
+  Workflow rules and operating constraints
+
+- `memory_history`
+  Append-only change log
+
+- `memory_links`
+  Typed provenance links
+
+- `contradictions`
+  Resolved assumption changes
+
+## Tool
+
+The provider exposes one tool:
+
+```text
+consolidating_memory
+```
+
+Actions:
+
+- `search`
+- `remember`
+- `forget`
+- `recent`
+- `contradictions`
+- `status`
+- `consolidate`
+- `journal`
+- `distill`
+- `history`
+- `policy`
+- `decay`
+- `export`
+
+Search scopes:
+
+- `all`
+- `facts`
+- `topics`
+- `episodes`
+- `summaries`
+- `journals`
+- `preferences`
+- `policies`
+
+## Compiled Wiki Export
+
+When enabled, the provider can export a markdown mirror of the current store.
+
+Generated files include:
+
+- `index.md`
+- `topics/*.md`
+- `sessions/*.md`
+- `preferences/index.md`
+- `policies/index.md`
+- `contradictions/index.md`
+
+This export is:
+
+- deterministic
+- safe to rerun
+- suitable for Obsidian-style browsing
+- cleaned up on rerun when old generated pages no longer belong
+
+## Install Into Hermes
+
+Copy this folder into your Hermes checkout:
 
 ```text
 plugins/memory/consolidating_local/
 ```
 
-Then activate it in your Hermes profile config:
+Then configure Hermes:
 
 ```yaml
 memory:
@@ -60,72 +190,57 @@ plugins:
     episode_body_retention_hours: 24
     decay_half_life_days: 90
     decay_min_salience: 0.15
+    wiki_export_enabled: false
+    wiki_export_dir: $HERMES_HOME/consolidating_memory_wiki
+    wiki_export_on_consolidate: true
+    wiki_export_session_limit: 50
+    wiki_export_topic_limit: 100
     extractor_backend: hybrid
     retrieval_backend: fts
-    llm_model: ""          # blank = use Hermes model.default
-    llm_base_url: ""       # blank = use Hermes model.base_url
+    llm_model: ""
+    llm_base_url: ""
     llm_timeout_seconds: 45
     llm_max_input_chars: 4000
-    embedding_model: ""          # blank = use llm_model/model.default
-    embedding_base_url: ""       # blank = use llm_base_url/model.base_url
+    embedding_model: ""
+    embedding_base_url: ""
     embedding_timeout_seconds: 20
     embedding_candidate_limit: 16
 ```
 
-If your Hermes profile already uses a local OpenAI-compatible endpoint, `hybrid` mode will automatically reuse it. In your case, that means it can reuse the existing Qwen setup from `~/.hermes/config.yaml`.
+## Backends
 
-## Tool
+Extraction:
 
-The provider exposes one tool:
+- `heuristic`
+- `hybrid`
+- `llm`
 
-```text
-consolidating_memory
+Retrieval:
+
+- `fts`
+- `hybrid`
+
+If a local LLM or embedding endpoint is unavailable, the provider falls back safely to heuristic extraction or plain FTS.
+
+## Current Strengths
+
+- Local-first operation
+- Exclusive-state contradiction handling
+- Session-aware summaries and handoff notes
+- Stable preference and policy memory
+- Append-only history and typed provenance
+- Optional compiled wiki mirror
+
+## Development
+
+Syntax check:
+
+```bash
+python -m compileall plugins/memory/consolidating_local
 ```
 
-Supported actions:
+Run tests:
 
-- `search`
-- `remember`
-- `forget`
-- `recent`
-- `contradictions`
-- `status`
-- `consolidate`
-- `journal`
-- `distill`
-- `history`
-- `policy`
-- `decay`
-
-`search.scope` supports:
-
-- `all`
-- `facts`
-- `topics`
-- `episodes`
-- `summaries`
-- `journals`
-- `preferences`
-- `policies`
-
-## Current behavior
-
-The consolidation loop is still local-first, but it is now much more structured than the first scaffold:
-
-- it extracts atomic facts for user preferences, favorites, likes/dislikes, personal details, life events, environment details, workflow rules, and common project signals
-- it carries subject/value metadata for exclusive facts like response style, shell, OS, SSH port, and Docker sudo behavior
-- it tracks user-specific contradiction cases such as like -> dislike, favorite changes, location changes, and diet/profile updates
-- it logs contradiction resolutions when a newer fact replaces an older assumption, and records matching history plus provenance links
-- it stores bounded raw turns as episode buffers, then prunes those buffers after successful consolidation
-- it creates memory sessions, turn traces, journals, session summaries, and handoff summaries
-- it upgrades durable user-profile signals into first-class preferences and workflow rules into policies
-- it buckets facts into coarse topics and rebuilds concise topic summaries from the strongest active facts
-- it applies salience decay so low-value traces, journals, summaries, topics, and facts fade out over time without erasing high-salience preferences and policies
-- it can rerank FTS candidates with local embeddings when `retrieval_backend: hybrid` is configured and available
-- it renders prefetch in a fixed order: summaries, preferences/policies, direct fact matches, recent journals, and changed assumptions
-
-That gives you a practical memory loop without adding a cloud memory service.
-
-When `extractor_backend` is `hybrid` or `llm`, the provider also tries an OpenAI-compatible local model for extraction and falls back to heuristics if the model call or JSON parse fails.
-
-When `retrieval_backend` is `hybrid`, the provider also tries an OpenAI-compatible `/embeddings` endpoint for reranking and falls back to plain FTS if embeddings are unavailable.
+```bash
+python -m unittest discover -s tests -v
+```

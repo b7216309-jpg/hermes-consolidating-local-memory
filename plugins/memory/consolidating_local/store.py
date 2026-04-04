@@ -690,6 +690,105 @@ class MemoryStore:
             ),
         }
 
+    def list_sessions(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT session_id, label, summary, status, started_at, ended_at, last_activity_at, created_at, updated_at
+            FROM memory_sessions
+            ORDER BY updated_at DESC, session_id ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
+    def list_topics(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT id, slug, title, summary, category, importance, salience, source_session_id, last_recalled_at, decay_half_life_days, updated_at
+            FROM topics
+            ORDER BY salience DESC, importance DESC, updated_at DESC, slug ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
+    def list_preferences(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT id, preference_key, label, value, content, metadata_json, importance, salience, updated_at
+            FROM memory_preferences
+            WHERE active = 1
+            ORDER BY salience DESC, importance DESC, updated_at DESC, preference_key ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
+    def list_policies(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT id, policy_key, label, content, metadata_json, importance, salience, updated_at
+            FROM memory_policies
+            WHERE active = 1
+            ORDER BY salience DESC, importance DESC, updated_at DESC, policy_key ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
+    def topic_supporting_facts(self, topic_id: int, *, limit: int = 12) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT f.id, f.content, f.category, f.topic, f.importance, f.confidence, f.salience, f.updated_at, f.subject_key, f.value_key, f.source_session_id
+            FROM topic_membership tm
+            JOIN facts f ON f.id = tm.fact_id
+            WHERE tm.topic_id = ? AND f.active = 1
+            ORDER BY f.salience DESC, f.importance DESC, f.updated_at DESC, f.id ASC
+            LIMIT ?
+            """,
+            (int(topic_id), int(limit)),
+        )
+
+    def list_links(
+        self,
+        *,
+        source_kind: str = "",
+        source_id: Any | None = None,
+        target_kind: str = "",
+        target_id: Any | None = None,
+        link_type: str = "",
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if source_kind:
+            clauses.append("source_kind = ?")
+            params.append(normalize_whitespace(source_kind))
+        if source_id is not None:
+            clauses.append("source_id = ?")
+            params.append(str(source_id))
+        if target_kind:
+            clauses.append("target_kind = ?")
+            params.append(normalize_whitespace(target_kind))
+        if target_id is not None:
+            clauses.append("target_id = ?")
+            params.append(str(target_id))
+        if link_type:
+            clauses.append("link_type = ?")
+            params.append(normalize_whitespace(link_type))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(int(limit))
+        return self._fetchall(
+            f"""
+            SELECT id, source_kind, source_id, target_kind, target_id, link_type, metadata_json, created_at
+            FROM memory_links
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            params,
+        )
+
     def append_trace(
         self,
         *,

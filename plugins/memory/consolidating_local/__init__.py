@@ -26,6 +26,7 @@ from .consolidator import (
 )
 from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank, load_hermes_model_defaults
 from .store import MemoryStore, normalize_whitespace, slugify
+from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
 
@@ -46,14 +47,15 @@ TOOL_SCHEMA = {
         "- distill: create or refresh a summary.\n"
         "- history: inspect append-only memory history.\n"
         "- policy: set or get a memory policy.\n"
-        "- decay: apply salience decay now."
+        "- decay: apply salience decay now.\n"
+        "- export: write the compiled markdown wiki mirror."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "remember", "forget", "recent", "contradictions", "status", "consolidate", "journal", "distill", "history", "policy", "decay"],
+                "enum": ["search", "remember", "forget", "recent", "contradictions", "status", "consolidate", "journal", "distill", "history", "policy", "decay", "export"],
             },
             "query": {"type": "string", "description": "Search or forget query."},
             "scope": {
@@ -111,6 +113,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._store: MemoryStore | None = None
         self._llm: OpenAICompatibleLLM | None = None
         self._embedder: OpenAICompatibleEmbeddings | None = None
+        self._hermes_home = Path("~/.hermes").expanduser()
         self._llm_backend = "heuristic"
         self._retrieval_backend = "fts"
         self._session_id = ""
@@ -193,6 +196,31 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "default": "0.15",
             },
             {
+                "key": "wiki_export_enabled",
+                "description": "Enable compiled markdown wiki export",
+                "default": "false",
+            },
+            {
+                "key": "wiki_export_dir",
+                "description": "Directory for compiled wiki export",
+                "default": "$HERMES_HOME/consolidating_memory_wiki",
+            },
+            {
+                "key": "wiki_export_on_consolidate",
+                "description": "Refresh the wiki mirror after successful consolidation",
+                "default": "true",
+            },
+            {
+                "key": "wiki_export_session_limit",
+                "description": "Maximum number of session pages to export",
+                "default": "50",
+            },
+            {
+                "key": "wiki_export_topic_limit",
+                "description": "Maximum number of topic pages to export",
+                "default": "100",
+            },
+            {
                 "key": "extractor_backend",
                 "description": "Fact extraction backend",
                 "default": "hybrid",
@@ -264,6 +292,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         hermes_home = Path(str(kwargs.get("hermes_home") or Path("~/.hermes").expanduser()))
+        self._hermes_home = hermes_home
         db_path = str(self._config.get("db_path", "$HERMES_HOME/consolidating_memory.db"))
         db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
         defaults = load_hermes_model_defaults(hermes_home)
@@ -311,6 +340,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         retrieval_desc = self._retrieval_backend
         if self._retrieval_backend == "hybrid" and (not self._embedder or not self._embedder.enabled):
             retrieval_desc += " (embeddings unavailable, using FTS fallback)"
+        wiki_desc = "disabled"
+        if self._cfg()["wiki_export_enabled"]:
+            wiki_desc = f"enabled at {self._wiki_export_dir()}"
         return (
             "# Consolidating Memory\n"
             f"Active. {counts['facts']} facts, {counts['topics']} topics, {counts['summaries']} summaries, "
@@ -319,8 +351,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             f"Background consolidation gate: {cfg['min_hours']}h + {cfg['min_sessions']} sessions.\n"
             f"Extractor backend: {backend_desc}.\n"
             f"Retrieval backend: {retrieval_desc}.\n"
+            f"Compiled wiki export: {wiki_desc}.\n"
             f"Last consolidation: {last_text}.\n"
-            "Use consolidating_memory to search, remember, journal, distill, inspect history/policies, or force consolidation."
+            "Use consolidating_memory to search, remember, journal, distill, inspect history/policies, export the wiki mirror, or force consolidation."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -546,6 +579,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         "embedding_enabled": bool(self._embedder and self._embedder.enabled),
                         "last_decay_at": self._store.get_state("last_decay_at", ""),
                         "latest_session_summaries": self._store.latest_session_summaries(limit=3),
+                        "wiki_export": {
+                            "enabled": self._cfg()["wiki_export_enabled"],
+                            "on_consolidate": self._cfg()["wiki_export_on_consolidate"],
+                            "root": str(self._wiki_export_dir()),
+                            "last_export_at": self._store.get_state("last_wiki_export_at", ""),
+                            "last_export_stats": self._load_state_json("last_wiki_export_stats"),
+                        },
                         "config": self._cfg(),
                     }
                 )
@@ -615,6 +655,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     )
                 return json.dumps({"success": True, "action": action, "result": result})
 
+            if action == "export":
+                result = self._export_compiled_wiki(reason="tool")
+                return json.dumps({"success": True, "action": action, "result": result})
+
             return json.dumps({"success": False, "error": f"Unknown action: {action}"})
         except Exception as exc:
             logger.exception("Tool call failed for %s", self.name)
@@ -641,12 +685,39 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "episode_body_retention_hours": float(self._config.get("episode_body_retention_hours", 24)),
             "decay_half_life_days": float(self._config.get("decay_half_life_days", 90)),
             "decay_min_salience": float(self._config.get("decay_min_salience", 0.15)),
+            "wiki_export_enabled": self._cfg_bool("wiki_export_enabled", False),
+            "wiki_export_dir": str(self._config.get("wiki_export_dir", "$HERMES_HOME/consolidating_memory_wiki")),
+            "wiki_export_on_consolidate": self._cfg_bool("wiki_export_on_consolidate", True),
+            "wiki_export_session_limit": int(self._config.get("wiki_export_session_limit", 50)),
+            "wiki_export_topic_limit": int(self._config.get("wiki_export_topic_limit", 100)),
             "llm_timeout_seconds": int(self._config.get("llm_timeout_seconds", 45)),
             "llm_max_input_chars": int(self._config.get("llm_max_input_chars", 4000)),
             "retrieval_backend": str(self._config.get("retrieval_backend", "fts") or "fts").strip().lower(),
             "embedding_timeout_seconds": int(self._config.get("embedding_timeout_seconds", 20)),
             "embedding_candidate_limit": int(self._config.get("embedding_candidate_limit", 16)),
         }
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        raw = self._config.get(key, default)
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _wiki_export_dir(self) -> Path:
+        raw = str(self._cfg()["wiki_export_dir"] or "$HERMES_HOME/consolidating_memory_wiki")
+        return Path(raw.replace("$HERMES_HOME", str(self._hermes_home))).expanduser()
+
+    def _load_state_json(self, key: str) -> Dict[str, Any]:
+        if not self._store:
+            return {}
+        raw = str(self._store.get_state(key, "") or "").strip()
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _effective_retrieval_backend(self) -> str:
         if self._retrieval_backend == "hybrid" and self._embedder and self._embedder.enabled:
@@ -957,6 +1028,23 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
         return result
 
+    def _export_compiled_wiki(self, *, reason: str) -> Dict[str, Any]:
+        if not self._store:
+            return {"status": "uninitialized"}
+        result = export_compiled_wiki(
+            self._store,
+            export_dir=self._wiki_export_dir(),
+            session_limit=self._cfg()["wiki_export_session_limit"],
+            topic_limit=self._cfg()["wiki_export_topic_limit"],
+        )
+        result["reason"] = reason
+        result["enabled"] = self._cfg()["wiki_export_enabled"]
+        now = time.time()
+        self._store.set_state("last_wiki_export_at", now)
+        self._store.set_state("last_wiki_export_root", result["root"])
+        self._store.set_state("last_wiki_export_stats", json.dumps(result, sort_keys=True))
+        return result
+
     def _enqueue(self, kind: str, **payload: Any) -> None:
         if self._stop_event.is_set():
             return
@@ -1142,7 +1230,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not self._consolidation_lock.acquire(blocking=False):
             return {"status": "busy"}
         try:
-            return run_consolidation(
+            result = run_consolidation(
                 self._store,
                 min_hours=self._cfg()["min_hours"],
                 min_sessions=self._cfg()["min_sessions"],
@@ -1158,6 +1246,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 force=force,
                 reason=reason,
             )
+            if result.get("status") == "completed" and self._cfg()["wiki_export_enabled"] and self._cfg()["wiki_export_on_consolidate"]:
+                try:
+                    result["wiki_export"] = self._export_compiled_wiki(reason=f"consolidation:{reason}")
+                except Exception as exc:
+                    logger.warning("Wiki export failed after consolidation: %s", exc)
+                    result["wiki_export"] = {"success": False, "error": str(exc)}
+            return result
         finally:
             self._consolidation_lock.release()
 
