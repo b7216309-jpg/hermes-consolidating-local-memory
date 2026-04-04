@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Sequence
 from urllib import error, request
 
 logger = logging.getLogger(__name__)
@@ -71,26 +71,10 @@ class OpenAICompatibleLLM:
     def enabled(self) -> bool:
         return bool(self.model and self.base_url)
 
-    def chat_json(
-        self,
-        *,
-        system_prompt: str,
-        user_prompt: str,
-        temperature: float = 0.1,
-        max_tokens: int = 700,
-    ) -> Dict[str, Any] | None:
+    def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
         if not self.enabled:
             return None
-        url = f"{self.base_url}/chat/completions"
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "temperature": float(temperature),
-            "max_tokens": int(max_tokens),
-        }
+        url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -102,16 +86,37 @@ class OpenAICompatibleLLM:
         )
         try:
             with request.urlopen(req, timeout=self.timeout_seconds) as response:
-                body = json.loads(response.read().decode("utf-8"))
+                return json.loads(response.read().decode("utf-8"))
         except error.HTTPError as exc:
             try:
                 detail = exc.read().decode("utf-8", errors="ignore")
             except Exception:
                 detail = str(exc)
-            logger.warning("Local LLM request failed (%s): %s", exc.code, detail[:500])
+            logger.warning("Local model request failed (%s): %s", exc.code, detail[:500])
             return None
         except Exception as exc:
-            logger.warning("Local LLM request failed: %s", exc)
+            logger.warning("Local model request failed: %s", exc)
+            return None
+
+    def chat_json(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 700,
+    ) -> Dict[str, Any] | None:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+        body = self._post_json("/chat/completions", payload)
+        if not body:
             return None
 
         content = ""
@@ -128,6 +133,36 @@ class OpenAICompatibleLLM:
             else:
                 content = str(raw_content or "")
         return extract_json_object(content)
+
+
+class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
+    def embed_texts(self, texts: Sequence[str]) -> List[List[float]] | None:
+        clean = [str(text or "").strip() for text in texts]
+        if not clean or not self.enabled:
+            return None
+        body = self._post_json(
+            "/embeddings",
+            {
+                "model": self.model,
+                "input": clean,
+            },
+        )
+        if not body or not isinstance(body.get("data"), list):
+            return None
+        vectors: List[List[float]] = []
+        for item in body.get("data", []):
+            if not isinstance(item, dict):
+                return None
+            vector = item.get("embedding")
+            if not isinstance(vector, list):
+                return None
+            try:
+                vectors.append([float(value) for value in vector])
+            except Exception:
+                return None
+        if len(vectors) != len(clean):
+            return None
+        return vectors
 
 
 def env_or_blank(name: str) -> str:

@@ -67,6 +67,112 @@ WORKFLOW_HINTS = (
     "run tests",
 )
 
+PERSONAL_DETAIL_HINTS = (
+    "favorite",
+    "vegetarian",
+    "vegan",
+    "pescatarian",
+    "gluten-free",
+    "gluten free",
+    "allergic to",
+    "pronouns",
+    "i'm from",
+    "i am from",
+    "i live in",
+    "i'm based in",
+    "i am based in",
+    "i grew up in",
+    "single",
+    "married",
+    "engaged",
+    "divorced",
+    "widowed",
+)
+
+LIFE_EVENT_HINTS = (
+    "birthday",
+    "wedding",
+    "married",
+    "getting married",
+    "engaged",
+    "graduat",
+    "vacation",
+    "holiday",
+    "trip",
+    "flight",
+    "move",
+    "moving",
+    "relocat",
+    "baby",
+    "pregnan",
+    "anniversary",
+    "funeral",
+    "surgery",
+    "appointment",
+    "concert",
+)
+
+TIME_REFERENCE_HINTS = (
+    "today",
+    "yesterday",
+    "tomorrow",
+    "tonight",
+    "this week",
+    "next week",
+    "last week",
+    "this month",
+    "next month",
+    "last month",
+    "this year",
+    "next year",
+    "last year",
+    "this weekend",
+    "next weekend",
+    "last weekend",
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+
+RELATION_HINTS = (
+    "my sister",
+    "my brother",
+    "my mom",
+    "my mother",
+    "my dad",
+    "my father",
+    "my wife",
+    "my husband",
+    "my partner",
+    "my girlfriend",
+    "my boyfriend",
+    "my fiance",
+    "my fiancee",
+    "my son",
+    "my daughter",
+    "my kid",
+    "my child",
+    "my children",
+    "my parents",
+    "my family",
+)
+
 STYLE_VALUE_MAP = {
     "concise": "concise",
     "brief": "concise",
@@ -203,6 +309,10 @@ def infer_category(sentence: str) -> str:
     lower = sentence.lower()
     if any(hint in lower for hint in PREFERENCE_HINTS):
         return "user_pref"
+    if any(hint in lower for hint in PERSONAL_DETAIL_HINTS):
+        return "user_pref"
+    if any(hint in lower for hint in LIFE_EVENT_HINTS) and _has_time_reference(lower):
+        return "general"
     if any(hint in lower for hint in PROJECT_HINTS):
         return "project"
     if any(hint in lower for hint in ENVIRONMENT_HINTS):
@@ -213,6 +323,23 @@ def infer_category(sentence: str) -> str:
 
 
 def infer_topic(sentence: str, category: str, subject_key: str = "") -> str:
+    if subject_key in {"user:response_style", "user:answer_format"}:
+        return "user-preferences"
+    if subject_key.startswith("user:preference:") or subject_key.startswith("user:favorite:"):
+        return "user-preferences"
+    if subject_key.startswith("user:event:"):
+        return "life-events"
+    if subject_key in {
+        "user:role",
+        "user:timezone",
+        "user:diet",
+        "user:origin",
+        "user:hometown",
+        "user:location:current",
+        "user:pronouns",
+        "user:relationship_status",
+    } or subject_key.startswith("user:allergy:"):
+        return "personal-profile"
     if subject_key.startswith("user:"):
         return "user-profile"
     if subject_key.startswith("environment:"):
@@ -273,8 +400,77 @@ def is_memory_worthy(sentence: str) -> bool:
     lower = sentence.lower()
     return any(
         hint in lower
-        for hint in (PREFERENCE_HINTS + PROJECT_HINTS + ENVIRONMENT_HINTS + WORKFLOW_HINTS)
+        for hint in (PREFERENCE_HINTS + PROJECT_HINTS + ENVIRONMENT_HINTS + WORKFLOW_HINTS + PERSONAL_DETAIL_HINTS)
+    ) or (any(hint in lower for hint in LIFE_EVENT_HINTS) and _has_time_reference(lower))
+
+
+def _has_time_reference(text: str) -> bool:
+    lower = text.lower()
+    if any(token in lower for token in TIME_REFERENCE_HINTS):
+        return True
+    return bool(
+        re.search(
+            r"\b\d{4}-\d{2}-\d{2}\b|\b(?:in|on)\s+\d{4}\b|\b(?:this|next|last)\s+(?:summer|winter|spring|fall|autumn|week|month|year|weekend)\b",
+            lower,
+            flags=re.IGNORECASE,
+        )
     )
+
+
+def _trim_phrase(text: str, *, split_lists: bool = False) -> str:
+    clean = normalize_whitespace(text.strip(" .,!?:;\"'`"))
+    clean = re.sub(r"\b(?:right now|currently|for now|these days|now)$", "", clean, flags=re.IGNORECASE)
+    clean = normalize_whitespace(clean)
+    if split_lists:
+        return clean
+    parts = re.split(r"\b(?:because|since|but|although|though|while|currently|with)\b", clean, maxsplit=1, flags=re.IGNORECASE)
+    return normalize_whitespace(parts[0] if parts else clean)
+
+
+def _normalize_preference_items(raw: str) -> List[str]:
+    clean = _trim_phrase(raw, split_lists=True)
+    if not clean:
+        return []
+    parts = re.split(r"\s*,\s*|\s+\band\b\s+|\s+\bor\b\s+", clean, flags=re.IGNORECASE)
+    if len(parts) <= 1:
+        parts = [clean]
+    items: List[str] = []
+    seen = set()
+    for part in parts[:4]:
+        item = normalize_whitespace(part.strip(" .,!?:;\"'`"))
+        item = re.sub(r"^(?:a|an|the|my)\s+", "", item, flags=re.IGNORECASE)
+        item = re.sub(r"\b(?:a lot|very much|too much)$", "", item, flags=re.IGNORECASE)
+        item = normalize_whitespace(item)
+        if not item or len(item) > 48:
+            continue
+        if any(
+            token in item.lower()
+            for token in (
+                "response",
+                "responses",
+                "answer",
+                "answers",
+                "explanation",
+                "explanations",
+                "bullet",
+                "bullets",
+                "paragraph",
+                "paragraphs",
+                "format",
+                "tone",
+                "style",
+                "markdown",
+                "code block",
+                "code blocks",
+            )
+        ):
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+    return items
 
 
 def _extract_response_style(segment: str, source_role: str) -> List[Dict[str, Any]]:
@@ -342,6 +538,64 @@ def _extract_answer_format(segment: str, source_role: str) -> List[Dict[str, Any
     return []
 
 
+def _extract_favorite_things(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    match = re.search(
+        r"\bmy\s+favorite\s+([a-z][a-z0-9 _/-]{1,24})\s+is\s+(.+?)(?:[.;,]|$)",
+        segment,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return []
+    trait = normalize_whitespace(match.group(1))
+    value = _trim_phrase(match.group(2))
+    if not trait or not value:
+        return []
+    return [
+        build_candidate(
+            content=f"User's favorite {trait} is {value}",
+            category="user_pref",
+            topic="user-preferences",
+            importance=7,
+            confidence=0.85 if source_role == "user" else 0.6,
+            source_role=source_role,
+            subject_key=f"user:favorite:{slugify(trait)}",
+            value_key=slugify(value),
+            exclusive=True,
+            metadata={"trait_label": trait, "value_label": value},
+        )
+    ]
+
+
+def _extract_user_preferences(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    patterns = (
+        (r"\bi\s+(?:really\s+|absolutely\s+|honestly\s+|pretty\s+much\s+|kind of\s+|kinda\s+)*(like|love|enjoy|prefer)\s+(.+?)(?:[.;,]|$)", 1, "likes"),
+        (r"\bi\s+(?:really\s+|absolutely\s+|honestly\s+)*(dislike|hate|avoid|can't stand|cannot stand|do not like|don't like)\s+(.+?)(?:[.;,]|$)", -1, "dislikes"),
+    )
+    candidates: List[Dict[str, Any]] = []
+    for pattern, polarity, verb in patterns:
+        match = re.search(pattern, segment, flags=re.IGNORECASE)
+        if not match:
+            continue
+        for item in _normalize_preference_items(match.group(2)):
+            candidates.append(
+                build_candidate(
+                    content=f"User {verb} {item}",
+                    category="user_pref",
+                    topic="user-preferences",
+                    importance=6 if polarity > 0 else 7,
+                    confidence=0.85 if source_role == "user" else 0.6,
+                    source_role=source_role,
+                    subject_key=f"user:preference:{slugify(item)}",
+                    value_key="like" if polarity > 0 else "dislike",
+                    exclusive=True,
+                    polarity=polarity,
+                    metadata={"item_label": item},
+                )
+            )
+        break
+    return candidates
+
+
 def _extract_user_role(segment: str, source_role: str) -> List[Dict[str, Any]]:
     match = re.search(
         r"\b(?:i am|i'm|the user is|user is)\s+(?:a|an)\s+([a-z][a-z0-9 /+-]{2,40})\b",
@@ -364,6 +618,157 @@ def _extract_user_role(segment: str, source_role: str) -> List[Dict[str, Any]]:
             exclusive=True,
         )
     ]
+
+
+def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+
+    match = re.search(r"\bmy\s+pronouns\s+are\s+([A-Za-z/ -]{2,24})\b", segment, flags=re.IGNORECASE)
+    if match:
+        pronouns = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User pronouns are {pronouns}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=8,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:pronouns",
+                value_key=slugify(pronouns),
+                exclusive=True,
+                metadata={"pronouns_label": pronouns},
+            )
+        )
+
+    match = re.search(
+        r"\b(?:i(?:'m| am)\s+based in|i live in)\s+(.+?)(?:[.;,]|$)",
+        segment,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        location = _trim_phrase(match.group(1))
+        if location:
+            candidates.append(
+                build_candidate(
+                    content=f"User lives in {location}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:location:current",
+                    value_key=slugify(location),
+                    exclusive=True,
+                    metadata={"location_label": location},
+                )
+            )
+
+    match = re.search(r"\b(?:i(?:'m| am)\s+from)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
+    if match:
+        origin = _trim_phrase(match.group(1))
+        if origin:
+            candidates.append(
+                build_candidate(
+                    content=f"User is from {origin}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:origin",
+                    value_key=slugify(origin),
+                    exclusive=True,
+                    metadata={"origin_label": origin},
+                )
+            )
+
+    match = re.search(r"\bi grew up in\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
+    if match:
+        hometown = _trim_phrase(match.group(1))
+        if hometown:
+            candidates.append(
+                build_candidate(
+                    content=f"User grew up in {hometown}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:hometown",
+                    value_key=slugify(hometown),
+                    exclusive=True,
+                    metadata={"hometown_label": hometown},
+                )
+            )
+
+    match = re.search(
+        r"\bi(?:'m| am)\s+(vegetarian|vegan|pescatarian|gluten[- ]free|lactose intolerant)\b",
+        segment,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        diet = normalize_whitespace(match.group(1)).replace("  ", " ")
+        candidates.append(
+            build_candidate(
+                content=f"User is {diet}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=8,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:diet",
+                value_key=slugify(diet),
+                exclusive=True,
+                metadata={"diet_label": diet},
+            )
+        )
+
+    match = re.search(r"\bi(?:'m| am)\s+(single|married|engaged|divorced|widowed)\b", segment, flags=re.IGNORECASE)
+    if match:
+        status = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User is {status}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=7,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:relationship_status",
+                value_key=slugify(status),
+                exclusive=True,
+                metadata={"relationship_label": status},
+            )
+        )
+
+    for pattern, polarity, label in (
+        (r"\bi(?:'m| am)\s+allergic to\s+(.+?)(?:[.;,]|$)", 1, "allergic"),
+        (r"\bi(?:'m| am)\s+not allergic to\s+(.+?)(?:[.;,]|$)", -1, "not allergic"),
+    ):
+        match = re.search(pattern, segment, flags=re.IGNORECASE)
+        if not match:
+            continue
+        for item in _normalize_preference_items(match.group(1)):
+            candidates.append(
+                build_candidate(
+                    content=f"User is {label} to {item}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=8,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key=f"user:allergy:{slugify(item)}",
+                    value_key="allergic" if polarity > 0 else "not-allergic",
+                    exclusive=True,
+                    polarity=polarity,
+                    metadata={"item_label": item},
+                )
+            )
+        break
+
+    return candidates
 
 
 def _extract_timezone(segment: str, source_role: str) -> List[Dict[str, Any]]:
@@ -680,11 +1085,45 @@ def _extract_generic_rule(segment: str, source_role: str) -> List[Dict[str, Any]
     ]
 
 
+def _extract_life_event(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    lower = segment.lower()
+    if not re.search(r"\b(i|my|we|our)\b", lower):
+        return []
+    if not any(hint in lower for hint in LIFE_EVENT_HINTS):
+        return []
+    if not (_has_time_reference(lower) or any(hint in lower for hint in RELATION_HINTS)):
+        return []
+    event_type = next((hint for hint in LIFE_EVENT_HINTS if hint in lower), "life-event")
+    metadata: Dict[str, Any] = {"kind": "life_event", "event_type": slugify(event_type)}
+    date_match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", segment)
+    if date_match:
+        metadata["event_date"] = date_match.group(0)
+    relation = next((hint for hint in RELATION_HINTS if hint in lower), "")
+    if relation:
+        metadata["relation_label"] = relation.replace("my ", "").strip()
+    return [
+        build_candidate(
+            content=segment,
+            category="general",
+            topic="life-events",
+            importance=8 if any(token in lower for token in ("birthday", "wedding", "married", "graduat", "surgery", "baby")) else 7,
+            confidence=0.85 if source_role == "user" else 0.6,
+            source_role=source_role,
+            subject_key=f"user:event:{slugify(event_type)}",
+            value_key=slugify(segment[:64]),
+            metadata=metadata,
+        )
+    ]
+
+
 def _structured_candidates(segment: str, source_role: str) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     extractors = (
         _extract_response_style,
         _extract_answer_format,
+        _extract_favorite_things,
+        _extract_user_preferences,
+        _extract_personal_details,
         _extract_user_role,
         _extract_timezone,
         _extract_shell,
@@ -697,6 +1136,7 @@ def _structured_candidates(segment: str, source_role: str) -> List[Dict[str, Any
         _extract_deploy_method,
         _extract_database_identity,
         _extract_project_techs,
+        _extract_life_event,
         _extract_generic_rule,
     )
     for extractor in extractors:
@@ -813,6 +1253,7 @@ def build_consolidation_plan(store: MemoryStore, *, min_hours: int, min_sessions
     hours_since = (time.time() - last_at) / 3600 if last_at else float("inf")
     pending_sessions = store.sessions_since_episode(last_episode_id)
     pending_episodes = store.latest_episode_id() - last_episode_id
+    has_pending = pending_episodes > 0
     return {
         "last_consolidated_at": last_at,
         "last_consolidated_episode_id": last_episode_id,
@@ -821,9 +1262,30 @@ def build_consolidation_plan(store: MemoryStore, *, min_hours: int, min_sessions
         "pending_episodes": int(max(pending_episodes, 0)),
         "min_hours": int(min_hours),
         "min_sessions": int(min_sessions),
-        "should_run": (hours_since == float("inf") or hours_since >= min_hours)
+        "should_run": has_pending and (hours_since == float("inf") or hours_since >= min_hours)
         and pending_sessions >= min_sessions,
     }
+
+
+def _build_session_summary_text(artifacts: Dict[str, Any], *, max_chars: int) -> str:
+    parts: List[str] = []
+    facts = [str(item.get("content") or "") for item in artifacts.get("facts", [])[:4] if item.get("content")]
+    if facts:
+        parts.append("Facts: " + "; ".join(facts))
+    journals = [str(item.get("content") or "") for item in artifacts.get("journals", [])[:2] if item.get("content")]
+    if journals:
+        parts.append("Notes: " + " | ".join(journals))
+    traces = [str(item.get("content") or "") for item in artifacts.get("traces", [])[:3] if item.get("content")]
+    if traces:
+        parts.append("Recent flow: " + " | ".join(traces))
+    preferences = [str(item.get("content") or item.get("label") or "") for item in artifacts.get("preferences", [])[:2] if item.get("content") or item.get("label")]
+    if preferences:
+        parts.append("Preferences: " + " | ".join(preferences))
+    policies = [str(item.get("content") or item.get("label") or "") for item in artifacts.get("policies", [])[:2] if item.get("content") or item.get("label")]
+    if policies:
+        parts.append("Policies: " + " | ".join(policies))
+    summary = " ".join(part for part in parts if part).strip()
+    return summary[:max_chars] if summary else ""
 
 
 def run_consolidation(
@@ -834,7 +1296,12 @@ def run_consolidation(
     max_topic_facts: int,
     topic_summary_chars: int,
     prune_after_days: int,
+    session_summary_chars: int = 900,
+    episode_retention_hours: float = 24.0,
+    decay_half_life_days: float = 90.0,
+    decay_min_salience: float = 0.15,
     extractor=None,
+    fact_writer=None,
     force: bool = False,
     reason: str = "auto",
 ) -> Dict[str, Any]:
@@ -850,24 +1317,36 @@ def run_consolidation(
     facts_updated = 0
     facts_superseded = 0
     contradictions_resolved = 0
+    touched_sessions = set()
 
     for episode in episodes:
         extract = extractor or extract_candidate_facts_from_turn
+        session_id = normalize_whitespace(str(episode.get("session_id") or ""))
+        if session_id:
+            touched_sessions.add(session_id)
         for candidate in extract(
             user_content=str(episode.get("user_content", "")),
             assistant_content=str(episode.get("assistant_content", "")),
             created_at=float(episode.get("created_at") or started_at),
         ):
-            result = store.upsert_fact(
-                content=str(candidate["content"]),
-                category=str(candidate["category"]),
-                topic=str(candidate["topic"]),
-                source="episode_extract",
-                importance=int(candidate["importance"]),
-                confidence=float(candidate["confidence"]),
-                metadata=dict(candidate.get("metadata") or {}),
-                observed_at=float(episode.get("created_at") or started_at),
-            )
+            if fact_writer:
+                result = fact_writer(candidate, episode)
+            else:
+                result = store.upsert_fact(
+                    content=str(candidate["content"]),
+                    category=str(candidate["category"]),
+                    topic=str(candidate["topic"]),
+                    source="episode_extract",
+                    importance=int(candidate["importance"]),
+                    confidence=float(candidate["confidence"]),
+                    metadata=dict(candidate.get("metadata") or {}),
+                    observed_at=float(episode.get("created_at") or started_at),
+                    source_session_id=session_id,
+                    history_reason="episode_extract",
+                )
+                fact_id = dict(result.get("fact") or {}).get("id")
+                if fact_id is not None and episode.get("id") is not None:
+                    store.add_link("fact", fact_id, "episode", int(episode["id"]), "derived_from_episode")
             if result["action"] == "inserted":
                 facts_added += 1
             else:
@@ -876,11 +1355,53 @@ def run_consolidation(
             contradictions_resolved += len(result.get("contradictions", []))
 
     pruned = store.prune_stale_facts(max_age_days=prune_after_days)
+    decay_stats = store.apply_decay(
+        half_life_days=decay_half_life_days,
+        min_salience=decay_min_salience,
+    )
     topics_rebuilt = store.rebuild_topics(
         max_facts=max_topic_facts,
         max_chars=topic_summary_chars,
     )
+    session_summaries = 0
+    for session_id in sorted(touched_sessions):
+        artifacts = store.get_session_artifacts(session_id, limit=max(8, max_topic_facts * 2))
+        summary = _build_session_summary_text(artifacts, max_chars=int(session_summary_chars))
+        if not summary:
+            continue
+        refs: List[Dict[str, Any]] = []
+        kind_map = {
+            "facts": "fact",
+            "journals": "journal",
+            "traces": "trace",
+            "episodes": "episode",
+            "preferences": "preference",
+            "policies": "policy",
+        }
+        for section in ("facts", "journals", "traces", "episodes", "preferences", "policies"):
+            for item in artifacts.get(section, [])[:4]:
+                if item.get("id") is None:
+                    continue
+                refs.append({"kind": kind_map[section], "id": item["id"]})
+        store.upsert_summary(
+            label="Session Summary",
+            summary=summary,
+            session_id=session_id,
+            content=summary,
+            summary_type="session",
+            metadata={"source": "consolidation"},
+            importance=8,
+            salience=0.72,
+            source_refs=refs,
+            reason="consolidation_distill",
+        )
+        store.ensure_memory_session(session_id, summary=summary)
+        session_summaries += 1
     latest_episode_id = store.latest_episode_id()
+    episodes_pruned = store.purge_episode_buffers(
+        retention_hours=episode_retention_hours,
+        max_episode_id=latest_episode_id,
+    )
     finished_at = time.time()
 
     stats = {
@@ -893,6 +1414,9 @@ def run_consolidation(
         "contradictions_resolved": contradictions_resolved,
         "facts_pruned": pruned,
         "topics_rebuilt": topics_rebuilt,
+        "session_summaries": session_summaries,
+        "episodes_pruned": episodes_pruned,
+        "decay": decay_stats,
         "latest_episode_id": latest_episode_id,
         "counts": store.counts(),
         "duration_seconds": round(finished_at - started_at, 3),

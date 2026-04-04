@@ -1,6 +1,6 @@
 name: consolidating_local
-version: 0.1.0
-description: "Local SQLite memory provider with episodic storage, topic summaries, and background consolidation."
+version: 0.2.0
+description: "Local SQLite memory provider with layered sessions, summaries, provenance, and background consolidation."
 hooks:
   - on_turn_start
   - on_session_end
