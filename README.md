@@ -56,7 +56,7 @@ Implemented today:
 - spaced review scheduling
 - built-in snapshot sync back to `USER.md` and `MEMORY.md`
 - retrieval modes for current-state, summary, workflow, history, and provenance queries
-- optional OpenAI-compatible extraction
+- LLM extraction through OpenAI-compatible `/chat/completions` and Hermes Codex `/responses`
 - optional OpenAI-compatible embedding reranking
 - compiled markdown wiki export
 - Python-accessible `get_context(...)` and `ConsolidatingLocalProvider` alias for direct integration
@@ -280,7 +280,10 @@ Retrieval backends:
 
 ## Local Model Support
 
-The plugin can call OpenAI-compatible endpoints for both extraction and embeddings.
+The plugin can call:
+
+- OpenAI-compatible endpoints for extraction and embeddings
+- Hermes Codex `/responses` endpoints for extraction
 
 Resolution order for model settings:
 
@@ -299,6 +302,12 @@ If your embedding endpoint uses separate credentials:
 ```bash
 export CONSOLIDATING_MEMORY_EMBEDDING_API_KEY=...
 ```
+
+Current limitation:
+
+- Codex-style backends can now drive extraction
+- embedding reranking still needs a real `/embeddings` endpoint
+- if no embeddings endpoint is available, run retrieval in `fts` mode
 
 ## Compiled Wiki Mirror
 
@@ -377,12 +386,19 @@ Current WSL support includes:
 
 This matters because direct raw `AIAgent(model=...)` initialization can misroute Codex/OpenAI-style providers even when normal Hermes CLI usage works.
 
-The complete real benchmark uses the same resolved Hermes runtime route for agent chats, but the addon's LLM extraction and embedding backends still require a real OpenAI-compatible backend.
+The complete real benchmark uses the same resolved Hermes runtime route for agent chats.
+
+Current backend behavior:
+
+- addon extraction can now use the same Hermes Codex runtime through `/responses`
+- addon embeddings still require a real OpenAI-compatible `/embeddings` backend
+- if no embedding backend is available, run the full benchmark with `--retrieval-backend fts`
 
 Important limitation:
 
-- ChatGPT Codex-style runtime URLs such as `chatgpt.com/backend-api/codex` are valid for Hermes agent chats but are not valid plugin backends for `consolidating_local`, because the plugin currently talks to `/chat/completions` and `/embeddings`
-- for the full benchmark, use `--addon-llm-base-url` and `--addon-embedding-base-url` with an OpenAI-compatible endpoint if your normal Hermes runtime resolves to Codex
+- ChatGPT Codex-style runtime URLs such as `chatgpt.com/backend-api/codex` are now supported for addon extraction
+- they are still not valid embedding backends, because the plugin has no Codex embedding path
+- for hybrid retrieval, use `--addon-embedding-base-url` with a real OpenAI-compatible endpoint
 
 ### Benchmark Dimensions
 
@@ -420,6 +436,11 @@ Current design:
 - addon uses the same real chats plus provider hook-style turn sync and session finalization
 - addon defaults to `extractor_backend=llm` and `retrieval_backend=hybrid`
 - evaluation prompts are separate real agent calls and scored locally from JSON responses
+
+In practice:
+
+- if your Hermes runtime is Codex-only, extraction can still run through the resolved Codex backend
+- if you do not also have a working embeddings endpoint, use `--retrieval-backend fts`
 
 The current real dimensions are:
 
@@ -496,25 +517,29 @@ Important CLI options for the complete real benchmark:
 - `--addon-embedding-model`
 - `--addon-embedding-base-url`
 
-Example complete real benchmark run:
+Example complete real benchmark run using the shipped Codex-backed extractor path:
 
 ```powershell
 python bench_compare_full.py `
   --model gpt-5.4 `
+  --scale-facts 50 `
   --dims REAL-1,REAL-2,REAL-3,REAL-4,REAL-5 `
   --output .\artifacts\benchmark\bench_results_full_YYYYMMDDTHHMMSSZ.json `
   --hermes-home-baseline .\tmp_baseline_real `
   --hermes-home-addon .\tmp_addon_real `
   --timeout 900 `
   --seed-batch-size 5 `
-  --addon-llm-model "gpt-4o-mini" `
-  --addon-llm-base-url "https://api.openai.com/v1" `
-  --addon-embedding-model "text-embedding-3-large" `
-  --addon-embedding-base-url "https://api.openai.com/v1" `
+  --addon-llm-model "gpt-5.4" `
+  --retrieval-backend fts `
   --use-wsl `
   --wsl-distro Ubuntu `
   --wsl-hermes-root "~/.hermes/hermes-agent"
 ```
+
+If you do have a working embeddings endpoint and want hybrid retrieval, also provide:
+
+- `--addon-embedding-model`
+- `--addon-embedding-base-url`
 
 Set backend auth through environment variables when needed:
 
@@ -565,7 +590,22 @@ python -m bench_compare.report_pdf `
   --output .\artifacts\benchmark\Hermes_Memory_Comparative_Report_YYYYMMDD.pdf
 ```
 
+The same renderer also supports complete real benchmark JSON:
+
+```powershell
+python -m bench_compare.report_pdf `
+  --input .\artifacts\benchmark\bench_results_full_YYYYMMDDTHHMMSSZ.json `
+  --output .\artifacts\benchmark\Hermes_Complete_Real_Benchmark_Report_YYYYMMDD.pdf
+```
+
 Generated benchmark artifacts are intended to live under `artifacts/benchmark/`, which is git-ignored.
+
+Current kept final artifacts:
+
+- `artifacts/benchmark/bench_results_report_source_20260405.json`
+- `artifacts/benchmark/Hermes_Memory_Comparative_Report_20260405.pdf`
+- `artifacts/benchmark/bench_results_full_20260405T202253Z_clean.json`
+- `artifacts/benchmark/Hermes_Complete_Real_Benchmark_Report_20260405.pdf`
 
 ## Repository Layout
 

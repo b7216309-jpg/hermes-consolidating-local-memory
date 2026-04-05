@@ -12,14 +12,22 @@ It is written for the current environment:
 
 ## Goal
 
-Run the baseline vs addon comparison benchmark while:
+Run either benchmark mode while:
 
 - using the installed Hermes runtime from WSL2
 - keeping benchmark data in temporary benchmark homes
 - optionally wiping live Hermes memory before and after the run
 - preserving live Hermes auth and config
 
-## Important Finding
+The repo now ships two benchmark modes:
+
+- low-token structural benchmark
+  `bench_compare.py`
+
+- complete real benchmark
+  `bench_compare_full.py`
+
+## Important Findings
 
 The recall dimensions must not instantiate raw `run_agent.AIAgent(model=...)`
 without resolving runtime first.
@@ -40,13 +48,23 @@ That file now resolves Hermes runtime inside the recall subprocess using
 `hermes_cli.runtime_provider.resolve_runtime_provider(...)` before building
 `AIAgent`.
 
+Second important finding:
+
+- the complete real benchmark can now use the installed Hermes Codex backend for addon extraction
+- this works because the plugin LLM client supports Codex `/responses` in addition to OpenAI-compatible `/chat/completions`
+- embeddings are still a separate issue: if there is no live `/embeddings` backend, run the complete real benchmark with `--retrieval-backend fts`
+
 ## Files That Matter
 
 - [bench_compare.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare.py)
+- [bench_compare_full.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare_full.py)
 - [__main__.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/__main__.py)
+- [full_main.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/full_main.py)
 - [llm.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/utils/llm.py)
 - [wsl.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/utils/wsl.py)
 - [systems.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/systems.py)
+- [report_pdf.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/report_pdf.py)
+- [llm_client.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/plugins/memory/consolidating_local/llm_client.py)
 
 ## Live Hermes Memory Surfaces
 
@@ -121,7 +139,7 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText((Join-Path $memoryDir 'USER.md'), '', $utf8NoBom)
 ```
 
-### 3. Run the full benchmark
+### 3. Run the low-token structural benchmark
 
 Use temp benchmark homes, not `~/.hermes`:
 
@@ -147,6 +165,34 @@ Notes:
 - The benchmark copies runtime auth/config seeds needed for the temp homes.
 - `artifacts/benchmark/` is ignored by git, so generated JSON/PDF outputs stay out of repo status.
 
+### 3b. Run the complete real benchmark
+
+Use temp benchmark homes, not `~/.hermes`:
+
+```powershell
+python bench_compare_full.py `
+  --model gpt-5.4 `
+  --scale-facts 50 `
+  --dims REAL-1,REAL-2,REAL-3,REAL-4,REAL-5 `
+  --output .\artifacts\benchmark\bench_results_full_YYYYMMDDTHHMMSSZ.json `
+  --hermes-home-baseline .\tmp_full_baseline `
+  --hermes-home-addon .\tmp_full_addon `
+  --timeout 900 `
+  --seed-batch-size 5 `
+  --addon-llm-model gpt-5.4 `
+  --retrieval-backend fts `
+  --use-wsl `
+  --wsl-distro Ubuntu `
+  --wsl-hermes-root "~/.hermes/hermes-agent"
+```
+
+Notes:
+
+- this is the exact working path used for the final complete real benchmark run
+- addon extraction uses the resolved Codex backend through `/responses`
+- retrieval is set to `fts` because the current installation does not expose a live embeddings endpoint
+- if a working embeddings endpoint becomes available, switch to `--retrieval-backend hybrid` and pass `--addon-embedding-model` plus `--addon-embedding-base-url`
+
 ### 4. Check the result file
 
 The final result JSON will be the file passed via `--output`.
@@ -154,6 +200,10 @@ The final result JSON will be the file passed via `--output`.
 Good recent known-good example:
 
 - `artifacts/benchmark/bench_results_report_source_20260405.json`
+
+Good recent known-good complete real example:
+
+- `artifacts/benchmark/bench_results_full_20260405T202253Z_clean.json`
 
 Key values from that run:
 
@@ -164,6 +214,15 @@ Key values from that run:
 - `DIM-5`: baseline `2710ch rel=1.00`, addon `2941ch rel=1.00`
 - `DIM-6`: addon `PASS hi-lo=0.48`
 - `DIM-7`: baseline `SNR=0.39`, addon `SNR=0.90`
+
+Key values from the complete real run:
+
+- `REAL-1`: baseline `F1=0.36`, addon `F1=0.92`
+- `REAL-2`: baseline `acc=1.00`, addon `acc=0.90`
+- `REAL-3`: tie at `0.90`
+- `REAL-4`: baseline `SNR=0.50`, addon `SNR=0.87`
+- `REAL-5`: tie at `F1=1.00`
+- overall winner: addon
 
 ### 4b. Render the PDF report
 
@@ -181,6 +240,14 @@ This produces a multi-page PDF with:
 - overview graphs
 - one explanation page per dimension
 - compact appendix table
+
+For the complete real benchmark:
+
+```powershell
+python -m bench_compare.report_pdf `
+  --input .\artifacts\benchmark\bench_results_full_20260405T202253Z_clean.json `
+  --output .\artifacts\benchmark\Hermes_Complete_Real_Benchmark_Report_20260405.pdf
+```
 
 ### 5. Wipe live Hermes memory again after the run
 
@@ -240,6 +307,27 @@ python bench_compare.py `
   --wsl-hermes-root "~/.hermes/hermes-agent"
 ```
 
+### Complete-real smoke run
+
+Use this before the expensive full run:
+
+```powershell
+python bench_compare_full.py `
+  --model gpt-5.4 `
+  --scale-facts 10 `
+  --dims REAL-1 `
+  --output .\artifacts\benchmark\bench_results_full_smoke.json `
+  --hermes-home-baseline .\tmp_full_smoke_baseline `
+  --hermes-home-addon .\tmp_full_smoke_addon `
+  --timeout 600 `
+  --seed-batch-size 5 `
+  --addon-llm-model gpt-5.4 `
+  --retrieval-backend fts `
+  --use-wsl `
+  --wsl-distro Ubuntu `
+  --wsl-hermes-root "~/.hermes/hermes-agent"
+```
+
 ## Current DIM-5 Status
 
 `DIM-5` is resolved.
@@ -262,6 +350,24 @@ If this regresses in the future, inspect:
 - `bench_compare/dims/dim5_prefetch.py`
 - `bench_compare/report_pdf.py`
 - `plugins/memory/consolidating_local/__init__.py`
+
+## Current Complete-Real Backend Status
+
+What works on this machine today:
+
+- Hermes runtime resolves to `openai-codex`
+- addon extraction can use that Codex backend through `/responses`
+- complete real benchmark runs successfully with `--addon-llm-model gpt-5.4`
+
+What does not currently work:
+
+- the old local OpenAI-style base URL in `~/.hermes/.env` at `http://172.18.16.1:8080/v1` times out
+- no working embeddings endpoint is currently available from the installed setup
+
+Current recommendation:
+
+- run the complete real benchmark with `--retrieval-backend fts`
+- only switch to hybrid retrieval once a real embedding endpoint is confirmed working
 
 ## Sanity Check Commands Used During Debugging
 
@@ -298,12 +404,24 @@ Expected:
 
 - returns `["ok"]`
 
+## Kept Final Artifacts
+
+Keep only the latest final result pair for each benchmark:
+
+- `artifacts/benchmark/bench_results_report_source_20260405.json`
+- `artifacts/benchmark/Hermes_Memory_Comparative_Report_20260405.pdf`
+- `artifacts/benchmark/bench_results_full_20260405T202253Z_clean.json`
+- `artifacts/benchmark/Hermes_Complete_Real_Benchmark_Report_20260405.pdf`
+
+Superseded smoke, rerun, and intermediate result files can be removed.
+
 ## Suggested Future Session Prompt
 
 If a later session needs to rerun this benchmark, say:
 
 ```text
 Follow BENCHMARK_RUNBOOK.md exactly. Use the installed WSL Hermes runtime,
-run the full benchmark with gpt-5.4, and wipe live Hermes memory before and
-after the run.
+keep benchmark state in temp homes, and run either:
+- the low-token structural benchmark, or
+- the complete real benchmark with gpt-5.4, Codex-backed extraction, and retrieval_backend fts unless a live embeddings endpoint is available.
 ```
