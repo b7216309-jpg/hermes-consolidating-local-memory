@@ -10,6 +10,11 @@ from urllib import error, request
 logger = logging.getLogger(__name__)
 
 
+def is_codex_backend(base_url: str) -> bool:
+    clean = str(base_url or "").strip().rstrip("/").lower()
+    return "/backend-api/codex" in clean
+
+
 def load_hermes_model_defaults(hermes_home: str | Path | None) -> Dict[str, str]:
     if not hermes_home:
         return {"model": "", "base_url": ""}
@@ -71,6 +76,12 @@ class OpenAICompatibleLLM:
     def enabled(self) -> bool:
         return bool(self.model and self.base_url)
 
+    @property
+    def backend_kind(self) -> str:
+        if is_codex_backend(self.base_url):
+            return "codex"
+        return "openai_compatible"
+
     def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
         if not self.enabled:
             return None
@@ -106,6 +117,12 @@ class OpenAICompatibleLLM:
         temperature: float = 0.1,
         max_tokens: int = 700,
     ) -> Dict[str, Any] | None:
+        if self.backend_kind == "codex":
+            content = self._codex_responses_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            return extract_json_object(content or "")
         payload = {
             "model": self.model,
             "messages": [
@@ -133,6 +150,51 @@ class OpenAICompatibleLLM:
             else:
                 content = str(raw_content or "")
         return extract_json_object(content)
+
+    def _codex_responses_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+        if not self.enabled:
+            return ""
+        url = f"{self.base_url}/responses"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        payload = {
+            "model": self.model,
+            "instructions": str(system_prompt or ""),
+            "input": [
+                {
+                    "role": "user",
+                    "content": str(user_prompt or ""),
+                }
+            ],
+            "store": False,
+            "stream": True,
+        }
+        req = request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                detail = str(exc)
+            logger.warning("Codex responses request failed (%s): %s", exc.code, detail[:500])
+            return ""
+        except Exception as exc:
+            logger.warning("Codex responses request failed: %s", exc)
+            return ""
+        return _extract_codex_stream_text(raw)
 
 
 class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
@@ -167,3 +229,40 @@ class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
 
 def env_or_blank(name: str) -> str:
     return os.environ.get(name, "").strip()
+
+
+def _extract_codex_stream_text(raw: str) -> str:
+    text = str(raw or "")
+    if not text.strip():
+        return ""
+    pieces: List[str] = []
+    final_text = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data: "):
+            continue
+        payload = line[6:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            item = json.loads(payload)
+        except Exception:
+            continue
+        event_type = str(item.get("type") or "")
+        if event_type == "response.output_text.delta":
+            pieces.append(str(item.get("delta") or ""))
+        elif event_type == "response.output_text.done":
+            final_text = str(item.get("text") or "")
+        elif event_type == "response.completed":
+            response = item.get("response") or {}
+            for output in response.get("output") or []:
+                if not isinstance(output, dict):
+                    continue
+                for content in output.get("content") or []:
+                    if not isinstance(content, dict):
+                        continue
+                    if str(content.get("type") or "") == "output_text":
+                        final_text = str(content.get("text") or final_text)
+    if final_text:
+        return final_text
+    return "".join(pieces).strip()

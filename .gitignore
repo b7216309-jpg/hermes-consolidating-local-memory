@@ -5,3 +5,9 @@ __pycache__/
 *.sqlite3
 *.bak
 .DS_Store
+.tmp_*/
+tmp_*/
+bench_results*.json
+bench_dim*.json
+Hermes_Memory_Comparative_Report_*.pdf
+artifacts/

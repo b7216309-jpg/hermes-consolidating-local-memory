@@ -423,6 +423,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             self._prefetch_cache[key] = {"query": clean, "rendered": rendered, "created_at": time.time()}
         return rendered
 
+    def get_context(self, *, session_id: str = "", query: str = "") -> str:
+        effective_query = normalize_whitespace(query)
+        if not effective_query:
+            effective_query = (
+                "Give me a provenance summary of every fact, preference, policy, "
+                "journal note, and changed assumption you know about me."
+            )
+        return self.prefetch(effective_query, session_id=session_id or self._session_id)
+
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         clean = normalize_whitespace(query)
         if not clean or not self._store:
@@ -1214,6 +1223,130 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             decorated[section] = enriched
         return decorated
 
+    def _merge_prefetch_rows(
+        self,
+        section: str,
+        *row_groups: List[Dict[str, Any]],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        seen_texts: set[str] = set()
+        for rows in row_groups:
+            for raw_row in rows:
+                row = dict(raw_row)
+                metadata = self._result_metadata(row)
+                if metadata and "metadata" not in row:
+                    row["metadata"] = metadata
+                subject_key = normalize_whitespace(
+                    str(
+                        row.get("subject_key")
+                        or metadata.get("subject_key")
+                        or row.get("preference_key")
+                        or row.get("policy_key")
+                        or ""
+                    )
+                )
+                if section == "facts":
+                    stable_key = subject_key or normalize_whitespace(str(row.get("id") or ""))
+                elif section == "preferences":
+                    stable_key = normalize_whitespace(
+                        str(row.get("preference_key") or subject_key or row.get("label") or row.get("id") or "")
+                    )
+                elif section == "policies":
+                    stable_key = normalize_whitespace(
+                        str(row.get("policy_key") or subject_key or row.get("label") or row.get("id") or "")
+                    )
+                else:
+                    stable_key = normalize_whitespace(str(row.get("id") or row.get("label") or ""))
+                text = normalize_whitespace(
+                    str(
+                        row.get("content")
+                        or row.get("summary")
+                        or row.get("title")
+                        or row.get("label")
+                        or row.get("value")
+                        or ""
+                    )
+                )
+                text_key = normalize_text(text)
+                dedupe_key = stable_key or text_key
+                if dedupe_key and dedupe_key in seen_keys:
+                    continue
+                if text_key and text_key in seen_texts:
+                    continue
+                merged.append(row)
+                if dedupe_key:
+                    seen_keys.add(dedupe_key)
+                if text_key:
+                    seen_texts.add(text_key)
+                if len(merged) >= max(int(limit), 0):
+                    return merged
+        return merged
+
+    def _global_prefetch_results(
+        self,
+        *,
+        scope: str,
+        limit: int,
+        include_inactive: bool = False,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        empty_results = {name: [] for name in MemoryStore.SEARCH_SCOPES}
+        if not self._store:
+            return empty_results
+        candidate_limit = max(int(limit), int(self._cfg()["prefetch_limit"]), 8)
+        recent = self._decorate_search_results(
+            self._store.search("", scope=scope, limit=candidate_limit, include_inactive=include_inactive)
+        )
+        snapshot_rows = self._store.prompt_snapshot_rows(
+            user_limit=max(candidate_limit, 10),
+            memory_limit=max(candidate_limit * 2, 14),
+            preference_limit=max(candidate_limit, 8),
+            policy_limit=max(candidate_limit, 8),
+        )
+        snapshot = self._decorate_search_results(
+            {
+                "facts": list(snapshot_rows.get("user_facts", [])) + list(snapshot_rows.get("memory_facts", [])),
+                "topics": [],
+                "episodes": [],
+                "summaries": [],
+                "journals": [],
+                "preferences": list(snapshot_rows.get("preferences", [])),
+                "policies": list(snapshot_rows.get("policies", [])),
+            }
+        )
+        merged = {name: list(recent.get(name, [])) for name in MemoryStore.SEARCH_SCOPES}
+        if scope in {"all", "facts"}:
+            merged["facts"] = self._merge_prefetch_rows(
+                "facts",
+                list(snapshot.get("facts", [])),
+                list(recent.get("facts", [])),
+                limit=self._section_limit("facts", limit),
+            )
+        if scope in {"all", "preferences"}:
+            merged["preferences"] = self._merge_prefetch_rows(
+                "preferences",
+                list(snapshot.get("preferences", [])),
+                list(recent.get("preferences", [])),
+                limit=self._section_limit("preferences", limit),
+            )
+        if scope in {"all", "policies"}:
+            merged["policies"] = self._merge_prefetch_rows(
+                "policies",
+                list(snapshot.get("policies", [])),
+                list(recent.get("policies", [])),
+                limit=self._section_limit("policies", limit),
+            )
+        if scope in {"all", "summaries"}:
+            merged["summaries"] = list(recent.get("summaries", []))[: self._section_limit("summaries", limit)]
+        if scope in {"all", "journals"}:
+            merged["journals"] = list(recent.get("journals", []))[: self._section_limit("journals", limit)]
+        if scope in {"all", "topics"}:
+            merged["topics"] = list(recent.get("topics", []))[: self._section_limit("topics", limit)]
+        if scope in {"all", "episodes"}:
+            merged["episodes"] = list(recent.get("episodes", []))[: self._section_limit("episodes", limit)]
+        return merged
+
     def _current_snapshot_entries(self, *, max_items: int = 8) -> List[Dict[str, Any]]:
         combined = self._build_builtin_snapshot_entries()
         entries = list(combined.get("user", [])) + list(combined.get("memory", []))
@@ -1678,6 +1811,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 include_inactive=include_inactive,
             )
             results["facts"] = self._decorate_search_results(subject_results).get("facts", [])[: self._section_limit("facts", limit)]
+        if (
+            str(cue_map.get("mode") or "") in {"current_state", "provenance"}
+            and not str(cue_map.get("subject_key") or "")
+            and not any(results.get(section) for section in MemoryStore.SEARCH_SCOPES)
+        ):
+            results = self._global_prefetch_results(
+                scope=scope,
+                limit=limit,
+                include_inactive=include_inactive,
+            )
         if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.enabled:
             query_vector = self._embedder.embed_texts([clean])
             if query_vector:
@@ -2684,3 +2827,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
 def register(ctx) -> None:
     ctx.register_memory_provider(ConsolidatingLocalMemoryProvider())
+
+
+ConsolidatingLocalProvider = ConsolidatingLocalMemoryProvider
