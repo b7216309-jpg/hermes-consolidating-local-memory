@@ -421,6 +421,16 @@ def _trim_phrase(text: str, *, split_lists: bool = False) -> str:
     clean = normalize_whitespace(text.strip(" .,!?:;\"'`"))
     clean = re.sub(r"\b(?:right now|currently|for now|these days|now)$", "", clean, flags=re.IGNORECASE)
     clean = normalize_whitespace(clean)
+    clean = re.split(
+        r"\b(?:and\s+this\s+update\s+batch\s+label\s+is|and\s+the\s+update\s+batch\s+label\s+is|"
+        r"please\s+(?:acknowledge|confirm|reply|say)\b|reply\s+briefly\b|acknowledge\s+it\s+briefly\b|"
+        r"confirm\s+once\s+you\s+stored\s+it\b|once\s+you\s+stored\s+it\b|after\s+handling\s+it\b|"
+        r"once\s+you\s+understand\b|in\s+one\s+short\s+sentence\b|in\s+one\s+sentence\b)\b",
+        clean,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    clean = normalize_whitespace(clean)
     if split_lists:
         return clean
     parts = re.split(r"\b(?:because|since|but|although|though|while|currently|with)\b", clean, maxsplit=1, flags=re.IGNORECASE)
@@ -540,7 +550,7 @@ def _extract_answer_format(segment: str, source_role: str) -> List[Dict[str, Any
 
 def _extract_favorite_things(segment: str, source_role: str) -> List[Dict[str, Any]]:
     match = re.search(
-        r"\bmy\s+favorite\s+([a-z][a-z0-9 _/-]{1,24})\s+is\s+(.+?)(?:[.;,]|$)",
+        r"\b(?:my\s+|user(?:'s)?\s+)?favorite\s+([a-z][a-z0-9 _/-]{1,24})\s+is\s+(.+?)(?:[.;,]|$)",
         segment,
         flags=re.IGNORECASE,
     )
@@ -568,8 +578,8 @@ def _extract_favorite_things(segment: str, source_role: str) -> List[Dict[str, A
 
 def _extract_user_preferences(segment: str, source_role: str) -> List[Dict[str, Any]]:
     patterns = (
-        (r"\bi\s+(?:really\s+|absolutely\s+|honestly\s+|pretty\s+much\s+|kind of\s+|kinda\s+)*(like|love|enjoy|prefer)\s+(.+?)(?:[.;,]|$)", 1, "likes"),
-        (r"\bi\s+(?:really\s+|absolutely\s+|honestly\s+)*(dislike|hate|avoid|can't stand|cannot stand|do not like|don't like)\s+(.+?)(?:[.;,]|$)", -1, "dislikes"),
+        (r"\b(?:i|user)\s+(?:really\s+|absolutely\s+|honestly\s+|pretty\s+much\s+|kind of\s+|kinda\s+)*(like|love|enjoy|prefer|likes|prefers)\s+(.+?)(?:[.;,]|$)", 1, "likes"),
+        (r"\b(?:i|user)\s+(?:really\s+|absolutely\s+|honestly\s+)*(dislike|hate|avoid|can't stand|cannot stand|do not like|don't like|dislikes)\s+(.+?)(?:[.;,]|$)", -1, "dislikes"),
     )
     candidates: List[Dict[str, Any]] = []
     for pattern, polarity, verb in patterns:
@@ -643,7 +653,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
         )
 
     match = re.search(
-        r"\b(?:i(?:'m| am)\s+based in|i live in)\s+(.+?)(?:[.;,]|$)",
+        r"\b(?:i(?:'m| am)\s+based in|i live in|user lives in)\s+(.+?)(?:[.;,]|$)",
         segment,
         flags=re.IGNORECASE,
     )
@@ -665,7 +675,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
                 )
             )
 
-    match = re.search(r"\b(?:i(?:'m| am)\s+from)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
+    match = re.search(r"\b(?:i(?:'m| am)\s+from|user is from)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
     if match:
         origin = _trim_phrase(match.group(1))
         if origin:
@@ -684,7 +694,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
                 )
             )
 
-    match = re.search(r"\bi grew up in\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
+    match = re.search(r"\b(?:i grew up in|user grew up in|user's hometown is)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
     if match:
         hometown = _trim_phrase(match.group(1))
         if hometown:
@@ -744,8 +754,8 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
         )
 
     for pattern, polarity, label in (
-        (r"\bi(?:'m| am)\s+allergic to\s+(.+?)(?:[.;,]|$)", 1, "allergic"),
-        (r"\bi(?:'m| am)\s+not allergic to\s+(.+?)(?:[.;,]|$)", -1, "not allergic"),
+        (r"\b(?:i(?:'m| am)|user is)\s+allergic to\s+(.+?)(?:[.;,]|$)", 1, "allergic"),
+        (r"\b(?:i(?:'m| am)|user is)\s+not allergic to\s+(.+?)(?:[.;,]|$)", -1, "not allergic"),
     ):
         match = re.search(pattern, segment, flags=re.IGNORECASE)
         if not match:
@@ -771,26 +781,66 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
     return candidates
 
 
+def _is_plausible_timezone(value: str) -> bool:
+    clean = normalize_whitespace(value)
+    if not clean:
+        return False
+    upper = clean.upper()
+    common = {
+        "UTC",
+        "GMT",
+        "CET",
+        "CEST",
+        "EST",
+        "EDT",
+        "CST",
+        "CDT",
+        "MST",
+        "MDT",
+        "PST",
+        "PDT",
+        "BST",
+        "IST",
+        "JST",
+        "AEST",
+        "AEDT",
+        "AKST",
+        "AKDT",
+        "HST",
+    }
+    if "/" in clean:
+        return bool(re.fullmatch(r"[A-Za-z_]+/[A-Za-z_]+", clean))
+    if upper.startswith("UTC") or upper.startswith("GMT"):
+        return bool(re.fullmatch(r"(?:UTC|GMT)(?:[+-]?\d{0,2})", upper))
+    if upper in common:
+        return True
+    return False
+
+
 def _extract_timezone(segment: str, source_role: str) -> List[Dict[str, Any]]:
     match = re.search(
-        r"\b(?:timezone(?: is)?|i(?:'m| am) in|we(?:'re| are) in)\s+([A-Za-z]+(?:/[A-Za-z_]+)?|UTC[+-]?\d{0,2}|CET|CEST|PST|EST|EDT|BST)\b",
+        r"\b(?:my\s+timezone\s+is|user(?:'s)?\s+timezone\s+is|timezone(?:\s+is|:)?|i(?:'m| am)\s+in|we(?:'re| are) in)\s+([A-Za-z_]+/[A-Za-z_]+|[A-Za-z]{2,5}|(?:UTC|GMT)[+-]?\d{0,2})\b",
         segment,
         flags=re.IGNORECASE,
     )
     if not match:
         return []
     value = normalize_whitespace(match.group(1))
+    if not _is_plausible_timezone(value):
+        return []
+    label = value if "/" in value else value.upper()
     return [
         build_candidate(
-            content=f"User timezone: {value}",
+            content=f"User's timezone is {label}",
             category="user_pref",
             topic="user-profile",
             importance=7,
             confidence=0.85 if source_role == "user" else 0.6,
             source_role=source_role,
             subject_key="user:timezone",
-            value_key=slugify(value),
+            value_key=slugify(label),
             exclusive=True,
+            metadata={"timezone_label": label},
         )
     ]
 
@@ -914,6 +964,57 @@ def _extract_docker_rule(segment: str, source_role: str) -> List[Dict[str, Any]]
     return []
 
 
+def _extract_manual_edit_rule(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    lower = segment.lower()
+    if "apply_patch" not in lower:
+        return []
+    if not any(
+        token in lower
+        for token in (
+            "manual edit",
+            "manual file edit",
+            "edit a file by hand",
+            "edit files by hand",
+            "manual edits",
+        )
+    ):
+        return []
+    return [
+        build_candidate(
+            content="Use apply_patch for manual file edits",
+            category="workflow",
+            topic="workflow-rules",
+            importance=9,
+            confidence=0.85 if source_role == "user" else 0.65,
+            source_role=source_role,
+            subject_key="workflow:manual_edits",
+            value_key="apply-patch",
+            exclusive=True,
+        )
+    ]
+
+
+def _extract_git_safety_rule(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    lower = segment.lower()
+    if "git reset --hard" not in lower:
+        return []
+    if not any(token in lower for token in ("never", "avoid", "do not", "don't")):
+        return []
+    return [
+        build_candidate(
+            content="Never use git reset --hard",
+            category="workflow",
+            topic="workflow-rules",
+            importance=9,
+            confidence=0.85 if source_role == "user" else 0.65,
+            source_role=source_role,
+            subject_key="workflow:git_safety",
+            value_key="avoid-git-reset-hard",
+            exclusive=True,
+        )
+    ]
+
+
 def _extract_ssh_port(segment: str, source_role: str) -> List[Dict[str, Any]]:
     lower = segment.lower()
     if "port" not in lower:
@@ -966,7 +1067,9 @@ def _extract_test_command(segment: str, source_role: str) -> List[Dict[str, Any]
     )
     if not match:
         return []
-    command = normalize_whitespace(match.group(1)).rstrip(".")
+    command = _trim_phrase(match.group(1))
+    if not command:
+        return []
     return [
         build_candidate(
             content=f"Project tests run with {command}",
@@ -978,6 +1081,7 @@ def _extract_test_command(segment: str, source_role: str) -> List[Dict[str, Any]
             subject_key="project:test_command",
             value_key=slugify(command),
             exclusive=True,
+            metadata={"command_label": command},
         )
     ]
 
@@ -990,7 +1094,9 @@ def _extract_deploy_method(segment: str, source_role: str) -> List[Dict[str, Any
     )
     if not match:
         return []
-    method = normalize_whitespace(match.group(1))
+    method = _trim_phrase(match.group(1))
+    if not method:
+        return []
     return [
         build_candidate(
             content=f"Project deploys with {method}",
@@ -1001,6 +1107,8 @@ def _extract_deploy_method(segment: str, source_role: str) -> List[Dict[str, Any
             source_role=source_role,
             subject_key="project:deploy_method",
             value_key=slugify(method),
+            exclusive=True,
+            metadata={"method_label": method},
         )
     ]
 
@@ -1130,6 +1238,8 @@ def _structured_candidates(segment: str, source_role: str) -> List[Dict[str, Any
         _extract_editor,
         _extract_operating_system,
         _extract_docker_rule,
+        _extract_manual_edit_rule,
+        _extract_git_safety_rule,
         _extract_ssh_port,
         _extract_key_path,
         _extract_test_command,

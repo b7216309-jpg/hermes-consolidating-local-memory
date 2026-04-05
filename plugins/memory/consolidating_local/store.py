@@ -2080,18 +2080,130 @@ class MemoryStore:
             "contradictions": self.recent_contradictions(limit=limit),
         }
 
+    def prompt_snapshot_rows(
+        self,
+        *,
+        user_limit: int = 24,
+        memory_limit: int = 36,
+        preference_limit: int = 16,
+        policy_limit: int = 16,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        return {
+            "user_facts": self._fetchall(
+                """
+                SELECT id,
+                       content,
+                       category,
+                       topic,
+                       source,
+                       metadata_json,
+                       importance,
+                       salience,
+                       updated_at,
+                       subject_key,
+                       value_key,
+                       polarity,
+                       exclusive,
+                       source_session_id
+                FROM facts
+                WHERE active = 1
+                  AND subject_key LIKE 'user:%'
+                  AND (exclusive = 1 OR importance >= 7 OR salience >= 0.82)
+                  AND (source NOT LIKE 'builtin_memory:%' OR subject_key != '')
+                ORDER BY exclusive DESC, importance DESC, salience DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (int(user_limit),),
+            ),
+            "memory_facts": self._fetchall(
+                """
+                SELECT id,
+                       content,
+                       category,
+                       topic,
+                       source,
+                       metadata_json,
+                       importance,
+                       salience,
+                       updated_at,
+                       subject_key,
+                       value_key,
+                       polarity,
+                       exclusive,
+                       source_session_id
+                FROM facts
+                WHERE active = 1
+                  AND subject_key NOT LIKE 'user:%'
+                  AND subject_key != ''
+                  AND (source NOT LIKE 'builtin_memory:%' OR subject_key != '' OR category != 'user_pref')
+                ORDER BY exclusive DESC, importance DESC, salience DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (int(memory_limit),),
+            ),
+            "preferences": self._fetchall(
+                """
+                SELECT id,
+                       preference_key,
+                       label,
+                       value,
+                       content,
+                       metadata_json,
+                       source_session_id,
+                       importance,
+                       salience,
+                       updated_at
+                FROM memory_preferences
+                WHERE active = 1
+                ORDER BY importance DESC, salience DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (int(preference_limit),),
+            ),
+            "policies": self._fetchall(
+                """
+                SELECT id,
+                       policy_key,
+                       label,
+                       content,
+                       metadata_json,
+                       source_session_id,
+                       importance,
+                       salience,
+                       updated_at
+                FROM memory_policies
+                WHERE active = 1
+                ORDER BY importance DESC, salience DESC, updated_at DESC
+                LIMIT ?
+                """,
+                (int(policy_limit),),
+            ),
+        }
+
     def scoped_recent_items(self, *, scope: str = "all", limit: int = 5) -> Dict[str, List[Dict[str, Any]]]:
         recent = self.recent_items(limit=limit)
         if scope == "all":
             return {name: recent.get(name, []) for name in self.SEARCH_SCOPES}
         return {name: (recent.get(name, []) if name == scope else []) for name in self.SEARCH_SCOPES}
 
-    def recent_contradictions(self, *, limit: int = 5, max_age_days: int | None = None) -> List[Dict[str, Any]]:
+    def recent_contradictions(
+        self,
+        *,
+        limit: int = 5,
+        max_age_days: int | None = None,
+        subject_keys: Sequence[str] | None = None,
+    ) -> List[Dict[str, Any]]:
         params: List[Any] = []
-        where = ""
+        clauses: List[str] = []
         if max_age_days is not None:
-            where = "WHERE c.created_at >= ?"
+            clauses.append("c.created_at >= ?")
             params.append(now_ts() - (int(max_age_days) * 86400))
+        cleaned_subjects = [normalize_whitespace(str(item)) for item in (subject_keys or []) if normalize_whitespace(str(item))]
+        if cleaned_subjects:
+            placeholders = ", ".join("?" for _ in cleaned_subjects)
+            clauses.append(f"c.subject_key IN ({placeholders})")
+            params.extend(cleaned_subjects)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(int(limit))
         return self._fetchall(
             f"""
@@ -2149,7 +2261,7 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT f.id, f.content, f.category, f.topic, f.importance, f.confidence, f.salience, f.updated_at, f.subject_key, f.value_key, f.polarity, f.exclusive, f.source_session_id
+                    SELECT f.id, f.content, f.category, f.topic, f.source, f.metadata_json, f.importance, f.confidence, f.salience, f.created_at, f.updated_at, f.subject_key, f.value_key, f.polarity, f.exclusive, f.source_session_id
                     FROM facts_fts idx
                     JOIN facts f ON f.id = idx.fact_id
                     WHERE facts_fts MATCH ?
@@ -2165,7 +2277,7 @@ class MemoryStore:
         active_sql = "" if include_inactive else "AND active = 1"
         return self._fetchall(
             f"""
-            SELECT id, content, category, topic, importance, confidence, salience, updated_at, subject_key, value_key, polarity, exclusive, source_session_id
+            SELECT id, content, category, topic, source, metadata_json, importance, confidence, salience, created_at, updated_at, subject_key, value_key, polarity, exclusive, source_session_id
             FROM facts
             WHERE (content LIKE ? OR topic LIKE ? OR category LIKE ? OR subject_key LIKE ?)
               {active_sql}

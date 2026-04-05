@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import queue
+import re
 import threading
 import time
 from pathlib import Path
@@ -25,7 +26,7 @@ from .consolidator import (
     run_consolidation,
 )
 from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank, load_hermes_model_defaults
-from .store import MemoryStore, normalize_whitespace, pretty_topic, slugify
+from .store import MemoryStore, normalize_text, normalize_whitespace, pretty_topic, slugify
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,22 @@ TOOL_SCHEMA = {
 }
 
 PLUGIN_CONFIG_KEY = "consolidating-local-memory"
+AUTO_MEMORY_BLOCK_START = "<!-- consolidating_local:auto:start -->"
+AUTO_MEMORY_BLOCK_END = "<!-- consolidating_local:auto:end -->"
+SUMMARY_SNAPSHOT_SUBJECTS = (
+    "user:timezone",
+    "environment:shell",
+    "project:database",
+    "project:deploy_method",
+    "project:cache_backend",
+    "workflow:manual_edits",
+)
+WORKFLOW_SNAPSHOT_SUBJECTS = (
+    "environment:shell",
+    "project:test_command",
+    "project:deploy_method",
+    "workflow:docker_sudo",
+)
 
 
 def _load_plugin_config() -> dict:
@@ -205,6 +222,26 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "key": "decay_min_salience",
                 "description": "Minimum salience before low-priority items are deactivated",
                 "default": "0.15",
+            },
+            {
+                "key": "builtin_snapshot_sync_enabled",
+                "description": "Keep Hermes bounded USER.md and MEMORY.md aligned with the plugin's current-state winners",
+                "default": "true",
+            },
+            {
+                "key": "builtin_memory_dir",
+                "description": "Directory containing Hermes USER.md and MEMORY.md files",
+                "default": "$HERMES_HOME/memories",
+            },
+            {
+                "key": "builtin_snapshot_user_chars",
+                "description": "Character budget for USER.md snapshot updates",
+                "default": "1375",
+            },
+            {
+                "key": "builtin_snapshot_memory_chars",
+                "description": "Character budget for MEMORY.md snapshot updates",
+                "default": "2200",
             },
             {
                 "key": "wiki_export_enabled",
@@ -330,6 +367,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._session_id = session_id
         self._store = MemoryStore(db_path=db_path)
         self._store.ensure_memory_session(session_id, label=session_id)
+        self._sync_builtin_snapshot(reason="initialize")
         self._stop_event.clear()
         self._worker = threading.Thread(target=self._worker_loop, name="consolidating-memory", daemon=True)
         self._worker.start()
@@ -378,8 +416,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             cached = self._prefetch_cache.get(key)
             if cached and cached.get("query") == clean:
                 return str(cached.get("rendered") or "")
-        results = self._search_memory(clean, scope="all", limit=self._cfg()["prefetch_limit"], session_id=key)
-        rendered = self._render_prefetch(clean, results)
+        cues = self._build_retrieval_cues(query=clean, args={}, session_id=key)
+        results = self._search_memory(clean, scope="all", limit=self._cfg()["prefetch_limit"], session_id=key, cues=cues)
+        rendered = self._render_prefetch(clean, results, cues=cues)
         with self._prefetch_lock:
             self._prefetch_cache[key] = {"query": clean, "rendered": rendered, "created_at": time.time()}
         return rendered
@@ -509,7 +548,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     include_inactive=include_inactive,
                     cues=cues,
                 )
-                return json.dumps({"success": True, "action": action, "results": results})
+                payload: Dict[str, Any] = {"success": True, "action": action, "results": results}
+                if str(cues.get("mode") or "") == "provenance" and str(cues.get("subject_key") or ""):
+                    payload["provenance"] = self._subject_provenance_entries(
+                        subject_key=str(cues.get("subject_key") or ""),
+                        facts=list(results.get("facts", [])),
+                        limit=max(3, min(limit, 6)),
+                    )
+                if str(cues.get("mode") or "") in {"summary", "workflow"}:
+                    mode_snapshot = self._mode_snapshot_entries(
+                        str(cues.get("mode") or ""),
+                        max_items=max(4, min(limit, 8)),
+                    )
+                    if mode_snapshot:
+                        payload["current_snapshot"] = mode_snapshot
+                return json.dumps(payload)
 
             if action == "remember":
                 result = self._remember_from_tool(args, session_id=session_id)
@@ -526,6 +579,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         max_facts=self._cfg()["max_topic_facts"],
                         max_chars=self._cfg()["topic_summary_chars"],
                     )
+                    if removed:
+                        self._sync_builtin_snapshot(reason="tool_forget")
                     return json.dumps({"success": removed, "action": action, "fact_id": int(fact_id), "memory_type": memory_type})
                 query = str(args.get("query") or "").strip()
                 if not query:
@@ -560,6 +615,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                             continue
                         if self._store.deactivate_memory_item(memory_type, int(row["id"]), reason="tool_forget", source="tool"):
                             removed_count += 1
+                if removed_count > 0:
+                    self._sync_builtin_snapshot(reason="tool_forget")
                 return json.dumps({"success": True, "action": action, "removed_count": removed_count})
 
             if action == "recent":
@@ -608,6 +665,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                             "last_export_at": self._store.get_state("last_wiki_export_at", ""),
                             "last_export_stats": self._load_state_json("last_wiki_export_stats"),
                         },
+                        "builtin_snapshot": self._load_state_json("last_builtin_snapshot_sync"),
                         "config": self._cfg(),
                     }
                 )
@@ -659,6 +717,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     )
                     if session_id:
                         self._store.add_link("policy", result["id"], "session", session_id, "captured_in")
+                    self._sync_builtin_snapshot(reason="tool_policy")
                     return json.dumps({"success": True, "action": action, "result": result})
                 if not key:
                     return json.dumps({"success": True, "action": action, "results": self._store.recent_items(limit=limit).get("policies", [])})
@@ -696,6 +755,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         max_facts=self._cfg()["max_topic_facts"],
                         max_chars=self._cfg()["topic_summary_chars"],
                     )
+                    self._sync_builtin_snapshot(reason="decay")
                 return json.dumps({"success": True, "action": action, "result": result})
 
             if action == "export":
@@ -730,6 +790,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "reconsolidation_window_hours": float(self._config.get("reconsolidation_window_hours", 6)),
             "review_intervals_days": str(self._config.get("review_intervals_days", "1,3,7,14,30")),
             "decay_min_salience": float(self._config.get("decay_min_salience", 0.15)),
+            "builtin_snapshot_sync_enabled": self._cfg_bool("builtin_snapshot_sync_enabled", True),
+            "builtin_memory_dir": str(self._config.get("builtin_memory_dir", "$HERMES_HOME/memories")),
+            "builtin_snapshot_user_chars": int(self._config.get("builtin_snapshot_user_chars", 1375)),
+            "builtin_snapshot_memory_chars": int(self._config.get("builtin_snapshot_memory_chars", 2200)),
             "wiki_export_enabled": self._cfg_bool("wiki_export_enabled", False),
             "wiki_export_dir": str(self._config.get("wiki_export_dir", "$HERMES_HOME/consolidating_memory_wiki")),
             "wiki_export_on_consolidate": self._cfg_bool("wiki_export_on_consolidate", True),
@@ -751,6 +815,331 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _wiki_export_dir(self) -> Path:
         raw = str(self._cfg()["wiki_export_dir"] or "$HERMES_HOME/consolidating_memory_wiki")
         return Path(raw.replace("$HERMES_HOME", str(self._hermes_home))).expanduser()
+
+    def _builtin_memory_dir(self) -> Path:
+        raw = str(self._cfg()["builtin_memory_dir"] or "$HERMES_HOME/memories")
+        return Path(raw.replace("$HERMES_HOME", str(self._hermes_home))).expanduser()
+
+    def _builtin_memory_path(self, target: str) -> Path:
+        name = "USER.md" if target == "user" else "MEMORY.md"
+        return self._builtin_memory_dir() / name
+
+    def _candidate_for_memory_line(self, text: str) -> Dict[str, Any] | None:
+        clean = normalize_whitespace(text)
+        if not clean:
+            return None
+        facts: List[Dict[str, Any]] = []
+        for raw in extract_candidate_facts_from_messages([{"role": "assistant", "content": clean}]):
+            if not isinstance(raw, dict):
+                continue
+            normalized = normalize_candidate_fact(raw, source_role="assistant")
+            if normalized:
+                facts.append(normalized)
+        canonical = self._canonicalize_candidates(facts)
+        if not canonical:
+            return None
+        target = normalize_text(clean)
+        for candidate in canonical:
+            if normalize_text(str(candidate.get("content") or "")) == target:
+                return candidate
+        return canonical[0]
+
+    def _strip_auto_memory_block(self, text: str) -> str:
+        if not text:
+            return ""
+        pattern = rf"{re.escape(AUTO_MEMORY_BLOCK_START)}.*?{re.escape(AUTO_MEMORY_BLOCK_END)}\s*"
+        return re.sub(pattern, "", text, flags=re.DOTALL).strip()
+
+    def _select_snapshot_entries(self, entries: List[Dict[str, Any]], *, limit_chars: int) -> List[Dict[str, Any]]:
+        kept: List[Dict[str, Any]] = []
+        used = 0
+        for entry in sorted(
+            entries,
+            key=lambda item: (
+                int(item.get("importance") or 0),
+                float(item.get("salience") or 0.0),
+                float(item.get("updated_at") or 0.0),
+                1 if str(item.get("subject_key") or "") else 0,
+            ),
+            reverse=True,
+        ):
+            text = normalize_whitespace(str(entry.get("text") or ""))
+            if not text:
+                continue
+            cost = len(f"- {text}\n")
+            if used + cost > max(int(limit_chars), 0):
+                continue
+            kept.append({**entry, "text": text})
+            used += cost
+        return kept
+
+    def _build_snapshot_block(self, entries: List[Dict[str, Any]]) -> str:
+        if not entries:
+            return ""
+        lines = [AUTO_MEMORY_BLOCK_START]
+        lines.extend(f"- {entry['text']}" for entry in entries if str(entry.get("text") or "").strip())
+        lines.append(AUTO_MEMORY_BLOCK_END)
+        return "\n".join(lines).strip()
+
+    def _looks_like_user_profile_text(self, text: str) -> bool:
+        clean = normalize_text(text)
+        return clean.startswith(
+            (
+                "user prefers ",
+                "users favorite ",
+                "user likes ",
+                "user dislikes ",
+                "user is allergic to ",
+                "user is not allergic to ",
+                "user is from ",
+                "user grew up in ",
+                "user lives in ",
+                "user pronouns are ",
+                "user is ",
+                "users timezone is ",
+                "user timezone is ",
+            )
+        )
+
+    def _sanitize_mirror_memory_text(self, text: str) -> str:
+        clean = normalize_whitespace(text)
+        if not clean:
+            return ""
+        clean = re.sub(
+            r"^(?:please\s+remember\s+this(?:\s+long-term\s+project\s+fact)?(?:\s+(?:workflow|safety)\s+rule)?\s+for\s+future\s+sessions:|"
+            r"correction\s+for\s+future\s+sessions:|"
+            r"lower[- ]priority(?:\s+(?:note|preference|personal\s+detail|environment\s+note))?:)\s*",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        clean = re.sub(r"^\[[A-Z0-9-]+\]\s*", "", clean)
+        clean = re.sub(
+            r"\b(?:please\s+(?:acknowledge|confirm|reply|say)\b.*|reply\s+briefly\b.*|"
+            r"acknowledge\s+it\s+briefly\b.*|confirm\s+once\s+you\s+stored\s+it\b.*|"
+            r"once\s+you\s+stored\s+it\b.*|after\s+handling\s+it\b.*|once\s+you\s+understand\b.*|"
+            r"in\s+one\s+short\s+sentence\b.*|in\s+one\s+sentence\b.*)$",
+            "",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        clean = normalize_whitespace(clean.strip(" -:"))
+        return clean
+
+    def _extract_mirror_memory_candidates(self, content: str) -> List[Dict[str, Any]]:
+        clean = self._sanitize_mirror_memory_text(content)
+        if not clean:
+            return []
+        candidates: List[Dict[str, Any]] = []
+        for raw in extract_candidate_facts_from_messages([{"role": "user", "content": clean}]):
+            if not isinstance(raw, dict):
+                continue
+            normalized = normalize_candidate_fact(raw, source_role="user")
+            if normalized:
+                candidates.append(normalized)
+        if not candidates:
+            return []
+        canonical = self._canonicalize_candidates(self._dedupe_candidates(candidates))
+        filtered: List[Dict[str, Any]] = []
+        for candidate in canonical:
+            metadata = dict(candidate.get("metadata") or {})
+            subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
+            if not subject_key:
+                continue
+            filtered.append(candidate)
+        return filtered
+
+    def _mirror_candidate_target(self, candidate: Dict[str, Any], default_target: str) -> str:
+        metadata = dict(candidate.get("metadata") or {})
+        subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
+        if subject_key.startswith("user:"):
+            return "user"
+        if subject_key:
+            return "memory"
+        return "user" if default_target == "user" else "memory"
+
+    def _build_builtin_snapshot_entries(self) -> Dict[str, List[Dict[str, Any]]]:
+        if not self._store:
+            return {"user": [], "memory": []}
+        snapshot = self._store.prompt_snapshot_rows()
+        entries: Dict[str, List[Dict[str, Any]]] = {"user": [], "memory": []}
+        seen_subjects: Dict[str, set[str]] = {"user": set(), "memory": set()}
+        seen_texts: Dict[str, set[str]] = {"user": set(), "memory": set()}
+
+        def add_entry(
+            target: str,
+            *,
+            text: str,
+            subject_key: str = "",
+            importance: Any = 5,
+            salience: Any = 0.5,
+            updated_at: Any = 0.0,
+        ) -> None:
+            clean_text = normalize_whitespace(text)
+            clean_subject = normalize_whitespace(subject_key)
+            if not clean_text:
+                return
+            normalized_text = normalize_text(clean_text)
+            if normalized_text in seen_texts[target]:
+                return
+            if clean_subject and clean_subject in seen_subjects[target]:
+                return
+            seen_texts[target].add(normalized_text)
+            if clean_subject:
+                seen_subjects[target].add(clean_subject)
+            entries[target].append(
+                {
+                    "text": clean_text,
+                    "subject_key": clean_subject,
+                    "importance": int(importance or 0),
+                    "salience": float(salience or 0.0),
+                    "updated_at": float(updated_at or 0.0),
+                }
+            )
+
+        for row in snapshot.get("user_facts", []):
+            add_entry(
+                "user",
+                text=str(row.get("content") or ""),
+                subject_key=str(row.get("subject_key") or ""),
+                importance=row.get("importance"),
+                salience=row.get("salience"),
+                updated_at=row.get("updated_at"),
+            )
+        for row in snapshot.get("preferences", []):
+            metadata = dict(row.get("metadata") or {})
+            subject_key = str(metadata.get("subject_key") or "")
+            text = str(row.get("content") or row.get("label") or row.get("value") or "")
+            if not subject_key.startswith("user:"):
+                continue
+            add_entry(
+                "user",
+                text=text,
+                subject_key=subject_key or str(row.get("preference_key") or ""),
+                importance=row.get("importance"),
+                salience=row.get("salience"),
+                updated_at=row.get("updated_at"),
+            )
+        for row in snapshot.get("memory_facts", []):
+            add_entry(
+                "memory",
+                text=str(row.get("content") or ""),
+                subject_key=str(row.get("subject_key") or ""),
+                importance=row.get("importance"),
+                salience=row.get("salience"),
+                updated_at=row.get("updated_at"),
+            )
+        for row in snapshot.get("policies", []):
+            metadata = dict(row.get("metadata") or {})
+            add_entry(
+                "memory",
+                text=str(row.get("content") or row.get("label") or ""),
+                subject_key=str(metadata.get("subject_key") or row.get("policy_key") or ""),
+                importance=row.get("importance"),
+                salience=row.get("salience"),
+                updated_at=row.get("updated_at"),
+            )
+        return entries
+
+    def _line_should_be_replaced(
+        self,
+        target: str,
+        raw_line: str,
+        *,
+        subject_keys: set[str],
+        normalized_contents: set[str],
+    ) -> bool:
+        clean_line = raw_line.strip()
+        if not clean_line:
+            return False
+        if clean_line in {AUTO_MEMORY_BLOCK_START, AUTO_MEMORY_BLOCK_END}:
+            return True
+        text = clean_line[2:].strip() if clean_line.startswith("- ") else clean_line
+        if normalize_text(text) in normalized_contents:
+            return True
+        candidate = self._candidate_for_memory_line(text)
+        metadata = dict(candidate.get("metadata") or {}) if candidate else {}
+        subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
+        if not subject_key:
+            subject_key = self._infer_subject_key_from_query(text)
+        if not subject_key or subject_key not in subject_keys:
+            return False
+        candidate_target = "user" if subject_key.startswith("user:") or str((candidate or {}).get("category") or "") == "user_pref" else "memory"
+        return candidate_target == target
+
+    def _write_builtin_snapshot_file(self, target: str, entries: List[Dict[str, Any]], *, limit_chars: int) -> Dict[str, Any]:
+        path = self._builtin_memory_path(target)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing = ""
+        if path.exists():
+            try:
+                existing = path.read_text(encoding="utf-8")
+            except Exception:
+                existing = path.read_text(encoding="utf-8", errors="ignore")
+        stripped = self._strip_auto_memory_block(existing)
+        subject_keys = {normalize_whitespace(str(entry.get("subject_key") or "")) for entry in entries if str(entry.get("subject_key") or "").strip()}
+        normalized_contents = {normalize_text(str(entry.get("text") or "")) for entry in entries if str(entry.get("text") or "").strip()}
+        preserved_lines = [
+            line.rstrip()
+            for line in stripped.splitlines()
+            if not self._line_should_be_replaced(target, line, subject_keys=subject_keys, normalized_contents=normalized_contents)
+        ]
+        selected = self._select_snapshot_entries(entries, limit_chars=max(int(limit_chars), 0))
+        block = self._build_snapshot_block(selected)
+        preserved_text = "\n".join(preserved_lines).strip()
+        combined = block
+        if preserved_text:
+            combined = f"{block}\n\n{preserved_text}" if block else preserved_text
+        while preserved_lines and len(combined) > max(int(limit_chars), 0):
+            preserved_lines.pop()
+            while preserved_lines and not preserved_lines[-1].strip():
+                preserved_lines.pop()
+            preserved_text = "\n".join(preserved_lines).strip()
+            combined = f"{block}\n\n{preserved_text}" if block and preserved_text else (block or preserved_text)
+        while selected and len(combined) > max(int(limit_chars), 0):
+            selected.pop()
+            block = self._build_snapshot_block(selected)
+            combined = f"{block}\n\n{preserved_text}" if block and preserved_text else (block or preserved_text)
+        normalized = combined.strip()
+        if normalized:
+            normalized += "\n"
+        changed = normalize_whitespace(existing) != normalize_whitespace(normalized)
+        if changed:
+            path.write_text(normalized, encoding="utf-8")
+        return {
+            "path": str(path),
+            "changed": changed,
+            "chars": len(normalized),
+            "entries": len(selected),
+        }
+
+    def _sync_builtin_snapshot(self, *, reason: str) -> Dict[str, Any]:
+        if not self._store or not self._cfg()["builtin_snapshot_sync_enabled"]:
+            return {"success": False, "reason": "disabled"}
+        try:
+            entries = self._build_builtin_snapshot_entries()
+            result = {
+                "success": True,
+                "reason": reason,
+                "user": self._write_builtin_snapshot_file(
+                    "user",
+                    entries.get("user", []),
+                    limit_chars=int(self._cfg()["builtin_snapshot_user_chars"]),
+                ),
+                "memory": self._write_builtin_snapshot_file(
+                    "memory",
+                    entries.get("memory", []),
+                    limit_chars=int(self._cfg()["builtin_snapshot_memory_chars"]),
+                ),
+            }
+        except Exception as exc:
+            logger.warning("Builtin snapshot sync failed: %s", exc)
+            result = {"success": False, "reason": reason, "error": str(exc)}
+        try:
+            self._store.set_state("last_builtin_snapshot_sync", json.dumps(result, sort_keys=True))
+        except Exception:
+            logger.debug("Failed to persist builtin snapshot sync metadata", exc_info=True)
+        return result
 
     def _load_state_json(self, key: str) -> Dict[str, Any]:
         if not self._store:
@@ -787,10 +1176,319 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 values.append(value)
         return values or [1.0, 3.0, 7.0, 14.0, 30.0]
 
+    def _json_dict(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if not value:
+            return {}
+        try:
+            data = json.loads(str(value))
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _result_metadata(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        metadata = self._json_dict(row.get("metadata"))
+        if metadata:
+            return metadata
+        return self._json_dict(row.get("metadata_json"))
+
+    def _decorate_search_results(self, results: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
+        decorated: Dict[str, List[Dict[str, Any]]] = {}
+        for section, rows in results.items():
+            enriched: List[Dict[str, Any]] = []
+            for raw_row in rows:
+                row = dict(raw_row)
+                metadata = self._result_metadata(row)
+                if metadata:
+                    row["metadata"] = metadata
+                    if not row.get("subject_key") and metadata.get("subject_key"):
+                        row["subject_key"] = str(metadata.get("subject_key") or "")
+                    if not row.get("source_session_id") and metadata.get("source_session_id"):
+                        row["source_session_id"] = str(metadata.get("source_session_id") or "")
+                    if metadata.get("source_label"):
+                        row["source_label"] = str(metadata.get("source_label") or "")
+                    if metadata.get("turn_id"):
+                        row["turn_id"] = str(metadata.get("turn_id") or "")
+                enriched.append(row)
+            decorated[section] = enriched
+        return decorated
+
+    def _current_snapshot_entries(self, *, max_items: int = 8) -> List[Dict[str, Any]]:
+        combined = self._build_builtin_snapshot_entries()
+        entries = list(combined.get("user", [])) + list(combined.get("memory", []))
+        selected = self._select_snapshot_entries(entries, limit_chars=max(1600, max_items * 140))
+        return selected[:max_items]
+
+    def _snapshot_entry_for_subject(
+        self,
+        subject_key: str,
+        *,
+        snapshot_entries: List[Dict[str, Any]] | None = None,
+    ) -> Dict[str, Any] | None:
+        clean_subject = normalize_whitespace(subject_key)
+        if not clean_subject:
+            return None
+        pool = list(snapshot_entries or [])
+        for entry in pool:
+            if normalize_whitespace(str(entry.get("subject_key") or "")) == clean_subject:
+                return dict(entry)
+        if not self._store:
+            return None
+        fallback = self._decorate_search_results(
+            self._store.search(clean_subject, scope="all", limit=8, include_inactive=False)
+        )
+        for section in ("facts", "preferences", "policies"):
+            for row in fallback.get(section, []):
+                metadata = self._result_metadata(row)
+                row_subject = normalize_whitespace(
+                    str(
+                        row.get("subject_key")
+                        or metadata.get("subject_key")
+                        or row.get("preference_key")
+                        or row.get("policy_key")
+                        or ""
+                    )
+                )
+                if row_subject != clean_subject:
+                    continue
+                text = normalize_whitespace(
+                    str(row.get("content") or row.get("label") or row.get("value") or "")
+                )
+                if not text:
+                    continue
+                return {
+                    "text": text,
+                    "subject_key": clean_subject,
+                    "importance": int(row.get("importance") or 0),
+                    "salience": float(row.get("salience") or 0.0),
+                    "updated_at": float(row.get("updated_at") or row.get("created_at") or 0.0),
+                }
+        return None
+
+    def _current_subject_snapshot_entries(
+        self,
+        subject_keys: List[str] | tuple[str, ...],
+        *,
+        max_items: int | None = None,
+    ) -> List[Dict[str, Any]]:
+        combined = self._build_builtin_snapshot_entries()
+        pool = list(combined.get("user", [])) + list(combined.get("memory", []))
+        entries: List[Dict[str, Any]] = []
+        seen_subjects: set[str] = set()
+        for subject_key in subject_keys:
+            clean_subject = normalize_whitespace(subject_key)
+            if not clean_subject or clean_subject in seen_subjects:
+                continue
+            entry = self._snapshot_entry_for_subject(clean_subject, snapshot_entries=pool)
+            if not entry:
+                continue
+            entries.append(entry)
+            seen_subjects.add(clean_subject)
+            if max_items is not None and len(entries) >= max_items:
+                break
+        return entries
+
+    def _mode_snapshot_entries(self, mode: str, *, max_items: int = 8) -> List[Dict[str, Any]]:
+        clean_mode = normalize_whitespace(mode)
+        if clean_mode == "workflow":
+            return self._current_subject_snapshot_entries(
+                list(WORKFLOW_SNAPSHOT_SUBJECTS),
+                max_items=min(max_items, len(WORKFLOW_SNAPSHOT_SUBJECTS)),
+            )
+        if clean_mode == "summary":
+            selected = self._current_subject_snapshot_entries(
+                list(SUMMARY_SNAPSHOT_SUBJECTS),
+                max_items=min(max_items, len(SUMMARY_SNAPSHOT_SUBJECTS)),
+            )
+            if len(selected) >= max_items:
+                return selected[:max_items]
+            supplement = self._current_snapshot_entries(max_items=max_items * 2)
+            seen_subjects = {
+                normalize_whitespace(str(entry.get("subject_key") or ""))
+                for entry in selected
+                if normalize_whitespace(str(entry.get("subject_key") or ""))
+            }
+            seen_texts = {
+                normalize_text(str(entry.get("text") or ""))
+                for entry in selected
+                if normalize_whitespace(str(entry.get("text") or ""))
+            }
+            for entry in supplement:
+                clean_subject = normalize_whitespace(str(entry.get("subject_key") or ""))
+                clean_text = normalize_text(str(entry.get("text") or ""))
+                if (clean_subject and clean_subject in seen_subjects) or (clean_text and clean_text in seen_texts):
+                    continue
+                selected.append(entry)
+                if clean_subject:
+                    seen_subjects.add(clean_subject)
+                if clean_text:
+                    seen_texts.add(clean_text)
+                if len(selected) >= max_items:
+                    break
+            return selected[:max_items]
+        return self._current_snapshot_entries(max_items=max_items)
+
+    def _subject_provenance_entries(
+        self,
+        *,
+        subject_key: str,
+        facts: List[Dict[str, Any]] | None = None,
+        limit: int = 4,
+    ) -> List[Dict[str, Any]]:
+        clean_subject = normalize_whitespace(subject_key)
+        if not clean_subject or not self._store:
+            return []
+        entries: List[Dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+
+        def push(
+            *,
+            content: str,
+            source_label: str = "",
+            source_session_id: str = "",
+            action: str = "",
+            source: str = "",
+            created_at: Any = 0.0,
+            turn_id: str = "",
+            current: bool = False,
+        ) -> None:
+            clean_content = normalize_whitespace(content)
+            clean_label = normalize_whitespace(source_label)
+            clean_session = normalize_whitespace(source_session_id)
+            clean_turn = normalize_whitespace(turn_id)
+            key = (clean_label, clean_session, clean_content)
+            if key in seen:
+                return
+            if not clean_label and not clean_session and not clean_turn:
+                return
+            seen.add(key)
+            entries.append(
+                {
+                    "subject_key": clean_subject,
+                    "content": clean_content,
+                    "source_label": clean_label,
+                    "source_session_id": clean_session,
+                    "turn_id": clean_turn,
+                    "action": normalize_whitespace(action),
+                    "source": normalize_whitespace(source),
+                    "created_at": float(created_at or 0.0),
+                    "current": bool(current),
+                }
+            )
+
+        for fact in facts or []:
+            if normalize_whitespace(str(fact.get("subject_key") or "")) != clean_subject:
+                continue
+            metadata = self._result_metadata(fact)
+            push(
+                content=str(fact.get("content") or ""),
+                source_label=str(fact.get("source_label") or metadata.get("source_label") or ""),
+                source_session_id=str(fact.get("source_session_id") or metadata.get("source_session_id") or ""),
+                action="current",
+                source=str(fact.get("source") or ""),
+                created_at=fact.get("updated_at") or fact.get("created_at") or 0.0,
+                turn_id=str(fact.get("turn_id") or metadata.get("turn_id") or ""),
+                current=True,
+            )
+            if len(entries) >= limit:
+                return entries[:limit]
+
+        history_rows = self._store.list_history(memory_type="fact", subject_key=clean_subject, limit=max(limit * 4, 10))
+        for row in history_rows:
+            payload = self._json_dict(row.get("payload"))
+            if not payload:
+                payload = self._json_dict(row.get("payload_json"))
+            metadata = self._json_dict(payload.get("metadata"))
+            if not metadata:
+                metadata = self._json_dict(payload.get("metadata_json"))
+            push(
+                content=str(payload.get("content") or ""),
+                source_label=str(metadata.get("source_label") or ""),
+                source_session_id=str(payload.get("source_session_id") or metadata.get("source_session_id") or ""),
+                action=str(row.get("action") or ""),
+                source=str(row.get("source") or ""),
+                created_at=row.get("created_at") or 0.0,
+                turn_id=str(metadata.get("turn_id") or ""),
+            )
+            if len(entries) >= limit:
+                break
+        return entries[:limit]
+
+    def _infer_subject_key_from_query(self, query: str) -> str:
+        clean = normalize_text(query)
+        if not clean:
+            return ""
+        checks = (
+            (("timezone", "local morning", "clock zone"), "user:timezone"),
+            (("shell", "terminal environment"), "environment:shell"),
+            (("primary database", "main datastore", "database", "datastore"), "project:database"),
+            (("deployment path", "deploy", "deployment", "orchestration path", "release"), "project:deploy_method"),
+            (("test command", "run the tests", "test invocation", "tests in one command"), "project:test_command"),
+            (("docker commands", "container commands", "sudo"), "workflow:docker_sudo"),
+        )
+        for markers, subject_key in checks:
+            if any(marker in clean for marker in markers):
+                return subject_key
+        return ""
+
+    def _infer_recall_mode(self, *, query: str, args: Dict[str, Any] | None = None) -> str:
+        clean = normalize_text(query)
+        if not clean:
+            return "general"
+        provenance_markers = (
+            "provenance",
+            "source label",
+            "source update",
+            "source batch",
+            "source session",
+            "source of",
+            "which update batch label",
+            "where did",
+            "why do we know",
+            "captured in",
+        )
+        history_markers = (
+            "previous",
+            "older value",
+            "before the correction",
+            "before the current",
+            "used to be",
+            "changed over time",
+            "history",
+            "immediately previous",
+            "prior value",
+        )
+        summary_markers = (
+            "summary",
+            "snapshot",
+            "keep in mind",
+            "overview",
+            "profile",
+            "recap",
+            "synthesis",
+        )
+        workflow_markers = (
+            "checklist",
+            "runbook",
+            "operating checklist",
+        )
+        if any(marker in clean for marker in provenance_markers):
+            return "provenance"
+        if any(marker in clean for marker in history_markers):
+            return "history"
+        if any(marker in clean for marker in summary_markers):
+            return "summary"
+        if any(marker in clean for marker in workflow_markers):
+            return "workflow"
+        return "current_state"
+
     def _build_retrieval_cues(self, *, query: str, args: Dict[str, Any], session_id: str) -> Dict[str, Any]:
         subject_key = normalize_whitespace(str(args.get("subject_key") or ""))
         category = normalize_whitespace(str(args.get("category") or ""))
         topic = normalize_whitespace(str(args.get("topic") or ""))
+        if query and not subject_key:
+            subject_key = self._infer_subject_key_from_query(query)
         if query and not category:
             inferred_category = infer_category(query)
             if inferred_category in {"user_pref", "project", "environment", "workflow"}:
@@ -805,6 +1503,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "subject_key": subject_key,
             "category": category,
             "topic": slugify(topic) if topic else "",
+            "mode": self._infer_recall_mode(query=query, args=args),
         }
 
     def _cue_bonus(self, section: str, row: Dict[str, Any], cues: Dict[str, Any]) -> float:
@@ -826,6 +1525,84 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if subject_key_cue and row_subject and row_subject == subject_key_cue:
             bonus += 0.2
         return bonus
+
+    def _section_mode_adjustment(self, section: str, row: Dict[str, Any], cues: Dict[str, Any]) -> float:
+        mode = str(cues.get("mode") or "")
+        if not mode:
+            return 0.0
+        base: Dict[str, Dict[str, float]] = {
+            "current_state": {
+                "facts": 0.16,
+                "preferences": 0.14,
+                "policies": 0.14,
+                "topics": 0.04,
+                "summaries": -0.14,
+                "journals": -0.18,
+                "episodes": -0.2,
+            },
+            "summary": {
+                "topics": 0.14,
+                "facts": 0.12,
+                "preferences": 0.1,
+                "policies": 0.1,
+                "summaries": -0.04,
+                "journals": -0.1,
+                "episodes": -0.12,
+            },
+            "workflow": {
+                "topics": 0.12,
+                "facts": 0.12,
+                "preferences": 0.12,
+                "policies": 0.12,
+                "summaries": -0.04,
+                "journals": -0.1,
+                "episodes": -0.12,
+            },
+            "history": {
+                "facts": 0.1,
+                "summaries": 0.08,
+                "journals": 0.04,
+                "topics": 0.04,
+            },
+            "provenance": {
+                "facts": 0.12,
+                "summaries": 0.08,
+                "journals": 0.04,
+                "topics": 0.05,
+            },
+        }
+        adjustment = float(base.get(mode, {}).get(section, 0.0))
+        if mode == "current_state":
+            if section == "facts" and int(row.get("exclusive") or 0) == 1:
+                adjustment += 0.04
+            if section == "summaries" and str(row.get("summary_type") or "") in {"session", "handoff"}:
+                adjustment -= 0.06
+        if mode in {"summary", "workflow"} and section == "facts" and int(row.get("exclusive") or 0) == 1:
+            adjustment += 0.02
+        return adjustment
+
+    def _filter_results_for_mode(self, results: Dict[str, List[Dict[str, Any]]], cues: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+        mode = str(cues.get("mode") or "")
+        filtered = {section: list(rows) for section, rows in results.items()}
+        has_direct = any(filtered.get(section) for section in ("facts", "preferences", "policies"))
+        if mode == "current_state":
+            if has_direct:
+                for section in ("topics", "summaries", "journals", "episodes"):
+                    filtered[section] = []
+            else:
+                for section in ("summaries", "journals", "episodes"):
+                    filtered[section] = []
+        elif mode in {"summary", "workflow"}:
+            for section in ("journals", "episodes"):
+                filtered[section] = []
+            if mode == "workflow":
+                filtered["topics"] = []
+                filtered["summaries"] = []
+            elif filtered.get("topics") or has_direct:
+                filtered["summaries"] = []
+                if self._mode_snapshot_entries("summary", max_items=6):
+                    filtered["topics"] = []
+        return filtered
 
     def _review_prompt(self, section: str, row: Dict[str, Any]) -> str:
         if section == "facts":
@@ -892,6 +1669,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             cue_map["session_id"] = normalize_whitespace(session_id)
         candidate_limit = self._cfg()["embedding_candidate_limit"] if self._effective_retrieval_backend() == "hybrid" else limit
         results = self._store.search(clean, scope=scope, limit=int(candidate_limit), include_inactive=include_inactive)
+        results = self._decorate_search_results(results)
+        if str(cue_map.get("mode") or "") == "provenance" and str(cue_map.get("subject_key") or "") and not results.get("facts"):
+            subject_results = self._store.search(
+                str(cue_map.get("subject_key") or ""),
+                scope="facts",
+                limit=max(int(candidate_limit), 3),
+                include_inactive=include_inactive,
+            )
+            results["facts"] = self._decorate_search_results(subject_results).get("facts", [])[: self._section_limit("facts", limit)]
         if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.enabled:
             query_vector = self._embedder.embed_texts([clean])
             if query_vector:
@@ -913,10 +1699,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         recency = 1.0 / (1.0 + age_days / 7.0)
                         rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                         cue_bonus = self._cue_bonus(section, row, cue_map)
-                        score = (0.5 * similarity) + (0.2 * salience) + (0.1 * importance) + (0.08 * recency) + (0.07 * rank_prior) + cue_bonus
+                        mode_adjustment = self._section_mode_adjustment(section, row, cue_map)
+                        score = (0.5 * similarity) + (0.2 * salience) + (0.1 * importance) + (0.08 * recency) + (0.07 * rank_prior) + cue_bonus + mode_adjustment
                         item = dict(row)
                         item["hybrid_score"] = round(score, 5)
                         item["cue_match_score"] = round(cue_bonus, 5)
+                        item["mode_adjustment_score"] = round(mode_adjustment, 5)
                         scored.append(item)
                     scored.sort(key=lambda item: float(item.get("hybrid_score") or 0.0), reverse=True)
                     results[section] = scored[: self._section_limit(section, limit)]
@@ -931,13 +1719,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     recency = 1.0 / (1.0 + age_days / 7.0)
                     rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                     cue_bonus = self._cue_bonus(section, row, cue_map)
-                    score = (0.38 * rank_prior) + (0.3 * salience) + (0.16 * importance) + (0.16 * recency) + cue_bonus
+                    mode_adjustment = self._section_mode_adjustment(section, row, cue_map)
+                    score = (0.38 * rank_prior) + (0.3 * salience) + (0.16 * importance) + (0.16 * recency) + cue_bonus + mode_adjustment
                     item = dict(row)
                     item["heuristic_score"] = round(score, 5)
                     item["cue_match_score"] = round(cue_bonus, 5)
+                    item["mode_adjustment_score"] = round(mode_adjustment, 5)
                     scored.append(item)
                 scored.sort(key=lambda item: float(item.get("heuristic_score") or 0.0), reverse=True)
                 results[section] = scored[: self._section_limit(section, limit)]
+        results = self._filter_results_for_mode(results, cue_map)
         if touch_recall and clean:
             self._store.touch_recall_batch(
                 results,
@@ -952,9 +1743,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not self._store:
             return
         metadata = dict(candidate.get("metadata") or fact.get("metadata") or {})
-        category = str(candidate.get("category") or fact.get("category") or "")
         subject_key = str(metadata.get("subject_key") or "")
-        if category != "user_pref" and not subject_key.startswith("user:"):
+        if not subject_key.startswith("user:"):
             return
         key = subject_key or slugify(str(metadata.get("item_label") or fact.get("content") or "")[:48])
         value = str(metadata.get("value_key") or metadata.get("item_label") or fact.get("content") or "")
@@ -1034,6 +1824,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             )
             if session_id:
                 self._store.add_link("preference", result["id"], "session", session_id, "captured_in")
+            self._sync_builtin_snapshot(reason="tool_remember_preference")
             return {"memory_type": "preference", "entry": result}
         if not content:
             raise ValueError("content is required for remember")
@@ -1072,6 +1863,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             max_facts=self._cfg()["max_topic_facts"],
             max_chars=self._cfg()["topic_summary_chars"],
         )
+        self._sync_builtin_snapshot(reason="tool_remember_fact")
         return {"memory_type": "fact", **result}
 
     def _singular_kind(self, section: str) -> str:
@@ -1265,8 +2057,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         session_id = str(payload.get("session_id") or self._session_id)
         if not query:
             return
-        results = self._search_memory(query, scope="all", limit=self._cfg()["prefetch_limit"], session_id=session_id)
-        rendered = self._render_prefetch(query, results)
+        cues = self._build_retrieval_cues(query=query, args={}, session_id=session_id)
+        results = self._search_memory(query, scope="all", limit=self._cfg()["prefetch_limit"], session_id=session_id, cues=cues)
+        rendered = self._render_prefetch(query, results, cues=cues)
         with self._prefetch_lock:
             self._prefetch_cache[session_id] = {"query": query, "rendered": rendered, "created_at": time.time()}
 
@@ -1278,10 +2071,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         content = str(payload.get("content") or "").strip()
         if not content:
             return
+        candidates = self._extract_mirror_memory_candidates(content)
         if action == "remove":
-            clean = normalize_whitespace(content)
-            self._store.deactivate_matching(clean, limit=10)
-            if target == "user":
+            removal_texts = [normalize_whitespace(str(candidate.get("content") or "")) for candidate in candidates]
+            if not removal_texts:
+                removal_texts = [normalize_whitespace(self._sanitize_mirror_memory_text(content) or content)]
+            for clean in removal_texts:
+                if not clean:
+                    continue
+                self._store.deactivate_matching(clean, limit=10)
                 matches = self._store.search(clean, scope="preferences", limit=10).get("preferences", [])
                 for row in matches:
                     values = {
@@ -1301,29 +2099,37 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 max_facts=self._cfg()["max_topic_facts"],
                 max_chars=self._cfg()["topic_summary_chars"],
             )
+            self._sync_builtin_snapshot(reason="mirror_memory_remove")
         else:
-            category = "user_pref" if target == "user" else "workflow"
-            topic = "user-profile" if target == "user" else "builtin-memory"
-            result = self._store.upsert_fact(
-                content=content,
-                category=category,
-                topic=topic,
-                source=f"builtin_memory:{target}",
-                importance=8,
-                confidence=0.95,
-                metadata={"target": target, "action": action},
-                source_session_id=self._session_id,
-                history_reason="mirror_memory",
-            )
-            if target == "user":
+            if not candidates:
+                return
+            for candidate in candidates:
+                effective_target = self._mirror_candidate_target(candidate, target)
+                metadata = {
+                    **dict(candidate.get("metadata") or {}),
+                    "target": target,
+                    "action": action,
+                    "snapshot_target": effective_target,
+                }
+                result = self._store.upsert_fact(
+                    content=str(candidate.get("content") or ""),
+                    category=str(candidate.get("category") or "general"),
+                    topic=str(candidate.get("topic") or infer_topic(str(candidate.get("content") or ""), str(candidate.get("category") or "general"))),
+                    source=f"builtin_memory:{effective_target}",
+                    importance=int(candidate.get("importance") or 8),
+                    confidence=float(candidate.get("confidence") or 0.85),
+                    metadata=metadata,
+                    source_session_id=self._session_id,
+                    history_reason="mirror_memory",
+                )
                 self._candidate_to_preference(
                     {
-                        "content": content,
-                        "category": category,
-                        "topic": topic,
-                        "importance": 8,
-                        "confidence": 0.95,
-                        "metadata": {"target": target, "action": action},
+                        "content": str(candidate.get("content") or ""),
+                        "category": str(candidate.get("category") or "general"),
+                        "topic": str(candidate.get("topic") or "builtin-memory"),
+                        "importance": int(candidate.get("importance") or 8),
+                        "confidence": float(candidate.get("confidence") or 0.85),
+                        "metadata": metadata,
                     },
                     dict(result.get("fact") or {}),
                 )
@@ -1331,6 +2137,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 max_facts=self._cfg()["max_topic_facts"],
                 max_chars=self._cfg()["topic_summary_chars"],
             )
+            self._sync_builtin_snapshot(reason="mirror_memory_write")
 
     def _handle_remember_fact(self, payload: Dict[str, Any]) -> None:
         if not self._store:
@@ -1357,6 +2164,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             },
             dict(result.get("fact") or {}),
         )
+        self._sync_builtin_snapshot(reason=str(payload.get("source") or "remember_fact"))
 
     def _handle_extract_messages(self, payload: Dict[str, Any]) -> None:
         if not self._store:
@@ -1391,6 +2199,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     reason=source,
                 )
                 self._store.close_memory_session(session_id, summary=summary)
+        self._sync_builtin_snapshot(reason=f"extract_messages:{source}")
 
     def _run_consolidation(self, *, force: bool, reason: str) -> Dict[str, Any]:
         if not self._store:
@@ -1420,6 +2229,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 except Exception as exc:
                     logger.warning("Wiki export failed after consolidation: %s", exc)
                     result["wiki_export"] = {"success": False, "error": str(exc)}
+            if result.get("status") == "completed":
+                result["builtin_snapshot"] = self._sync_builtin_snapshot(reason=f"consolidation:{reason}")
             return result
         finally:
             self._consolidation_lock.release()
@@ -1578,12 +2389,32 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if "docker compose" in lowered:
                     metadata["value_key"] = "docker-compose"
                     item["content"] = "Project deploys with Docker Compose."
+                elif "nomad" in lowered:
+                    metadata["value_key"] = "nomad"
+                    item["content"] = "Project deploys with Nomad."
                 elif "kubernetes" in lowered or "k8s" in lowered:
                     metadata["value_key"] = "kubernetes"
                     item["content"] = "Project deploys with Kubernetes."
                 elif "docker" in lowered:
                     metadata["value_key"] = "docker"
                     item["content"] = "Project deploys with Docker."
+            elif subject_key == "project:test_command":
+                command_label = str(metadata.get("command_label") or "")
+                if "uv run pytest -q" in lowered:
+                    metadata["value_key"] = "uv-run-pytest-q"
+                    metadata["command_label"] = "uv run pytest -q"
+                    item["content"] = "Project tests run with uv run pytest -q."
+                elif "python -m unittest -q" in lowered:
+                    metadata["value_key"] = "python-m-unittest-q"
+                    metadata["command_label"] = "python -m unittest -q"
+                    item["content"] = "Project tests run with python -m unittest -q."
+                elif "pytest -q" in lowered:
+                    metadata["value_key"] = "pytest-q"
+                    metadata["command_label"] = "pytest -q"
+                    item["content"] = "Project tests run with pytest -q."
+                elif command_label:
+                    metadata["value_key"] = slugify(command_label)
+                    item["content"] = f"Project tests run with {command_label}."
             elif subject_key == "project:database":
                 if "postgres" in lowered:
                     metadata["value_key"] = "postgresql"
@@ -1658,6 +2489,14 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if status:
                     metadata["value_key"] = value_key or status.lower().replace(" ", "-")
                     item["content"] = f"User is {status}."
+            elif subject_key == "user:timezone":
+                timezone = str(metadata.get("timezone_label") or value_key.replace("-", " "))
+                timezone = normalize_whitespace(timezone)
+                if timezone:
+                    label = timezone if "/" in timezone else timezone.upper()
+                    metadata["timezone_label"] = label
+                    metadata["value_key"] = slugify(label)
+                    item["content"] = f"User's timezone is {label}."
             elif subject_key.startswith("user:allergy:"):
                 item_label = str(metadata.get("item_label") or subject_key.split(":", 2)[-1].replace("-", " "))
                 item_label = normalize_whitespace(item_label)
@@ -1681,6 +2520,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 elif "use sudo" in lowered:
                     metadata["value_key"] = "sudo-required"
                     item["content"] = "Use sudo for Docker commands."
+            elif subject_key == "workflow:manual_edits":
+                metadata["value_key"] = "apply-patch"
+                item["content"] = "Use apply_patch for manual file edits."
+            elif subject_key == "workflow:git_safety":
+                metadata["value_key"] = "avoid-git-reset-hard"
+                item["content"] = "Never use git reset --hard."
 
             if subject_key and not metadata.get("value_key"):
                 metadata["value_key"] = value_key
@@ -1688,7 +2533,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             normalized.append(item)
         return self._dedupe_candidates(normalized)
 
-    def _render_prefetch(self, query: str, results: Dict[str, List[Dict[str, Any]]]) -> str:
+    def _render_prefetch(self, query: str, results: Dict[str, List[Dict[str, Any]]], *, cues: Dict[str, Any] | None = None) -> str:
+        cue_map = dict(cues or {})
+        mode = str(cue_map.get("mode") or "current_state")
+        snapshot_lines: List[str] = []
+        if mode in {"summary", "workflow"}:
+            snapshot_lines = [f"- {entry.get('text')}" for entry in self._mode_snapshot_entries(mode, max_items=6)]
+        topic_lines = []
+        for item in results.get("topics", [])[:2]:
+            topic_lines.append(f"- {item.get('title')}: {item.get('summary')}")
         summary_lines = []
         for item in results.get("summaries", [])[:3]:
             summary_lines.append(f"- {item.get('label')}: {item.get('summary')}")
@@ -1715,10 +2568,102 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         for item in results.get("journals", [])[:2]:
             journal_lines.append(f"- {item.get('label')}: {item.get('content')}")
 
-        if not summary_lines and not preference_lines and not workflow_lines and not fact_lines and not journal_lines:
+        contradiction_subjects = set()
+        if cue_map.get("subject_key"):
+            contradiction_subjects.add(str(cue_map["subject_key"]))
+        for fact in results.get("facts", []):
+            subject_key = normalize_whitespace(str(fact.get("subject_key") or ""))
+            if subject_key:
+                contradiction_subjects.add(subject_key)
+        contradiction_lines = []
+        provenance_lines: List[str] = []
+        if mode in {"history", "provenance"} and self._store:
+            rows = self._store.recent_contradictions(
+                limit=3,
+                max_age_days=14,
+                subject_keys=sorted(contradiction_subjects) if contradiction_subjects else None,
+            )
+            for row in rows:
+                winner = normalize_whitespace(str(row.get("winner_content") or ""))
+                loser = normalize_whitespace(str(row.get("loser_content") or ""))
+                contradiction_lines.append(f"- {row.get('subject_key')}: {loser} -> {winner}")
+        if mode == "provenance":
+            subject_keys: List[str] = []
+            if cue_map.get("subject_key"):
+                subject_keys.append(str(cue_map.get("subject_key") or ""))
+            for fact in results.get("facts", []):
+                subject_key = normalize_whitespace(str(fact.get("subject_key") or ""))
+                if subject_key and subject_key not in subject_keys:
+                    subject_keys.append(subject_key)
+            for subject_key in subject_keys[:3]:
+                for entry in self._subject_provenance_entries(
+                    subject_key=subject_key,
+                    facts=list(results.get("facts", [])),
+                    limit=3,
+                ):
+                    label = str(entry.get("source_label") or "")
+                    session_text = str(entry.get("source_session_id") or "")
+                    turn_text = str(entry.get("turn_id") or "")
+                    content = str(entry.get("content") or "")
+                    origin = label or session_text or turn_text or "unknown source"
+                    detail = f"{subject_key} -> {origin}"
+                    if content:
+                        detail += f" ({content})"
+                    provenance_lines.append(f"- {detail}")
+            deduped: List[str] = []
+            seen = set()
+            for line in provenance_lines:
+                if line in seen:
+                    continue
+                seen.add(line)
+                deduped.append(line)
+            provenance_lines = deduped[:6]
+
+        if not topic_lines and not summary_lines and not preference_lines and not workflow_lines and not fact_lines and not journal_lines and not contradiction_lines and not provenance_lines and not snapshot_lines:
             return ""
 
         lines = [f"## Consolidating Memory Recall for: {query}"]
+        if mode in {"current_state", "summary", "workflow"}:
+            lines.append("Current-state guidance: prefer active current memory and avoid mentioning older conflicting values unless the user explicitly asks for history or provenance.")
+        if mode == "summary":
+            lines.append("Do not mention obsolete or superseded values, even as exclusions, contrasts, or examples.")
+            lines.append("When you answer, list only the current winner facts and stop. Do not append an exclusions note.")
+            lines.append("Use the winner snapshot as the source of truth. Do not add replacement history, caveats, or extra workflow items that are not in the snapshot.")
+        if mode == "workflow":
+            lines.append("Use only the current workflow winners below for shell, test command, deploy method, and Docker sudo behavior.")
+            lines.append("Do not append an obsolete-values note, contrast list, or superseded examples.")
+        if mode == "current_state":
+            if preference_lines or workflow_lines:
+                lines.append("Active preferences and workflow rules:")
+                lines.extend(preference_lines + workflow_lines)
+            if fact_lines:
+                lines.append("Current direct matches:")
+                lines.extend(fact_lines)
+            elif topic_lines:
+                lines.append("Current topic snapshots:")
+                lines.extend(topic_lines)
+            return "\n".join(lines)
+        if mode in {"summary", "workflow"}:
+            if snapshot_lines:
+                lines.append("Current workflow winners:" if mode == "workflow" else "Current winner snapshot:")
+                lines.extend(snapshot_lines)
+            if not snapshot_lines:
+                if topic_lines:
+                    lines.append("Current topic snapshots:")
+                    lines.extend(topic_lines)
+                elif summary_lines:
+                    lines.append("Relevant summaries:")
+                    lines.extend(summary_lines)
+                if preference_lines or workflow_lines:
+                    lines.append("Active preferences and workflow rules:")
+                    lines.extend(preference_lines + workflow_lines)
+                if fact_lines:
+                    lines.append("Active direct matches:")
+                    lines.extend(fact_lines)
+            return "\n".join(lines)
+        if provenance_lines:
+            lines.append("Provenance trail:")
+            lines.extend(provenance_lines)
         if summary_lines:
             lines.append("Relevant summaries:")
             lines.extend(summary_lines)
@@ -1731,11 +2676,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if journal_lines:
             lines.append("Recent journal notes:")
             lines.extend(journal_lines)
-        contradiction_lines = []
-        for row in self._store.recent_contradictions(limit=2, max_age_days=7) if self._store else []:
-            winner = normalize_whitespace(str(row.get("winner_content") or ""))
-            loser = normalize_whitespace(str(row.get("loser_content") or ""))
-            contradiction_lines.append(f"- {row.get('subject_key')}: {loser} -> {winner}")
         if contradiction_lines:
             lines.append("Changed assumptions:")
             lines.extend(contradiction_lines)
