@@ -406,6 +406,14 @@ EPHEMERAL_PATTERNS = (
     r"\bis currently (playing|watching|eating|having|coding|working)\b",
     r"\bcurrently (in a|focused on|working on|playing|eating|watching)\b",
     r"\bjust (woke up|ate|started|logged|got)\b",
+    r"\bis celebrating\b",
+    r"\bis considering\b",
+    r"\bplans to (play|watch|eat|do|start|continue)\b",
+    r"\binitiated session\b",
+    r"\bgreeted the (assistant|agent)\b",
+    r"\bis doing (her|his|their|its) thing\b",
+    r"\bhas (just |recently )?(finished|started|begun|completed)\b",
+    r"\btoday('s| is)\b.*\b(holiday|easter|christmas|birthday)\b",
 )
 
 _EPHEMERAL_RE = re.compile("|".join(EPHEMERAL_PATTERNS), re.IGNORECASE)
@@ -413,15 +421,33 @@ _EPHEMERAL_RE = re.compile("|".join(EPHEMERAL_PATTERNS), re.IGNORECASE)
 # Subject keys whose content is inherently transient and should not persist.
 EPHEMERAL_SUBJECT_PREFIXES = (
     "general:activity_current",
+    "general:last_interaction",
+    "general:last_log_date",
+    "general:conversation_topic",
+    "general:rei_status",
     "user:daily_activity",
     "user:coding_state",
     "user:game_phase",
+    "user:resource:tokens",
+    "user:session_pattern",
+    "user:log_focus",
+    "user:file_request",
+    "user:next_activity_choice",
+    "user:mood:",
     "workflow:current_activity",
     "workflow:current_phase",
+    "workflow:current_focus",
     "workflow:gaming_focus",
     "workflow:next_step",
+    "workflow:last_tool_call",
+    "workflow:operation_timeout",
+    "workflow:core_facts_count",
+    "workflow:session_episodes_count",
+    "workflow:concept_links_count",
     "project:memory_stats",
     "project:memory_usage",
+    "environment:last_reflection_date",
+    "environment:memory_plugin_status",
 )
 
 
@@ -490,6 +516,15 @@ def _normalize_preference_items(raw: str) -> List[str]:
         item = re.sub(r"\b(?:a lot|very much|too much)$", "", item, flags=re.IGNORECASE)
         item = normalize_whitespace(item)
         if not item or len(item) > 48:
+            continue
+        # Reject single generic words (produces junk like "User likes food.")
+        if len(item.split()) == 1 and item.lower() in (
+            "food", "hobby", "enjoyment", "status", "location", "things",
+            "stuff", "it", "that", "this", "them", "everything", "nothing",
+        ):
+            continue
+        # Reject items that are too long (sentence fragments, not preference items)
+        if len(item.split()) > 8:
             continue
         if any(
             token in item.lower()
@@ -596,7 +631,7 @@ def _extract_favorite_things(segment: str, source_role: str) -> List[Dict[str, A
         return []
     trait = normalize_whitespace(match.group(1))
     value = _trim_phrase(match.group(2))
-    if not trait or not value:
+    if not trait or not value or not _is_plausible_value(value):
         return []
     return [
         build_candidate(
@@ -668,6 +703,27 @@ def _extract_user_role(segment: str, source_role: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _is_plausible_value(value: str) -> bool:
+    """Reject values that look like unresolved variables or metadata keys."""
+    clean = normalize_whitespace(value).strip()
+    if not clean or len(clean) < 2:
+        return False
+    lower = clean.lower()
+    # Reject single words that are clearly metadata field names
+    if lower in (
+        "status", "location", "value", "unknown", "none", "default",
+        "current", "primary", "general", "user", "preference", "setting",
+    ):
+        return False
+    # Reject strings that look like subject_key references (contain colons)
+    if ":" in clean and re.match(r"^[a-z_]+:[a-z_:]+$", lower):
+        return False
+    # Reject strings starting with user: or project: etc. (unresolved keys)
+    if lower.startswith(("user:", "project:", "environment:", "workflow:", "general:")):
+        return False
+    return True
+
+
 def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     confidence = 0.85 if source_role == "user" else 0.6
@@ -697,7 +753,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
     )
     if match:
         location = _trim_phrase(match.group(1))
-        if location:
+        if location and _is_plausible_value(location):
             candidates.append(
                 build_candidate(
                     content=f"User lives in {location}",
@@ -716,7 +772,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
     match = re.search(r"\b(?:i(?:'m| am)\s+from|user is from)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
     if match:
         origin = _trim_phrase(match.group(1))
-        if origin:
+        if origin and _is_plausible_value(origin):
             candidates.append(
                 build_candidate(
                     content=f"User is from {origin}",
@@ -735,7 +791,7 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
     match = re.search(r"\b(?:i grew up in|user grew up in|user's hometown is)\s+(.+?)(?:[.;,]|$)", segment, flags=re.IGNORECASE)
     if match:
         hometown = _trim_phrase(match.group(1))
-        if hometown:
+        if hometown and _is_plausible_value(hometown):
             candidates.append(
                 build_candidate(
                     content=f"User grew up in {hometown}",
@@ -776,20 +832,21 @@ def _extract_personal_details(segment: str, source_role: str) -> List[Dict[str, 
     match = re.search(r"\bi(?:'m| am)\s+(single|married|engaged|divorced|widowed)\b", segment, flags=re.IGNORECASE)
     if match:
         status = normalize_whitespace(match.group(1))
-        candidates.append(
-            build_candidate(
-                content=f"User is {status}",
-                category="user_pref",
-                topic="personal-profile",
-                importance=7,
-                confidence=confidence,
-                source_role=source_role,
-                subject_key="user:relationship_status",
-                value_key=slugify(status),
-                exclusive=True,
-                metadata={"relationship_label": status},
+        if _is_plausible_value(status):
+            candidates.append(
+                build_candidate(
+                    content=f"User is {status}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:relationship_status",
+                    value_key=slugify(status),
+                    exclusive=True,
+                    metadata={"relationship_label": status},
+                )
             )
-        )
 
     for pattern, polarity, label in (
         (r"\b(?:i(?:'m| am)|user is)\s+allergic to\s+(.+?)(?:[.;,]|$)", 1, "allergic"),
@@ -1507,6 +1564,9 @@ def run_consolidation(
             facts_superseded += len(result.get("superseded", []))
             contradictions_resolved += len(result.get("contradictions", []))
 
+    # Merge duplicate subject_key+value_key facts (keep best, supersede rest)
+    subjects_merged = store.merge_duplicate_subjects()
+
     pruned = store.prune_stale_facts(max_age_days=prune_after_days)
     decay_stats = store.apply_decay(
         half_life_days=decay_half_life_days,
@@ -1565,6 +1625,7 @@ def run_consolidation(
         "facts_added": facts_added,
         "facts_updated": facts_updated,
         "facts_superseded": facts_superseded,
+        "subjects_merged": subjects_merged,
         "contradictions_resolved": contradictions_resolved,
         "facts_pruned": pruned,
         "topics_rebuilt": topics_rebuilt,

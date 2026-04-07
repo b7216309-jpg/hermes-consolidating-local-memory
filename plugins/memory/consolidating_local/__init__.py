@@ -2024,12 +2024,25 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             )
         return results
 
+    # Subject key prefixes that warrant a preference record (behavioral directives,
+    # response style, explicit likes/dislikes, favorites).  Other user:* facts
+    # (physical attributes, schedule, financials, etc.) stay as facts only.
+    _PREFERENCE_WORTHY_PREFIXES = (
+        "user:preference:", "user:favorite:", "user:response_style",
+        "user:response_tone", "user:answer_format", "user:vibe",
+        "user:diet", "user:allergy:", "user:pronouns",
+    )
+
     def _candidate_to_preference(self, candidate: Dict[str, Any], fact: Dict[str, Any]) -> None:
         if not self._store:
             return
         metadata = dict(candidate.get("metadata") or fact.get("metadata") or {})
         subject_key = str(metadata.get("subject_key") or "")
         if not subject_key.startswith("user:"):
+            return
+        # Only promote to preference if it's a behavioral/preference pattern,
+        # not every user:* fact (avoids duplication of profile facts).
+        if not any(subject_key.startswith(p) for p in self._PREFERENCE_WORTHY_PREFIXES):
             return
         key = subject_key or slugify(str(metadata.get("item_label") or fact.get("content") or "")[:48])
         # Prefer human-readable label metadata over slugified value_key.
@@ -2056,8 +2069,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 **metadata,
                 **({"session_id": str(fact.get("source_session_id") or "")} if fact.get("source_session_id") else {}),
             },
-            importance=max(int(fact.get("importance") or 6), 7),
-            salience=max(float(fact.get("salience") or 0.0), 0.8),
+            importance=int(fact.get("importance") or 6),
+            salience=float(fact.get("salience") or 0.7),
             reason="fact_extract",
         )
         if fact.get("id") is not None:
@@ -2749,7 +2762,17 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     metadata["value_key"] = value_key or value.lower().replace(" ", "-")
                     item["content"] = f"User's favorite {trait} is {value}."
             elif subject_key.startswith("user:preference:"):
-                item_label = str(metadata.get("item_label") or subject_key.split(":", 2)[-1].replace("-", " "))
+                item_label = str(metadata.get("item_label") or "")
+                if not item_label:
+                    # Fallback to slug, but reject if it looks like a DB key
+                    fallback = subject_key.split(":", 2)[-1].replace("-", " ")
+                    # Skip canonicalization if the fallback is a single generic word
+                    if fallback and " " not in fallback and fallback.lower() in (
+                        "food", "hobby", "enjoyment", "status", "location",
+                        "things", "stuff", "setting", "preference",
+                    ):
+                        continue
+                    item_label = normalize_whitespace(fallback)
                 item_label = normalize_whitespace(item_label)
                 if item_label:
                     if int(metadata.get("polarity", 1) or 1) < 0 or value_key == "dislike":

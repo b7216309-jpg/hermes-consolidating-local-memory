@@ -1185,10 +1185,16 @@ class MemoryStore:
             self.ensure_memory_session(source_session_id)
         if existing:
             action = "reconsolidated" if float(existing.get("reconsolidation_until") or 0.0) > now else "updated"
+            # Weighted merge instead of pure MAX
+            _old_imp = int(existing.get("importance") or 5)
+            _new_imp = int(importance)
+            next_importance = max(_new_imp, round(_old_imp * 0.7 + _new_imp * 0.3))
+            _old_sal = float(existing.get("salience") or 0.5)
+            next_salience = min(1.0, _old_sal * 0.6 + float(salience) * 0.4 + 0.05)
             self._execute(
                 """
                 UPDATE memory_preferences
-                SET label = ?, value = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = MAX(importance, ?), salience = MAX(salience, ?), next_review_at = ?, active = 1, updated_at = ?
+                SET label = ?, value = ?, content = ?, metadata_json = ?, source_session_id = ?, importance = ?, salience = ?, next_review_at = ?, active = 1, updated_at = ?
                 WHERE preference_key = ?
                 """,
                 (
@@ -1197,8 +1203,8 @@ class MemoryStore:
                     pref_content,
                     json.dumps(meta, sort_keys=True),
                     source_session_id,
-                    int(importance),
-                    float(salience),
+                    next_importance,
+                    next_salience,
                     now + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0)),
                     now,
                     pref_key,
@@ -1518,15 +1524,31 @@ class MemoryStore:
         return deleted
 
     def _default_fact_salience(self, category: str, metadata: Dict[str, Any]) -> float:
-        if str(metadata.get("subject_key") or "").startswith("user:"):
-            return 0.9
+        subject_key = str(metadata.get("subject_key") or "")
+        if subject_key.startswith("user:"):
+            # Differentiate: core identity facts get high salience,
+            # transient/activity facts start lower.
+            _HIGH_SALIENCE_PREFIXES = (
+                "user:name", "user:date_of_birth", "user:occupation",
+                "user:location", "user:origin", "user:hometown",
+                "user:condition", "user:diet", "user:pronouns",
+                "user:physical_attributes", "user:response_style",
+                "user:response_tone",
+            )
+            if any(subject_key.startswith(p) for p in _HIGH_SALIENCE_PREFIXES):
+                return 0.92
+            if subject_key.startswith("user:preference:"):
+                return 0.72
+            if subject_key.startswith("user:favorite:"):
+                return 0.78
+            return 0.80
         if category == "workflow":
-            return 0.88
+            return 0.85
         if category == "project":
-            return 0.74
+            return 0.72
         if category == "environment":
-            return 0.68
-        return 0.55
+            return 0.65
+        return 0.50
 
     def _default_fact_half_life(self, category: str, metadata: Dict[str, Any]) -> float:
         if str(metadata.get("subject_key") or "").startswith("user:"):
@@ -1582,7 +1604,21 @@ class MemoryStore:
             next_value = value_key or str(existing.get("value_key") or "")
             next_polarity = polarity if subject_key else int(existing.get("polarity") or 1)
             next_exclusive = exclusive if subject_key else int(existing.get("exclusive") or 0)
-            next_salience = max(float(existing.get("salience") or 0.0), salience_value)
+            # Weighted merge: blend existing and new values instead of pure MAX.
+            # This allows importance/salience to drift down when new observations
+            # provide lower values, while still giving weight to the historical peak.
+            _old_imp = int(existing.get("importance") or 5)
+            _new_imp = int(importance)
+            # 70% old + 30% new, but never drop below new value minus 1
+            next_importance = max(_new_imp, round(_old_imp * 0.7 + _new_imp * 0.3))
+            _old_conf = float(existing.get("confidence") or 0.5)
+            _new_conf = float(confidence)
+            next_confidence = max(_new_conf, _old_conf * 0.7 + _new_conf * 0.3)
+            # Salience: blend with slight upward bias for re-observation
+            _old_sal = float(existing.get("salience") or 0.5)
+            next_salience = _old_sal * 0.6 + salience_value * 0.4
+            # Bump slightly for being re-observed (reconsolidation reward)
+            next_salience = min(1.0, next_salience + 0.05)
             next_half_life = max(float(existing.get("decay_half_life_days") or 0.0), half_life)
             next_session = source_session or str(existing.get("source_session_id") or "")
             next_review_at = observed_at + _first_review_offset_seconds((1.0, 3.0, 7.0, 14.0, 30.0))
@@ -1590,8 +1626,8 @@ class MemoryStore:
                 """
                 UPDATE facts
                 SET active = 1,
-                    importance = MAX(importance, ?),
-                    confidence = MAX(confidence, ?),
+                    importance = ?,
+                    confidence = ?,
                     salience = ?,
                     updated_at = ?,
                     last_seen_at = ?,
@@ -1606,8 +1642,8 @@ class MemoryStore:
                 WHERE id = ?
                 """,
                 (
-                    int(importance),
-                    float(confidence),
+                    next_importance,
+                    next_confidence,
                     next_salience,
                     observed_at,
                     observed_at,
@@ -1751,6 +1787,52 @@ class MemoryStore:
             )
             superseded_ids.append(fact_id)
         return superseded_ids
+
+    def merge_duplicate_subjects(self) -> int:
+        """Consolidation-time dedup: for each subject_key that has multiple
+        active facts with the same value_key, keep only the one with the
+        highest (importance, salience, updated_at) and supersede the rest."""
+        merged = 0
+        rows = self._fetchall(
+            """
+            SELECT subject_key, value_key, COUNT(*) AS cnt
+            FROM facts
+            WHERE active = 1 AND subject_key != ''
+            GROUP BY subject_key, value_key
+            HAVING cnt > 1
+            ORDER BY subject_key, value_key
+            """
+        )
+        for row in rows:
+            sk = str(row["subject_key"])
+            vk = str(row.get("value_key") or "")
+            if vk:
+                dupes = self._fetchall(
+                    """SELECT id, importance, salience, updated_at FROM facts
+                       WHERE active=1 AND subject_key=? AND value_key=?
+                       ORDER BY importance DESC, salience DESC, updated_at DESC""",
+                    (sk, vk),
+                )
+            else:
+                dupes = self._fetchall(
+                    """SELECT id, importance, salience, updated_at FROM facts
+                       WHERE active=1 AND subject_key=? AND (value_key IS NULL OR value_key='')
+                       ORDER BY importance DESC, salience DESC, updated_at DESC""",
+                    (sk,),
+                )
+            if len(dupes) <= 1:
+                continue
+            winner_id = int(dupes[0]["id"])
+            for loser in dupes[1:]:
+                self._soft_supersede_fact(
+                    int(loser["id"]),
+                    winner_id,
+                    float(dupes[0]["updated_at"]),
+                    subject_key=sk,
+                    reason="consolidation_dedup",
+                )
+                merged += 1
+        return merged
 
     def _soft_supersede_fact(
         self,
