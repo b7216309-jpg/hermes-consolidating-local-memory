@@ -419,6 +419,9 @@ EPHEMERAL_SUBJECT_PREFIXES = (
     "workflow:current_activity",
     "workflow:current_phase",
     "workflow:gaming_focus",
+    "workflow:next_step",
+    "project:memory_stats",
+    "project:memory_usage",
 )
 
 

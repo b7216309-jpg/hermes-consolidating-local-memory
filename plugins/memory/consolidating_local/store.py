@@ -93,7 +93,18 @@ def text_signature(text: str) -> str:
 COEXIST_SUBJECT_KEYS = frozenset({
     "environment:os",
     "environment:shell",
+    "user:physical_attributes",
+    "user:interest:media",
 })
+
+# Subject-key prefixes for transient / stats-like data that should never
+# generate contradictions.  These change every session and create noise.
+_SUPERSEDE_ONLY_PREFIXES = (
+    "workflow:next_step",
+    "workflow:current_",
+    "project:memory_stats",
+    "project:memory_usage",
+)
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> Dict[str, Any] | None:
@@ -1774,29 +1785,56 @@ class MemoryStore:
         if subject_key in COEXIST_SUBJECT_KEYS:
             return {"superseded": [], "contradictions": []}
 
-        others = self._fetchall(
-            """
-            SELECT id, content, value_key, polarity
-            FROM facts
-            WHERE id != ?
-              AND active = 1
-              AND subject_key = ?
-              AND exclusive = 1
-            ORDER BY updated_at DESC
-            """,
-            (int(new_fact["id"]), subject_key),
-        )
-        superseded: List[int] = []
-        contradictions: List[Dict[str, Any]] = []
+        # Transient / stats keys: supersede silently, never record as contradiction.
+        supersede_only = any(subject_key.startswith(p) for p in _SUPERSEDE_ONLY_PREFIXES)
+
         new_value = str(new_fact.get("value_key") or "")
         new_polarity = int(new_fact.get("polarity") or 1)
+
+        # ── Only match facts with the SAME value_key (or both empty).
+        # Different value_keys under the same subject are complementary
+        # facets, not contradictions (e.g. height vs weight under
+        # user:physical_attributes).
+        if new_value:
+            others = self._fetchall(
+                """
+                SELECT id, content, value_key, polarity
+                FROM facts
+                WHERE id != ?
+                  AND active = 1
+                  AND subject_key = ?
+                  AND exclusive = 1
+                  AND value_key = ?
+                ORDER BY updated_at DESC
+                """,
+                (int(new_fact["id"]), subject_key, new_value),
+            )
+        else:
+            # No value_key — match other empty-value facts with same subject.
+            others = self._fetchall(
+                """
+                SELECT id, content, value_key, polarity
+                FROM facts
+                WHERE id != ?
+                  AND active = 1
+                  AND subject_key = ?
+                  AND exclusive = 1
+                  AND (value_key IS NULL OR value_key = '')
+                ORDER BY updated_at DESC
+                """,
+                (int(new_fact["id"]), subject_key),
+            )
+
+        superseded: List[int] = []
+        contradictions: List[Dict[str, Any]] = []
         for row in others:
             row_value = str(row.get("value_key") or "")
             row_polarity = int(row.get("polarity") or 1)
             same_state = row_value == new_value and row_polarity == new_polarity
-            contradictory = row_polarity != new_polarity or (row_value and new_value and row_value != new_value)
+            contradictory = row_polarity != new_polarity
             if not same_state and not contradictory:
-                continue
+                # Same value_key, same polarity → duplicate state, supersede silently.
+                same_state = True
             self._soft_supersede_fact(
                 int(row["id"]),
                 int(new_fact["id"]),
@@ -1805,7 +1843,7 @@ class MemoryStore:
                 reason="exclusive_subject",
             )
             superseded.append(int(row["id"]))
-            if contradictory:
+            if contradictory and not supersede_only:
                 contradictions.append(
                     self._record_contradiction(
                         subject_key=subject_key,
