@@ -44,6 +44,8 @@ STOPWORDS = {
     "to",
     "use",
     "uses",
+    "user",
+    "users",
     "using",
     "we",
     "with",
@@ -84,6 +86,14 @@ def text_signature(text: str) -> str:
     tokens = re.findall(r"[a-z0-9]+", normalize_text(text))
     keep = [token for token in tokens if token not in STOPWORDS]
     return " ".join(keep[:6])
+
+
+# Subject keys that can hold multiple coexisting values (e.g. WSL = Windows + Linux).
+# Facts under these keys are never treated as mutually exclusive.
+COEXIST_SUBJECT_KEYS = frozenset({
+    "environment:os",
+    "environment:shell",
+})
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> Dict[str, Any] | None:
@@ -154,6 +164,10 @@ class MemoryStore:
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError:
+            pass
         self._fts_enabled = False
         self._init_schema()
 
@@ -1447,6 +1461,51 @@ class MemoryStore:
             params,
         )
 
+    def compact_history(self, *, max_per_entity: int = 10, max_age_days: int = 90) -> int:
+        """Delete old history rows, keeping only the newest *max_per_entity* per entity."""
+        cutoff = now_ts() - (int(max_age_days) * 86400)
+        # Find entities with too many rows.
+        heavy = self._fetchall(
+            """
+            SELECT entity_kind, entity_id, COUNT(*) AS cnt
+            FROM memory_history
+            GROUP BY entity_kind, entity_id
+            HAVING cnt > ?
+            """,
+            (int(max_per_entity),),
+        )
+        deleted = 0
+        for row in heavy:
+            kind = str(row["entity_kind"])
+            eid = str(row["entity_id"])
+            # Find the Nth-newest row id to use as the cutoff.
+            boundary = self._fetchone(
+                """
+                SELECT id FROM memory_history
+                WHERE entity_kind = ? AND entity_id = ?
+                ORDER BY id DESC
+                LIMIT 1 OFFSET ?
+                """,
+                (kind, eid, int(max_per_entity) - 1),
+            )
+            if not boundary:
+                continue
+            cur = self._execute(
+                """
+                DELETE FROM memory_history
+                WHERE entity_kind = ? AND entity_id = ? AND id < ?
+                """,
+                (kind, eid, int(boundary["id"])),
+            )
+            deleted += cur.rowcount
+        # Also delete very old rows regardless.
+        cur = self._execute(
+            "DELETE FROM memory_history WHERE created_at < ? AND action = 'updated'",
+            (cutoff,),
+        )
+        deleted += cur.rowcount
+        return deleted
+
     def _default_fact_salience(self, category: str, metadata: Dict[str, Any]) -> float:
         if str(metadata.get("subject_key") or "").startswith("user:"):
             return 0.9
@@ -1661,15 +1720,11 @@ class MemoryStore:
             FROM facts
             WHERE id != ?
               AND active = 1
-              AND category = ?
-              AND topic = ?
               AND signature = ?
             ORDER BY updated_at DESC
             """,
             (
                 int(new_fact["id"]),
-                new_fact["category"],
-                new_fact["topic"],
                 signature,
             ),
         )
@@ -1714,6 +1769,9 @@ class MemoryStore:
     def _resolve_subject_state(self, new_fact: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]] | List[int]]:
         subject_key = normalize_whitespace(str(new_fact.get("subject_key") or ""))
         if not subject_key or int(new_fact.get("exclusive") or 0) != 1:
+            return {"superseded": [], "contradictions": []}
+        # Allow coexisting values for multi-environment keys (e.g. WSL = Windows + Linux).
+        if subject_key in COEXIST_SUBJECT_KEYS:
             return {"superseded": [], "contradictions": []}
 
         others = self._fetchall(

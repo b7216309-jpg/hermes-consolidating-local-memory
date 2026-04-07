@@ -379,9 +379,12 @@ def export_compiled_wiki(
         slug = str(topic.get("slug") or "")
         if not slug:
             continue
+        topic_id = topic.get("id")
+        if topic_id is None:
+            continue
         expected[f"topics/{slug}.md"] = _render_topic_page(
             topic,
-            facts=store.topic_supporting_facts(int(topic["id"]), limit=20),
+            facts=store.topic_supporting_facts(int(topic_id), limit=20),
             contradictions=contradictions,
             session_paths=session_paths,
         )
@@ -390,7 +393,9 @@ def export_compiled_wiki(
         session_id = str(session.get("session_id") or "")
         if not session_id:
             continue
-        rel = session_paths[session_id]
+        rel = session_paths.get(session_id)
+        if not rel:
+            continue
         expected[rel] = _render_session_page(
             session,
             artifacts=store.get_session_artifacts(session_id, limit=20),

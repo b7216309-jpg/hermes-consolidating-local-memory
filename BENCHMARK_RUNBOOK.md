@@ -19,13 +19,16 @@ Run either benchmark mode while:
 - optionally wiping live Hermes memory before and after the run
 - preserving live Hermes auth and config
 
-The repo now ships two benchmark modes:
+The repo now ships three benchmark modes:
 
 - low-token structural benchmark
   `bench_compare.py`
 
 - complete real benchmark
   `bench_compare_full.py`
+
+- LongMemEval real benchmark
+  `bench_compare_longmemeval.py`
 
 ## Important Findings
 
@@ -54,13 +57,22 @@ Second important finding:
 - this works because the plugin LLM client supports Codex `/responses` in addition to OpenAI-compatible `/chat/completions`
 - embeddings are still a separate issue: if there is no live `/embeddings` backend, run the complete real benchmark with `--retrieval-backend fts`
 
+Third important finding:
+
+- the repo now has a LongMemEval-based real benchmark runner that replays timestamped LongMemEval haystack sessions into Hermes instead of trying to cram the entire history into one live chat
+- each historical LongMemEval session is replayed as its own Hermes session, which keeps addon session boundaries meaningful and keeps the run practical on larger datasets
+- answer scoring follows the LongMemEval task-specific yes/no judge prompts for knowledge updates, temporal reasoning, multi-session reasoning, preferences, and abstention
+
 ## Files That Matter
 
 - [bench_compare.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare.py)
 - [bench_compare_full.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare_full.py)
+- [bench_compare_longmemeval.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare_longmemeval.py)
 - [__main__.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/__main__.py)
 - [full_main.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/full_main.py)
+- [longmemeval_main.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/longmemeval_main.py)
 - [llm.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/utils/llm.py)
+- [longmemeval.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/utils/longmemeval.py)
 - [wsl.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/utils/wsl.py)
 - [systems.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/systems.py)
 - [report_pdf.py](C:/Users/Aezaror/Desktop/TESTUNKNOW2/bench_compare/report_pdf.py)
@@ -193,6 +205,34 @@ Notes:
 - retrieval is set to `fts` because the current installation does not expose a live embeddings endpoint
 - if a working embeddings endpoint becomes available, switch to `--retrieval-backend hybrid` and pass `--addon-embedding-model` plus `--addon-embedding-base-url`
 
+### 3c. Run the LongMemEval real benchmark
+
+Use temp benchmark homes, not `~/.hermes`:
+
+```powershell
+python bench_compare_longmemeval.py `
+  --model gpt-5.4 `
+  --dataset .\data\longmemeval_oracle.json `
+  --output .\artifacts\benchmark\bench_results_longmemeval_YYYYMMDDTHHMMSSZ.json `
+  --hermes-home-baseline .\tmp_lme_baseline `
+  --hermes-home-addon .\tmp_lme_addon `
+  --timeout 900 `
+  --history-format json `
+  --include-abstention all `
+  --retrieval-backend fts `
+  --use-wsl `
+  --wsl-distro Ubuntu `
+  --wsl-hermes-root "~/.hermes/hermes-agent"
+```
+
+Notes:
+
+- this runner expects a LongMemEval JSON or JSONL dataset file downloaded separately
+- it uses the same resolved WSL Hermes runtime route as the other benchmark runners
+- addon extraction can use the resolved Codex backend through `/responses`
+- retrieval should stay on `fts` unless a working embeddings backend is explicitly available
+- for quick smoke tests, use `--limit 1` and optionally `--max-sessions-per-example 2`
+
 ### 4. Check the result file
 
 The final result JSON will be the file passed via `--output`.
@@ -204,6 +244,12 @@ Good recent known-good example:
 Good recent known-good complete real example:
 
 - `artifacts/benchmark/bench_results_full_20260405T202253Z_clean.json`
+
+LongMemEval runner smoke example:
+
+- synthetic 1-instance smoke run passed on `2026-04-05` with `--limit 1`
+- baseline and addon both answered the simple knowledge-update sample correctly
+- total usage on that smoke run was `8` LLM calls and roughly `5k` estimated tokens
 
 Key values from that run:
 
@@ -413,6 +459,8 @@ Keep only the latest final result pair for each benchmark:
 - `artifacts/benchmark/bench_results_full_20260405T202253Z_clean.json`
 - `artifacts/benchmark/Hermes_Complete_Real_Benchmark_Report_20260405.pdf`
 
+LongMemEval runs are usually larger and more situational, so keep only the final JSON or PDF you actually intend to compare or publish.
+
 Superseded smoke, rerun, and intermediate result files can be removed.
 
 ## Suggested Future Session Prompt
@@ -424,4 +472,5 @@ Follow BENCHMARK_RUNBOOK.md exactly. Use the installed WSL Hermes runtime,
 keep benchmark state in temp homes, and run either:
 - the low-token structural benchmark, or
 - the complete real benchmark with gpt-5.4, Codex-backed extraction, and retrieval_backend fts unless a live embeddings endpoint is available.
+- the LongMemEval real benchmark with a downloaded dataset file, json history replay, and retrieval_backend fts unless a live embeddings endpoint is available.
 ```

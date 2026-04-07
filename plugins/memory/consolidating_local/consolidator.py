@@ -396,8 +396,43 @@ def split_candidate_segments(text: str) -> List[str]:
     return segments
 
 
+EPHEMERAL_PATTERNS = (
+    r"\bis currently\b",
+    r"\bright now\b",
+    r"\bjust finished\b",
+    r"\babout to\b",
+    r"\bis (playing|watching|eating|having|doing)\b",
+    r"\bhas finished (breakfast|lunch|dinner|eating)\b",
+    r"\bis currently (playing|watching|eating|having|coding|working)\b",
+    r"\bcurrently (in a|focused on|working on|playing|eating|watching)\b",
+    r"\bjust (woke up|ate|started|logged|got)\b",
+)
+
+_EPHEMERAL_RE = re.compile("|".join(EPHEMERAL_PATTERNS), re.IGNORECASE)
+
+# Subject keys whose content is inherently transient and should not persist.
+EPHEMERAL_SUBJECT_PREFIXES = (
+    "general:activity_current",
+    "user:daily_activity",
+    "user:coding_state",
+    "user:game_phase",
+    "workflow:current_activity",
+    "workflow:current_phase",
+    "workflow:gaming_focus",
+)
+
+
+def is_ephemeral(sentence: str, subject_key: str = "") -> bool:
+    """Return True if the content describes transient state that should not be stored durably."""
+    if subject_key and any(subject_key.startswith(prefix) for prefix in EPHEMERAL_SUBJECT_PREFIXES):
+        return True
+    return bool(_EPHEMERAL_RE.search(sentence))
+
+
 def is_memory_worthy(sentence: str) -> bool:
     lower = sentence.lower()
+    if is_ephemeral(sentence):
+        return False
     return any(
         hint in lower
         for hint in (PREFERENCE_HINTS + PROJECT_HINTS + ENVIRONMENT_HINTS + WORKFLOW_HINTS + PERSONAL_DETAIL_HINTS)
@@ -922,7 +957,7 @@ def _extract_operating_system(segment: str, source_role: str) -> List[Dict[str, 
                 source_role=source_role,
                 subject_key="environment:os",
                 value_key=slugify(value),
-                exclusive=True,
+                exclusive=False,
             )
         )
         break
@@ -1289,8 +1324,7 @@ def extract_candidate_facts_from_turn(
             if source_role == "assistant" and "remember" not in normalized.lower():
                 continue
             if source_role == "user" and not is_memory_worthy(normalized):
-                if not re.search(r"\b(i|my|we|our)\b", normalized.lower()):
-                    continue
+                continue
             category = infer_category(normalized)
             candidates.append(
                 build_candidate(
@@ -1330,6 +1364,9 @@ def extract_candidate_facts_from_messages(messages: Iterable[Dict[str, Any]]) ->
 def normalize_candidate_fact(raw: Dict[str, Any], *, source_role: str = "assistant") -> Dict[str, Any] | None:
     content = normalize_sentence(str(raw.get("content") or ""))
     if not content:
+        return None
+    subject_key_hint = normalize_whitespace(str(raw.get("subject_key") or ""))
+    if is_ephemeral(content, subject_key_hint):
         return None
     category = str(raw.get("category") or infer_category(content)).strip().lower()
     if category not in {"user_pref", "project", "environment", "workflow", "general"}:
@@ -1372,8 +1409,11 @@ def build_consolidation_plan(store: MemoryStore, *, min_hours: int, min_sessions
         "pending_episodes": int(max(pending_episodes, 0)),
         "min_hours": int(min_hours),
         "min_sessions": int(min_sessions),
-        "should_run": has_pending and (hours_since == float("inf") or hours_since >= min_hours)
-        and pending_sessions >= min_sessions,
+        "should_run": (
+            has_pending
+            and (hours_since == float("inf") or hours_since >= min_hours)
+            and pending_sessions >= min_sessions
+        ),
     }
 
 
@@ -1512,6 +1552,7 @@ def run_consolidation(
         retention_hours=episode_retention_hours,
         max_episode_id=latest_episode_id,
     )
+    history_compacted = store.compact_history(max_per_entity=10, max_age_days=90)
     finished_at = time.time()
 
     stats = {
@@ -1526,6 +1567,7 @@ def run_consolidation(
         "topics_rebuilt": topics_rebuilt,
         "session_summaries": session_summaries,
         "episodes_pruned": episodes_pruned,
+        "history_compacted": history_compacted,
         "decay": decay_stats,
         "latest_episode_id": latest_episode_id,
         "counts": store.counts(),

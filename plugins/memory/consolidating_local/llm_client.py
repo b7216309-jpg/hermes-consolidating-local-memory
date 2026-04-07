@@ -71,6 +71,8 @@ class OpenAICompatibleLLM:
         self.base_url = str(base_url or "").rstrip("/")
         self.api_key = str(api_key or "")
         self.timeout_seconds = int(timeout_seconds)
+        self._last_http_error_code: int | None = None
+        self._last_http_error_detail = ""
 
     @property
     def enabled(self) -> bool:
@@ -85,6 +87,8 @@ class OpenAICompatibleLLM:
     def _post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any] | None:
         if not self.enabled:
             return None
+        self._last_http_error_code = None
+        self._last_http_error_detail = ""
         url = f"{self.base_url}{path}"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -103,9 +107,12 @@ class OpenAICompatibleLLM:
                 detail = exc.read().decode("utf-8", errors="ignore")
             except Exception:
                 detail = str(exc)
+            self._last_http_error_code = int(exc.code)
+            self._last_http_error_detail = str(detail or "")
             logger.warning("Local model request failed (%s): %s", exc.code, detail[:500])
             return None
         except Exception as exc:
+            self._last_http_error_detail = str(exc)
             logger.warning("Local model request failed: %s", exc)
             return None
 
@@ -117,12 +124,27 @@ class OpenAICompatibleLLM:
         temperature: float = 0.1,
         max_tokens: int = 700,
     ) -> Dict[str, Any] | None:
+        content = self.chat_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return extract_json_object(content or "")
+
+    def chat_text(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        temperature: float = 0.1,
+        max_tokens: int = 700,
+    ) -> str:
         if self.backend_kind == "codex":
-            content = self._codex_responses_text(
+            return self._codex_responses_text(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
             )
-            return extract_json_object(content or "")
         payload = {
             "model": self.model,
             "messages": [
@@ -134,22 +156,8 @@ class OpenAICompatibleLLM:
         }
         body = self._post_json("/chat/completions", payload)
         if not body:
-            return None
-
-        content = ""
-        choices = body.get("choices") or []
-        if choices:
-            message = choices[0].get("message") or {}
-            raw_content = message.get("content", "")
-            if isinstance(raw_content, list):
-                content = " ".join(
-                    str(block.get("text", ""))
-                    for block in raw_content
-                    if isinstance(block, dict)
-                )
-            else:
-                content = str(raw_content or "")
-        return extract_json_object(content)
+            return ""
+        return _extract_openai_chat_text(body)
 
     def _codex_responses_text(
         self,
@@ -198,9 +206,41 @@ class OpenAICompatibleLLM:
 
 
 class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
+    def __init__(
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str = "",
+        timeout_seconds: int = 45,
+    ):
+        super().__init__(
+            model=model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+        )
+        self._embedding_support_override: bool | None = None
+
+    @property
+    def supports_embeddings(self) -> bool:
+        if not self.enabled or self.backend_kind == "codex":
+            return False
+        if self._embedding_support_override is False:
+            return False
+        return True
+
+    def _mark_embeddings_unsupported_if_needed(self) -> None:
+        detail = str(self._last_http_error_detail or "").lower()
+        if self._last_http_error_code in {404, 405, 501}:
+            self._embedding_support_override = False
+            return
+        if "does not support embeddings" in detail or ("embedding" in detail and "not support" in detail):
+            self._embedding_support_override = False
+
     def embed_texts(self, texts: Sequence[str]) -> List[List[float]] | None:
         clean = [str(text or "").strip() for text in texts]
-        if not clean or not self.enabled:
+        if not clean or not self.supports_embeddings:
             return None
         body = self._post_json(
             "/embeddings",
@@ -210,6 +250,7 @@ class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
             },
         )
         if not body or not isinstance(body.get("data"), list):
+            self._mark_embeddings_unsupported_if_needed()
             return None
         vectors: List[List[float]] = []
         for item in body.get("data", []):
@@ -224,6 +265,7 @@ class OpenAICompatibleEmbeddings(OpenAICompatibleLLM):
                 return None
         if len(vectors) != len(clean):
             return None
+        self._embedding_support_override = True
         return vectors
 
 
@@ -266,3 +308,21 @@ def _extract_codex_stream_text(raw: str) -> str:
     if final_text:
         return final_text
     return "".join(pieces).strip()
+
+
+def _extract_openai_chat_text(body: Dict[str, Any]) -> str:
+    content = ""
+    choices = body.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    raw_content = message.get("content", "")
+    if isinstance(raw_content, list):
+        content = " ".join(
+            str(block.get("text", ""))
+            for block in raw_content
+            if isinstance(block, dict)
+        )
+    else:
+        content = str(raw_content or "")
+    return content

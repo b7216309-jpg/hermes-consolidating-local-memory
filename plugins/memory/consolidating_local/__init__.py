@@ -387,7 +387,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         elif self._llm_backend != "heuristic":
             backend_desc += " (LLM unavailable, using fallback)"
         retrieval_desc = self._retrieval_backend
-        if self._retrieval_backend == "hybrid" and (not self._embedder or not self._embedder.enabled):
+        if self._retrieval_backend == "hybrid" and (not self._embedder or not self._embedder.supports_embeddings):
             retrieval_desc += " (embeddings unavailable, using FTS fallback)"
         wiki_desc = "disabled"
         if self._cfg()["wiki_export_enabled"]:
@@ -487,6 +487,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 source_refs.append({"kind": "fact", "id": fact_id})
             if result["action"] == "inserted":
                 inserted += 1
+        if inserted > 0:
+            self._store.rebuild_topics(
+                max_facts=self._cfg()["max_topic_facts"],
+                max_chars=self._cfg()["topic_summary_chars"],
+            )
         if not candidates:
             return ""
         summary = "; ".join(str(item["content"]) for item in candidates[:3])
@@ -663,7 +668,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         "llm_base_url": self._llm.base_url if self._llm else "",
                         "embedding_model": self._embedder.model if self._embedder else "",
                         "embedding_base_url": self._embedder.base_url if self._embedder else "",
-                        "embedding_enabled": bool(self._embedder and self._embedder.enabled),
+                        "embedding_enabled": bool(self._embedder and self._embedder.supports_embeddings),
                         "last_decay_at": self._store.get_state("last_decay_at", ""),
                         "latest_session_summaries": self._store.latest_session_summaries(limit=3),
                         "review": review_status,
@@ -967,12 +972,75 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return "memory"
         return "user" if default_target == "user" else "memory"
 
+    @staticmethod
+    def _is_snapshot_worthy(text: str, subject_key: str = "") -> bool:
+        """Return False for content that should never appear in MEMORY.md / USER.md."""
+        lower = (text or "").lower()
+        if len(lower) < 6:
+            return False
+        # Reject raw conversation fragments (questions, broken grammar, meta-talk).
+        if lower.endswith("?") and not any(
+            k in lower for k in ("prefer", "schedule", "allerg", "born", "live")
+        ):
+            return False
+        # Reject agent self-description / system status.
+        if any(phrase in lower for phrase in (
+            "plugin is running",
+            "plugin is operational",
+            "memory is active",
+            "sql db consolidation",
+            "system confirms",
+            "memory usage is not",
+            "hermes prioritizes",
+            "hermes avoids",
+            "hermes is a",
+            "hermes optimizes",
+            "agent views its internal",
+            "nothing to save",
+        )):
+            return False
+        # Reject subject keys that describe transient system state.
+        subj = (subject_key or "").lower()
+        if any(subj.startswith(p) for p in (
+            "system:", "plugin:", "memory:sql",
+            "general:roleplay", "assistant:",
+        )):
+            return False
+        return True
+
+    # Subject-key prefixes that should share a single snapshot slot.
+    # Only the highest-salience entry from each group is kept.
+    _SNAPSHOT_SUBJECT_GROUPS: Dict[str, str] = {
+        "hardware:gpu": "hardware:rig",
+        "hardware:cpu": "hardware:rig",
+        "hardware:ram": "hardware:rig",
+        "hardware:rig": "hardware:rig",
+        "hardware:monitor": "hardware:rig",
+        "hardware:storage": "hardware:rig",
+        "hardware:motherboard": "hardware:rig",
+        "environment:os": "environment:setup",
+        "environment:shell": "environment:setup",
+        "environment:editor": "environment:setup",
+        "environment:ide": "environment:setup",
+        "environment:terminal": "environment:setup",
+    }
+
+    @classmethod
+    def _snapshot_group(cls, subject_key: str) -> str:
+        """Return the dedup group for a subject_key, or the key itself."""
+        lower = (subject_key or "").lower()
+        for prefix, group in cls._SNAPSHOT_SUBJECT_GROUPS.items():
+            if lower == prefix or lower.startswith(prefix + "_") or lower.startswith(prefix + ":"):
+                return group
+        return subject_key
+
     def _build_builtin_snapshot_entries(self) -> Dict[str, List[Dict[str, Any]]]:
         if not self._store:
             return {"user": [], "memory": []}
         snapshot = self._store.prompt_snapshot_rows()
         entries: Dict[str, List[Dict[str, Any]]] = {"user": [], "memory": []}
         seen_subjects: Dict[str, set[str]] = {"user": set(), "memory": set()}
+        seen_groups: Dict[str, set[str]] = {"user": set(), "memory": set()}
         seen_texts: Dict[str, set[str]] = {"user": set(), "memory": set()}
 
         def add_entry(
@@ -988,14 +1056,22 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             clean_subject = normalize_whitespace(subject_key)
             if not clean_text:
                 return
+            if not self._is_snapshot_worthy(clean_text, clean_subject):
+                return
             normalized_text = normalize_text(clean_text)
             if normalized_text in seen_texts[target]:
                 return
             if clean_subject and clean_subject in seen_subjects[target]:
                 return
+            # Group dedup: only one entry per hardware/environment group.
+            group = self._snapshot_group(clean_subject)
+            if group and group != clean_subject and group in seen_groups[target]:
+                return
             seen_texts[target].add(normalized_text)
             if clean_subject:
                 seen_subjects[target].add(clean_subject)
+            if group:
+                seen_groups[target].add(group)
             entries[target].append(
                 {
                     "text": clean_text,
@@ -1108,6 +1184,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         while selected and len(combined) > max(int(limit_chars), 0):
             selected.pop()
             block = self._build_snapshot_block(selected)
+            preserved_text = "\n".join(preserved_lines).strip()
             combined = f"{block}\n\n{preserved_text}" if block and preserved_text else (block or preserved_text)
         normalized = combined.strip()
         if normalized:
@@ -1163,7 +1240,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         return data if isinstance(data, dict) else {}
 
     def _effective_retrieval_backend(self) -> str:
-        if self._retrieval_backend == "hybrid" and self._embedder and self._embedder.enabled:
+        if self._retrieval_backend == "hybrid" and self._embedder and self._embedder.supports_embeddings:
             return "hybrid"
         return "fts"
 
@@ -1229,6 +1306,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         *row_groups: List[Dict[str, Any]],
         limit: int,
     ) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
         merged: List[Dict[str, Any]] = []
         seen_keys: set[str] = set()
         seen_texts: set[str] = set()
@@ -1445,7 +1524,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             seen_texts = {
                 normalize_text(str(entry.get("text") or ""))
                 for entry in selected
-                if normalize_whitespace(str(entry.get("text") or ""))
+                if normalize_text(str(entry.get("text") or ""))
             }
             for entry in supplement:
                 clean_subject = normalize_whitespace(str(entry.get("subject_key") or ""))
@@ -1641,10 +1720,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def _cue_bonus(self, section: str, row: Dict[str, Any], cues: Dict[str, Any]) -> float:
         bonus = 0.0
-        session_cue = str(cues.get("session_id") or "")
-        topic_cue = str(cues.get("topic") or "")
-        category_cue = str(cues.get("category") or "")
-        subject_key_cue = str(cues.get("subject_key") or "")
+        session_cue = normalize_whitespace(str(cues.get("session_id") or ""))
+        topic_cue = normalize_whitespace(str(cues.get("topic") or ""))
+        category_cue = normalize_whitespace(str(cues.get("category") or ""))
+        subject_key_cue = normalize_whitespace(str(cues.get("subject_key") or ""))
         row_session = normalize_whitespace(str(row.get("source_session_id") or row.get("session_id") or ""))
         if session_cue and row_session and row_session == session_cue:
             bonus += 0.22
@@ -1821,7 +1900,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 limit=limit,
                 include_inactive=include_inactive,
             )
-        if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.enabled:
+        if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.supports_embeddings:
             query_vector = self._embedder.embed_texts([clean])
             if query_vector:
                 query_embedding = query_vector[0]
@@ -1831,14 +1910,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     texts = [self._memory_text(section, row) for row in rows]
                     vectors = self._embedder.embed_texts(texts)
                     if not vectors or len(vectors) != len(rows):
+                        logger.debug("Hybrid retrieval: embedding mismatch for section %s (%s vectors vs %s rows), falling back to FTS scoring", section, len(vectors) if vectors else 0, len(rows))
                         continue
                     scored: List[Dict[str, Any]] = []
                     for index, (row, vector) in enumerate(zip(rows, vectors)):
                         similarity = self._cosine_similarity(query_embedding, vector)
                         salience = float(row.get("salience") or 0.4)
                         importance = float(row.get("importance") or 5) / 10.0
-                        updated_at = float(row.get("updated_at") or row.get("created_at") or time.time())
-                        age_days = max((time.time() - updated_at) / 86400.0, 0.0)
+                        updated_at = float(row.get("updated_at") or row.get("created_at") or 0)
+                        age_days = max((time.time() - updated_at) / 86400.0, 0.0) if updated_at > 0 else 365.0
                         recency = 1.0 / (1.0 + age_days / 7.0)
                         rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                         cue_bonus = self._cue_bonus(section, row, cue_map)
@@ -1857,8 +1937,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 for index, row in enumerate(rows):
                     salience = float(row.get("salience") or 0.4)
                     importance = float(row.get("importance") or 5) / 10.0
-                    updated_at = float(row.get("updated_at") or row.get("created_at") or time.time())
-                    age_days = max((time.time() - updated_at) / 86400.0, 0.0)
+                    updated_at = float(row.get("updated_at") or row.get("created_at") or 0)
+                    age_days = max((time.time() - updated_at) / 86400.0, 0.0) if updated_at > 0 else 365.0
                     recency = 1.0 / (1.0 + age_days / 7.0)
                     rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                     cue_bonus = self._cue_bonus(section, row, cue_map)
@@ -1890,7 +1970,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not subject_key.startswith("user:"):
             return
         key = subject_key or slugify(str(metadata.get("item_label") or fact.get("content") or "")[:48])
-        value = str(metadata.get("value_key") or metadata.get("item_label") or fact.get("content") or "")
+        # Prefer human-readable label metadata over slugified value_key.
+        value = str(
+            metadata.get("value_label")
+            or metadata.get("item_label")
+            or metadata.get("trait_label")
+            or metadata.get("location_label")
+            or metadata.get("origin_label")
+            or metadata.get("hometown_label")
+            or metadata.get("diet_label")
+            or metadata.get("relationship_label")
+            or metadata.get("pronouns_label")
+            or fact.get("content")
+            or metadata.get("value_key")
+            or ""
+        )
         preference = self._store.upsert_preference(
             key=key,
             label=str(fact.get("content") or key),
@@ -2307,6 +2401,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             },
             dict(result.get("fact") or {}),
         )
+        self._store.rebuild_topics(
+            max_facts=self._cfg()["max_topic_facts"],
+            max_chars=self._cfg()["topic_summary_chars"],
+        )
         self._sync_builtin_snapshot(reason=str(payload.get("source") or "remember_fact"))
 
     def _handle_extract_messages(self, payload: Dict[str, Any]) -> None:
@@ -2341,7 +2439,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     source_refs=self._collect_summary_refs(artifacts, per_section=4),
                     reason=source,
                 )
-                self._store.close_memory_session(session_id, summary=summary)
+            # Always close the session at session_end, even without a summary.
+            if source == "session_end" or summary:
+                self._store.close_memory_session(session_id, summary=summary or "")
         self._sync_builtin_snapshot(reason=f"extract_messages:{source}")
 
     def _run_consolidation(self, *, force: bool, reason: str) -> Dict[str, Any]:

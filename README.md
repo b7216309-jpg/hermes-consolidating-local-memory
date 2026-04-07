@@ -355,13 +355,16 @@ The benchmark is designed to minimize token spend:
 - LLM calls are used only for recall dimensions
 - recall prompts are batched into one model call per system per dimension
 
-The repo now also includes a second benchmark mode:
+The repo now also includes additional benchmark modes:
 
 - a low-token structural benchmark
   Direct seeding and storage inspection, with LLM calls only for recall checks
 
 - a complete real benchmark
   Real multi-turn `AIAgent` conversations for seeding and evaluation, plus LLM-backed addon extraction and hybrid retrieval
+
+- a LongMemEval-based real benchmark
+  Replay timestamped LongMemEval history sessions into Hermes, answer the held-out question in a fresh session, and score the result with LongMemEval-style task-aware yes/no judging
 
 ### Safety Rules
 
@@ -461,6 +464,34 @@ The current real dimensions are:
 
 The full benchmark fails fast if the addon would silently fall back away from LLM extraction or hybrid retrieval because the configured backend is missing or incompatible.
 
+### LongMemEval Real Benchmark
+
+The repo also includes a dataset-driven real benchmark based on [LongMemEval](https://github.com/xiaowu0162/LongMemEval).
+
+Current design:
+
+- load a LongMemEval JSON or JSONL dataset through `--dataset`
+- replay each haystack session as a separate Hermes session using a timestamped transcript prompt
+- keep baseline and addon in isolated temporary `HERMES_HOME` directories
+- ask the held-out question in a fresh session using the benchmark `question_date`
+- judge each answer with a task-aware LongMemEval-style evaluator prompt
+
+Supported task families:
+
+- `single-session-user`
+- `single-session-preference`
+- `single-session-assistant`
+- `multi-session`
+- `temporal-reasoning`
+- `knowledge-update`
+- abstention scoring for `*_abs` items
+
+Important implementation detail:
+
+- the runner replays each historical haystack session as its own Hermes session instead of concatenating the entire history into one huge live chat
+- this preserves session boundaries for the addon while keeping the run practical on larger datasets
+- transcript replay supports `--history-format json|nl`, `--user-only`, and deterministic sampling through `--shuffle-seed`
+
 ### Current DIM-5 Status
 
 DIM-5 is resolved.
@@ -478,6 +509,11 @@ For the complete real benchmark:
 
 - `python bench_compare_full.py`
 - `python -m bench_compare.full_main`
+
+For the LongMemEval benchmark:
+
+- `python bench_compare_longmemeval.py`
+- `python -m bench_compare.longmemeval_main`
 
 Example with WSL-backed runtime:
 
@@ -536,6 +572,24 @@ python bench_compare_full.py `
   --wsl-hermes-root "~/.hermes/hermes-agent"
 ```
 
+Example LongMemEval benchmark run:
+
+```powershell
+python bench_compare_longmemeval.py `
+  --model gpt-5.4 `
+  --dataset .\data\longmemeval_oracle.json `
+  --output .\artifacts\benchmark\bench_results_longmemeval_YYYYMMDDTHHMMSSZ.json `
+  --hermes-home-baseline .\tmp_lme_baseline `
+  --hermes-home-addon .\tmp_lme_addon `
+  --timeout 900 `
+  --history-format json `
+  --include-abstention all `
+  --retrieval-backend fts `
+  --use-wsl `
+  --wsl-distro Ubuntu `
+  --wsl-hermes-root "~/.hermes/hermes-agent"
+```
+
 If you do have a working embeddings endpoint and want hybrid retrieval, also provide:
 
 - `--addon-embedding-model`
@@ -569,6 +623,14 @@ The complete real benchmark also produces weighted summary scoring, but it empha
 - task usability in `REAL-3`
 - noise resistance in `REAL-4`
 - temporal change awareness in `REAL-5`
+
+The LongMemEval benchmark reports:
+
+- per-task accuracy for the six LongMemEval task families
+- overall accuracy
+- task-averaged accuracy
+- abstention accuracy
+- per-instance answer and judge logs for both systems
 
 ### PDF Report Generator
 
@@ -613,15 +675,18 @@ Current kept final artifacts:
 BENCHMARK_RUNBOOK.md
 bench_compare.py
 bench_compare_full.py
+bench_compare_longmemeval.py
 bench_compare/
   __main__.py
   full_main.py
+  longmemeval_main.py
   full_scenarios.py
   report.py
   report_pdf.py
   systems.py
   dims/
   utils/
+    longmemeval.py
 plugins/memory/consolidating_local/
   __init__.py
   consolidator.py
@@ -652,6 +717,7 @@ Show benchmark CLI help:
 ```bash
 python bench_compare.py --help
 python bench_compare_full.py --help
+python bench_compare_longmemeval.py --help
 ```
 
 Run tests:
