@@ -2181,7 +2181,7 @@ class MemoryStore:
         *,
         user_limit: int = 24,
         memory_limit: int = 36,
-        preference_limit: int = 16,
+        preference_limit: int = 10,
         policy_limit: int = 16,
     ) -> Dict[str, List[Dict[str, Any]]]:
         return {

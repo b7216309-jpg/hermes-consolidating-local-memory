@@ -1006,6 +1006,61 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "general:roleplay", "assistant:",
         )):
             return False
+
+        # --- Fix 2: Reject unresolved variable placeholders ---
+        clean = (text or "").strip()
+        if re.match(
+            r'^(?:User|The user)\s+(?:is|lives in|prefers|has)\s+\w+\.\s*$',
+            clean, re.IGNORECASE,
+        ):
+            word = clean.rstrip('.').split()[-1].lower()
+            if word in ('status', 'location', 'value', 'unknown', 'none', 'default'):
+                return False
+
+        # Reject "User likes <slug>" where the value looks like a DB key
+        m = re.match(r'^User\s+(?:likes|dislikes)\s+(\S+)\.\s*$', clean, re.IGNORECASE)
+        if m:
+            val = m.group(1)
+            if '_' in val or val.lower() in (
+                'food', 'hobby', 'enjoyment', 'status', 'location',
+            ):
+                return False
+
+        # --- Fix 3: Ephemeral subject keys that should not persist ---
+        _EPHEMERAL_SNAPSHOT_KEYS = {
+            'user:mood', 'user:mood:easter', 'user:daily_activity',
+            'user:game_phase', 'user:resource:tokens',
+            'user:session_pattern', 'user:coding_state',
+            'user:log_focus', 'user:file_request',
+            'user:next_activity_choice', 'user:hobby_status',
+        }
+        _EPHEMERAL_SNAPSHOT_PREFIXES = (
+            'memory:durable_storage',
+            'environment:memory_plugin_status',
+            'environment:last_reflection_date',
+            'environment:philosophical_log',
+            'environment:agent_memory_structure',
+            'general:identity_file_location',
+        )
+        if subj in _EPHEMERAL_SNAPSHOT_KEYS:
+            return False
+        for prefix in _EPHEMERAL_SNAPSHOT_PREFIXES:
+            if subj.startswith(prefix):
+                return False
+
+        # --- Fix 5: Reject meta/self-referential content about memory system ---
+        meta_patterns = (
+            'memory and sql db consolidation',
+            'consolidating_memory plugin',
+            'durable memory is being stored',
+            'dedicated .soul. file structure',
+            'memory system is categorized',
+            'memory.md and user.md',
+        )
+        for pattern in meta_patterns:
+            if pattern in lower:
+                return False
+
         return True
 
     # Subject-key prefixes that should share a single snapshot slot.
@@ -1094,13 +1149,20 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         for row in snapshot.get("preferences", []):
             metadata = dict(row.get("metadata") or {})
             subject_key = str(metadata.get("subject_key") or "")
+            pref_key = str(row.get("preference_key") or "")
             text = str(row.get("content") or row.get("label") or row.get("value") or "")
             if not subject_key.startswith("user:"):
+                continue
+            # Cross-table dedup: skip if this preference's subject_key
+            # OR preference_key was already added by a fact row.
+            if subject_key and subject_key in seen_subjects.get("user", set()):
+                continue
+            if pref_key and pref_key != subject_key and pref_key in seen_subjects.get("user", set()):
                 continue
             add_entry(
                 "user",
                 text=text,
-                subject_key=subject_key or str(row.get("preference_key") or ""),
+                subject_key=subject_key or pref_key,
                 importance=row.get("importance"),
                 salience=row.get("salience"),
                 updated_at=row.get("updated_at"),
