@@ -226,7 +226,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             {
                 "key": "builtin_snapshot_sync_enabled",
                 "description": "Keep Hermes bounded USER.md and MEMORY.md aligned with the plugin's current-state winners",
-                "default": "true",
+                "default": "false",
             },
             {
                 "key": "builtin_memory_dir",
