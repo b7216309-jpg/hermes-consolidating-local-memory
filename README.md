@@ -10,6 +10,7 @@ The current plugin version is `0.3.0`.
 - a comparative benchmark at `bench_compare/`
 - a PDF report generator for benchmark results
 - a runbook for rerunning the benchmark safely from a fresh session
+- a companion desktop app, [Hermes Memory Control](https://github.com/b7216309-jpg/hermes-memory-control), for browsing and editing the live memory store
 
 The design goal is simple:
 
@@ -65,6 +66,38 @@ Important current behavior:
 
 - broad subjectless `get_context()` queries now fall back to a merged current-memory snapshot instead of returning an empty block
 - this fixed the earlier DIM-5 prefetch audit issue in the benchmark
+
+## Companion Desktop App
+
+This plugin now has a companion desktop control panel:
+
+- [Hermes Memory Control](https://github.com/b7216309-jpg/hermes-memory-control)
+
+The split between the two repos is:
+
+- this repo owns the provider, SQLite schema, consolidation logic, wiki export, and benchmark suite
+- the desktop app owns the Windows/Electron UI for inspecting the same database, editing plugin config, browsing the wiki mirror, and visualizing facts/topics/preferences
+
+They meet at three shared integration points:
+
+- Hermes `config.yaml`
+- `consolidating_memory.db`
+- the optional compiled wiki export directory
+
+Important boundary:
+
+- SQLite remains the source of truth
+- the wiki mirror is generated output
+- the desktop app is an operator tool, not a second memory engine
+
+Quick setup flow:
+
+1. Install and configure the plugin in Hermes from this repo.
+2. Run Hermes long enough to create `consolidating_memory.db`.
+3. Install and launch Hermes Memory Control.
+4. Point the app at your Hermes home directory such as `\\wsl$\\Ubuntu\\home\\user\\.hermes`.
+
+Additional integration notes live in [docs/HERMES_MEMORY_CONTROL.md](docs/HERMES_MEMORY_CONTROL.md).
 
 ## Architecture
 

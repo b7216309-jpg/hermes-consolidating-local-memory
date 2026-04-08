@@ -162,6 +162,27 @@ This export is:
 - suitable for Obsidian-style browsing
 - cleaned up on rerun when old generated pages no longer belong
 
+## Companion Desktop App
+
+This provider also has a companion desktop control panel:
+
+- [Hermes Memory Control](https://github.com/b7216309-jpg/hermes-memory-control)
+
+The app is useful when you want to:
+
+- inspect facts, topics, preferences, and contradictions without querying SQLite by hand
+- edit the plugin config from a UI instead of editing YAML manually
+- browse the compiled wiki export in-app
+- visualize the memory graph and spot bad clusters or noisy facts
+
+Integration boundary:
+
+- this provider writes and reads the canonical SQLite store
+- the desktop app reads that same store and edits related operator-facing files
+- the app does not replace consolidation logic or become a second source of truth
+
+See [../../../docs/HERMES_MEMORY_CONTROL.md](../../../docs/HERMES_MEMORY_CONTROL.md) for the end-to-end workflow.
+
 ## Install Into Hermes
 
 Copy this folder into your Hermes checkout:
