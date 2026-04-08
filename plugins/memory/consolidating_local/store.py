@@ -869,6 +869,18 @@ class MemoryStore:
             (int(limit),),
         )
 
+    def list_active_facts(self, *, limit: int = 500) -> List[Dict[str, Any]]:
+        return self._fetchall(
+            """
+            SELECT id, content, category, topic, subject_key, value_key, importance, confidence, salience, updated_at, source_session_id
+            FROM facts
+            WHERE active = 1
+            ORDER BY category ASC, importance DESC, salience DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        )
+
     def list_policies(self, *, limit: int = 100) -> List[Dict[str, Any]]:
         return self._fetchall(
             """
