@@ -87,6 +87,58 @@ PERSONAL_DETAIL_HINTS = (
     "engaged",
     "divorced",
     "widowed",
+    # Family
+    "my father",
+    "my mother",
+    "my brother",
+    "my sister",
+    "my dad",
+    "my mom",
+    "my wife",
+    "my husband",
+    "my partner",
+    "my son",
+    "my daughter",
+    "my cat",
+    "my dog",
+    "my pet",
+    # Personality / traits
+    "i'm introverted",
+    "i am introverted",
+    "i'm extroverted",
+    "i am extroverted",
+    "i'm shy",
+    "i am shy",
+    "i'm relaxed",
+    "i am relaxed",
+    # Physical
+    "i weigh",
+    "i'm tall",
+    "i am tall",
+    "my height",
+    "my weight",
+    "my eyes",
+    "my hair",
+    # Schedule / routine
+    "i wake up",
+    "i go to bed",
+    "i work at",
+    "i work from",
+    "my schedule",
+    # Identity
+    "my name is",
+    "i was born",
+    "born on",
+    "i'm called",
+    "i am called",
+    "years old",
+    # Hobbies
+    "i play",
+    "i mainly play",
+    "i'm into",
+    "i am into",
+    "i'm stuck on",
+    "i am stuck on",
 )
 
 LIFE_EVENT_HINTS = (
@@ -305,11 +357,18 @@ def clamp_float(value: Any, low: float, high: float, default: float) -> float:
     return max(low, min(high, parsed))
 
 
+_IDENTITY_HINTS = (
+    "my name", "i was born", "born on", "years old", "i am a ", "i'm a ",
+    "user's name", "user name is", "user is a ",
+)
+
 def infer_category(sentence: str) -> str:
     lower = sentence.lower()
     if any(hint in lower for hint in PREFERENCE_HINTS):
         return "user_pref"
     if any(hint in lower for hint in PERSONAL_DETAIL_HINTS):
+        return "user_pref"
+    if any(hint in lower for hint in _IDENTITY_HINTS):
         return "user_pref"
     if any(hint in lower for hint in LIFE_EVENT_HINTS) and _has_time_reference(lower):
         return "general"
@@ -1319,6 +1378,385 @@ def _extract_life_event(segment: str, source_role: str) -> List[Dict[str, Any]]:
     ]
 
 
+def _extract_family_members(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+    _FAMILY_PATTERNS = [
+        (r"\bmy\s+(?:father|dad)\s+(?:is\s+called\s+|named?\s+|'s name is\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî -]{1,30})\b", "father"),
+        (r"\b(?:father|dad)\s+([A-Z][a-zA-Zéèêëàâäùûüôöïî]{2,20})\b", "father"),
+        (r"\bmy\s+(?:mother|mom)\s+(?:is\s+called\s+|named?\s+|'s name is\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî -]{1,30})\b", "mother"),
+        (r"\b(?:mother|mom)\s+([A-Z][a-zA-Zéèêëàâäùûüôöïî]{2,20})\b", "mother"),
+        (r"\bmy\s+brothers?\s+(?:is\s+called\s+|named?\s+|'s name is\s+|are\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî &,]+?)(?:[.,;]|$)", "brother"),
+        (r"\b(?:brother)\s+([A-Z][a-zA-Zéèêëàâäùûüôöïî]{2,20})\b", "brother"),
+        (r"\bmy\s+sisters?\s+(?:is\s+called\s+|named?\s+|'s name is\s+|are\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî &,]+?)(?:[.,;]|$)", "sister"),
+        (r"\bmy\s+(?:wife|husband|partner|girlfriend|boyfriend)\s+(?:is\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî -]{1,30})\b", "partner"),
+        (r"\bmy\s+(?:son|daughter)\s+(?:is\s+)?([A-Z][a-zA-Zéèêëàâäùûüôöïî -]{1,30})\b", "child"),
+    ]
+    for pattern, relation in _FAMILY_PATTERNS:
+        match = re.search(pattern, segment)
+        if match:
+            name = normalize_whitespace(match.group(1).rstrip(".,;"))
+            if name and _is_plausible_value(name) and len(name) > 1:
+                candidates.append(
+                    build_candidate(
+                        content=f"User's {relation}: {name}",
+                        category="general",
+                        topic="user-profile",
+                        importance=8,
+                        confidence=confidence,
+                        source_role=source_role,
+                        subject_key=f"user:family:{relation}",
+                        value_key=slugify(name),
+                        metadata={"relation": relation, "name_label": name},
+                    )
+                )
+    return candidates
+
+
+def _extract_personality_traits(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+    _TRAIT_PATTERNS = [
+        (r"\b(?:i(?:'m| am))\s+(introverted|extroverted|shy|outgoing|relaxed|anxious|patient|impatient|organized|disorganized|lazy|energetic|clingy|independent|curious|creative|analytical|emotional|stoic|optimistic|pessimistic)", "personality"),
+        (r"\b(?:i(?:'m| am))\s+(?:a\s+)?(night owl|morning person|early bird|perfectionist|procrastinator|overthinker|people pleaser)", "personality"),
+    ]
+    for pattern, trait_type in _TRAIT_PATTERNS:
+        match = re.search(pattern, segment, flags=re.IGNORECASE)
+        if match:
+            trait = normalize_whitespace(match.group(1))
+            candidates.append(
+                build_candidate(
+                    content=f"User is {trait}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key=f"user:personality:{slugify(trait)}",
+                    value_key=slugify(trait),
+                    metadata={"trait_label": trait},
+                )
+            )
+    return candidates
+
+
+def _extract_physical_attributes(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+    # Height: "I'm 1m83", "I'm 183cm", "I'm 6'1", "my height is 183cm"
+    match = re.search(
+        r"(?:i(?:'m| am)|my height is)\s+(\d{1,2}m\d{2}|\d{2,3}\s*cm|\d'\d{1,2}\"?|\d feet? \d{1,2})",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        height = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User height: {height}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=7,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:physical_attributes",
+                value_key="height",
+                exclusive=True,
+                metadata={"height_label": height},
+            )
+        )
+    # Weight: "I weigh 82kg", "82 kg", "my weight is 82kg", "weigh 82kg"
+    match = re.search(
+        r"(?:(?:i\s+)?weigh\s+|my weight is\s+)(\d{2,3}\s*(?:kg|lbs?|pounds?))",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        weight = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User weight: {weight}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=7,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:physical_attributes",
+                value_key="weight",
+                exclusive=True,
+                metadata={"weight_label": weight},
+            )
+        )
+    # Eye color: "I have blue eyes", "my eyes are blue"
+    match = re.search(
+        r"(?:i have|my eyes are)\s+(blue|green|brown|hazel|grey|gray|dark|light|amber)\s*(?:eyes)?",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        color = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User has {color} eyes",
+                category="user_pref",
+                topic="personal-profile",
+                importance=6,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:physical_attributes",
+                value_key="eye_color",
+                exclusive=True,
+                metadata={"eye_color_label": color},
+            )
+        )
+    # Hair: "I have black hair", "my hair is brown"
+    match = re.search(
+        r"(?:i have|my hair is)\s+(black|brown|blond|blonde|red|grey|gray|white|dark|light|thin|thick|curly|straight)\s*(?:(?:thin|thick|curly|straight)\s*)?(?:hair)?",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        hair = normalize_whitespace(match.group(0).replace("i have ", "").replace("my hair is ", ""))
+        candidates.append(
+            build_candidate(
+                content=f"User has {hair}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=6,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:physical_attributes",
+                value_key="hair",
+                exclusive=True,
+                metadata={"hair_label": hair},
+            )
+        )
+    return candidates
+
+
+def _extract_daily_schedule(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+    # Wake up time: "I wake up at 7", "I wake up at 7h30", "I get up at 6:30"
+    match = re.search(
+        r"(?:i wake up|i get up)\s+(?:at\s+)?(\d{1,2}[h:]\d{0,2}|\d{1,2}\s*(?:am|pm)?)",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        wake = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User wakes up at {wake}",
+                category="general",
+                topic="user-profile",
+                importance=7,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:daily_schedule:wake_up",
+                value_key=slugify(wake),
+                exclusive=True,
+            )
+        )
+    # Work schedule: "I work at 7h30", "I work from 9 to 5"
+    match = re.search(
+        r"(?:i work)\s+(?:at|from)\s+(.+?)(?:\.|$)",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        sched = normalize_whitespace(match.group(1))[:60]
+        if len(sched) > 3:
+            candidates.append(
+                build_candidate(
+                    content=f"User work schedule: {sched}",
+                    category="general",
+                    topic="user-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:daily_schedule:work_hours",
+                    value_key=slugify(sched[:40]),
+                    exclusive=True,
+                )
+            )
+    # Sleep: "I go to bed at 11", "I sleep at midnight"
+    match = re.search(
+        r"(?:i go to bed|i sleep)\s+(?:at\s+)?(\d{1,2}[h:]\d{0,2}|\d{1,2}\s*(?:am|pm)?|midnight)",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        bed = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"User goes to bed at {bed}",
+                category="general",
+                topic="user-profile",
+                importance=6,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:daily_schedule:bedtime",
+                value_key=slugify(bed),
+                exclusive=True,
+            )
+        )
+    return candidates
+
+
+def _extract_pet(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.85 if source_role == "user" else 0.6
+    match = re.search(
+        r"\bmy\s+(cat|dog|bird|fish|hamster|rabbit|parrot|turtle|snake|ferret|guinea pig)(?:'s name is|,?\s*(?:named?|called|is)\s+)([A-Z][a-zA-Zéèêëàâäùûüôöïî]{1,20})\b",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        animal = match.group(1).lower()
+        name = normalize_whitespace(match.group(2).rstrip(".,;"))
+        if name and _is_plausible_value(name):
+            candidates.append(
+                build_candidate(
+                    content=f"User has a {animal} named {name}",
+                    category="general",
+                    topic="user-profile",
+                    importance=7,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key=f"user:pet:{name}",
+                    value_key=animal,
+                    metadata={"pet_name": name, "pet_type": animal},
+                )
+            )
+        return candidates
+    # Simpler: "I have a cat", "I have two dogs"
+    match = re.search(
+        r"\bi have\s+(?:a\s+)?(cat|dog|bird|fish|hamster|rabbit|parrot|turtle|snake|ferret|guinea pig)",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        animal = match.group(1).lower()
+        candidates.append(
+            build_candidate(
+                content=f"User has a {animal}",
+                category="general",
+                topic="user-profile",
+                importance=6,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key=f"user:pet:{animal}",
+                value_key=animal,
+            )
+        )
+    return candidates
+
+
+def _extract_hobbies(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.80 if source_role == "user" else 0.55
+    # "I play a lot of X", "I mainly play X", "I'm stuck on X"
+    match = re.search(
+        r"\b(?:i (?:mainly |mostly )?play(?:s|ed)?\s+(?:a lot of\s+)?|i(?:'m| am) stuck on\s+|i(?:'m| am) (?:really )?into\s+)(.+?)(?:\.|,|$)",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        hobby = normalize_whitespace(match.group(1).rstrip(".,;"))
+        if hobby and len(hobby) > 2 and len(hobby) < 80 and _is_plausible_value(hobby):
+            # Try to detect if it's gaming
+            is_game = bool(re.search(
+                r"(?:video game|game|cs2|valorant|fortnite|minecraft|league|overwatch|apex|dota|gta|cod|halo|elden ring|arc raider|diablo|destiny|warzone|rocket league|fifa|nba)",
+                hobby, flags=re.IGNORECASE,
+            ))
+            if is_game:
+                candidates.append(
+                    build_candidate(
+                        content=f"User plays {hobby}",
+                        category="user_pref",
+                        topic="user-profile",
+                        importance=7,
+                        confidence=confidence,
+                        source_role=source_role,
+                        subject_key="user:gaming:current",
+                        value_key=slugify(hobby[:40]),
+                        metadata={"hobby_label": hobby, "kind": "gaming"},
+                    )
+                )
+            else:
+                candidates.append(
+                    build_candidate(
+                        content=f"User does {hobby}",
+                        category="user_pref",
+                        topic="user-profile",
+                        importance=6,
+                        confidence=confidence,
+                        source_role=source_role,
+                        subject_key=f"user:hobby:{slugify(hobby[:30])}",
+                        value_key=slugify(hobby[:40]),
+                        metadata={"hobby_label": hobby},
+                    )
+                )
+    return candidates
+
+
+def _extract_identity(segment: str, source_role: str) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    confidence = 0.90 if source_role == "user" else 0.65
+    # Name: "My name is X", "I'm called X"
+    match = re.search(
+        r"(?:my name is|i(?:'m| am) called)\s+([A-Z][a-zA-Zéèêëàâäùûüôöïî -]{1,30})",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        name = normalize_whitespace(match.group(1).rstrip(".,;"))
+        if name and _is_plausible_value(name) and len(name) > 1:
+            candidates.append(
+                build_candidate(
+                    content=f"User's name is {name}",
+                    category="user_pref",
+                    topic="personal-profile",
+                    importance=9,
+                    confidence=confidence,
+                    source_role=source_role,
+                    subject_key="user:name",
+                    value_key="name",
+                    exclusive=True,
+                    metadata={"name_label": name},
+                )
+            )
+    # Date of birth: "I was born on 24 November 1993", "Born on ..."
+    match = re.search(
+        r"(?:i was )?born\s+(?:on\s+)?(\d{1,2}\s+\w+\s+\d{4}|\w+\s+\d{1,2},?\s+\d{4}|\d{4}-\d{2}-\d{2})",
+        segment, flags=re.IGNORECASE,
+    )
+    if match:
+        dob = normalize_whitespace(match.group(1))
+        candidates.append(
+            build_candidate(
+                content=f"Born on {dob}",
+                category="user_pref",
+                topic="personal-profile",
+                importance=9,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:date_of_birth",
+                value_key="dob",
+                exclusive=True,
+                metadata={"dob_label": dob},
+            )
+        )
+    # Age: "I'm 31 years old"
+    match = re.search(r"(?:i(?:'m| am))\s+(\d{1,3})\s+years?\s+old", segment, flags=re.IGNORECASE)
+    if match:
+        age = match.group(1)
+        candidates.append(
+            build_candidate(
+                content=f"User is {age} years old",
+                category="user_pref",
+                topic="personal-profile",
+                importance=8,
+                confidence=confidence,
+                source_role=source_role,
+                subject_key="user:age",
+                value_key=age,
+                exclusive=True,
+            )
+        )
+    return candidates
+
+
 def _structured_candidates(segment: str, source_role: str) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     extractors = (
@@ -1328,6 +1766,13 @@ def _structured_candidates(segment: str, source_role: str) -> List[Dict[str, Any
         _extract_user_preferences,
         _extract_personal_details,
         _extract_user_role,
+        _extract_identity,
+        _extract_family_members,
+        _extract_personality_traits,
+        _extract_physical_attributes,
+        _extract_daily_schedule,
+        _extract_pet,
+        _extract_hobbies,
         _extract_timezone,
         _extract_shell,
         _extract_editor,
