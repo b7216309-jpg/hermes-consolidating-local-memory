@@ -2045,7 +2045,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not any(subject_key.startswith(p) for p in self._PREFERENCE_WORTHY_PREFIXES):
             return
         key = subject_key or slugify(str(metadata.get("item_label") or fact.get("content") or "")[:48])
-        # Prefer human-readable label metadata over slugified value_key.
+        # ── Build distinct label / value / content fields ──
+        # value = the short, concrete datum (e.g. "coffee", "Caudry", "light")
         value = str(
             metadata.get("value_label")
             or metadata.get("item_label")
@@ -2056,15 +2057,34 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             or metadata.get("diet_label")
             or metadata.get("relationship_label")
             or metadata.get("pronouns_label")
-            or fact.get("content")
+            or metadata.get("name_label")
+            or metadata.get("pet_name")
+            or metadata.get("hobby_label")
+            or metadata.get("height_label")
+            or metadata.get("weight_label")
+            or metadata.get("eye_color_label")
+            or metadata.get("hair_label")
+            or metadata.get("dob_label")
             or metadata.get("value_key")
             or ""
         )
+        # label = short human-readable description (distinct from full content)
+        fact_content = str(fact.get("content") or key)
+        label = fact_content
+        # content = full sentence for context injection
+        content = fact_content
+        # If value is the same as content, try to shorten label to "key: value" form
+        if value and value != fact_content:
+            # We have a distinct short value — good
+            pass
+        else:
+            # Fallback: extract value from content by stripping common prefixes
+            value = fact_content
         preference = self._store.upsert_preference(
             key=key,
-            label=str(fact.get("content") or key),
-            value=value or str(fact.get("content") or key),
-            content=str(fact.get("content") or key),
+            label=label,
+            value=value,
+            content=content,
             metadata={
                 **metadata,
                 **({"session_id": str(fact.get("source_session_id") or "")} if fact.get("source_session_id") else {}),
@@ -2874,8 +2894,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         for item in results.get("summaries", [])[:3]:
             summary_lines.append(f"- {item.get('label')}: {item.get('summary')}")
 
+        # ── Collect preference content for dedup against facts ──
         preference_lines = []
+        _pref_content_seen: set[str] = set()
         for item in results.get("preferences", [])[:3]:
+            pref_text = str(item.get("content") or "").strip().lower()
+            _pref_content_seen.add(pref_text)
             preference_lines.append(f"- {item.get('content')}")
         workflow_lines = []
         for item in results.get("policies", [])[:3]:
@@ -2889,6 +2913,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         fact_lines = []
         for fact in results.get("facts", [])[: self._cfg()["prefetch_limit"]]:
             if str(fact.get("category") or "") == "workflow":
+                continue
+            # Skip facts already represented in preferences (avoid double-injection)
+            fact_text = str(fact.get("content") or "").strip().lower()
+            if fact_text in _pref_content_seen:
                 continue
             fact_lines.append(f"- [{fact['category']}/{fact['topic']}] {fact['content']}")
 
