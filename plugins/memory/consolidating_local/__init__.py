@@ -354,7 +354,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             model=llm_model,
             base_url=llm_base_url,
             api_key=llm_api_key,
-            timeout_seconds=int(self._config.get("llm_timeout_seconds", 45)),
+            timeout_seconds=int(self._config.get("llm_timeout_seconds", 120)),
         )
         self._llm_backend = str(self._config.get("extractor_backend", "hybrid") or "hybrid").strip().lower()
         self._embedder = OpenAICompatibleEmbeddings(
@@ -813,7 +813,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "wiki_export_on_consolidate": self._cfg_bool("wiki_export_on_consolidate", True),
             "wiki_export_session_limit": int(self._config.get("wiki_export_session_limit", 50)),
             "wiki_export_topic_limit": int(self._config.get("wiki_export_topic_limit", 100)),
-            "llm_timeout_seconds": int(self._config.get("llm_timeout_seconds", 45)),
+            "llm_timeout_seconds": int(self._config.get("llm_timeout_seconds", 120)),
             "llm_max_input_chars": int(self._config.get("llm_max_input_chars", 4000)),
             "retrieval_backend": str(self._config.get("retrieval_backend", "fts") or "fts").strip().lower(),
             "embedding_timeout_seconds": int(self._config.get("embedding_timeout_seconds", 20)),
@@ -2697,7 +2697,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.1,
-            max_tokens=700,
+            max_tokens=16384,
         )
         if not data or not isinstance(data.get("facts"), list):
             return []

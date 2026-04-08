@@ -325,4 +325,17 @@ def _extract_openai_chat_text(body: Dict[str, Any]) -> str:
         )
     else:
         content = str(raw_content or "")
+    # Some reasoning models (Qwen 3.x, DeepSeek-R1, etc.) put thinking in
+    # reasoning_content and the actual answer in content.  When content is
+    # empty but reasoning_content contains a JSON block, extract it.
+    if not content.strip():
+        reasoning = str(message.get("reasoning_content") or "")
+        if reasoning:
+            # Try to find JSON inside the reasoning trace
+            import re as _re
+            json_match = _re.search(r"\{[\s\S]*\}", reasoning)
+            if json_match:
+                content = json_match.group(0)
+            else:
+                content = reasoning
     return content
