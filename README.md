@@ -24,8 +24,3 @@ It adds a local SQLite-backed memory layer with:
 1. Install this plugin into your Hermes checkout.
 2. Enable `consolidating_local` in Hermes `config.yaml`.
 3. Run Hermes so the provider can initialize its SQLite store.
-
-## Core Principle
-
-- SQLite is the source of truth
-- generated markdown is derived output
