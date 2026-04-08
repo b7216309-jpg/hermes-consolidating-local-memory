@@ -4,14 +4,14 @@ This document explains how the main plugin repo and the companion desktop app fi
 
 Related repos:
 
-- Plugin and benchmarks: [hermes-consolidating-local-memory](https://github.com/b7216309-jpg/hermes-consolidating-local-memory)
+- Plugin repo: [hermes-consolidating-local-memory](https://github.com/b7216309-jpg/hermes-consolidating-local-memory)
 - Desktop control panel: [hermes-memory-control](https://github.com/b7216309-jpg/hermes-memory-control)
 
 ## Purpose
 
 The two repos are meant to feel like one system with a clean split of responsibilities:
 
-- this repo owns the memory provider, SQLite schema, consolidation logic, wiki export, and benchmark suite
+- this repo owns the memory provider, SQLite schema, consolidation logic, and wiki export
 - Hermes Memory Control owns the operator UI for browsing, editing, and visualizing the same memory store
 
 The app is not a separate memory backend. It is a control surface for the provider defined here.
@@ -62,8 +62,6 @@ Provider-side responsibilities in this repo:
 - topic rebuilding, summaries, provenance, and history
 - snapshot sync into `USER.md` and `MEMORY.md`
 - compiled wiki export
-- benchmark tooling and dataset-driven evaluation
-
 Desktop app responsibilities:
 
 - dashboard for counts and last consolidation state
@@ -77,13 +75,13 @@ Desktop app responsibilities:
 
 This split keeps the hard parts where they belong:
 
-- the provider stays local-first, scriptable, and benchmarkable
+- the provider stays local-first and scriptable
 - the app stays lightweight and focused on observability and operator control
 - both repos can evolve independently as long as the config contract and SQLite schema stay compatible
 
 It also makes debugging easier:
 
-- if the memory is wrong, inspect provider logic and benchmark cases here
+- if the memory is wrong, inspect provider logic here
 - if the data is right but hard to inspect, use the app
 - if the app shows unexpected data, check whether the provider wrote it or whether it was manually edited later
 
@@ -92,7 +90,6 @@ It also makes debugging easier:
 - Root overview: [../README.md](../README.md)
 - Plugin quick reference: [../plugins/memory/consolidating_local/README.md](../plugins/memory/consolidating_local/README.md)
 - Internal architecture: [PLUGIN_DEEP_DIVE.md](PLUGIN_DEEP_DIVE.md)
-- Function-level flow map: [FUNCTION_FLOW_SCHEME.md](FUNCTION_FLOW_SCHEME.md)
 
 ## Recommended Language
 
