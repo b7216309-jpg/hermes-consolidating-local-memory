@@ -1,3 +1,11 @@
+IT IS NOT WORKING, BETTER WITHOUT THAN WITH THIS. 
+
+
+
+
+
+
+
 # Hermes Consolidating Local Memory
 
 `consolidating_local` is a local-first memory provider for Hermes.
