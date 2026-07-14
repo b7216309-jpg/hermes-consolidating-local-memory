@@ -49,12 +49,14 @@ class OpenAICompatibleLLM:
         api_key: str = "",
         timeout_seconds: int = 45,
         failure_cooldown_seconds: int = 120,
+        disable_thinking: bool = False,
     ):
         self.model = str(model or "").strip()
         self.base_url = str(base_url or "").rstrip("/")
         self.api_key = str(api_key or "")
         self.timeout_seconds = max(1, min(int(timeout_seconds), 300))
         self.failure_cooldown_seconds = max(1, min(int(failure_cooldown_seconds), 86400))
+        self.disable_thinking = bool(disable_thinking)
         self._last_http_error_code: int | None = None
         self._last_http_error_detail = ""
         self._consecutive_failures = 0
@@ -158,6 +160,9 @@ class OpenAICompatibleLLM:
             max_tokens=max_tokens,
         )
         if not content:
+            if self._last_request_succeeded is not False:
+                self._last_http_error_detail = "model response did not contain visible content"
+                self._record_failure()
             return None
         data = extract_json_object(content)
         if data is None:
@@ -187,10 +192,15 @@ class OpenAICompatibleLLM:
             "temperature": float(temperature),
             "max_tokens": int(max_tokens),
         }
+        if self.disable_thinking:
+            # This is the raw OpenAI-compatible request body. It is equivalent
+            # to OpenAI SDK callers passing
+            # extra_body={"chat_template_kwargs": {"enable_thinking": False}}.
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
         body = self._post_json("/chat/completions", payload)
         if not body:
             return ""
-        return _extract_openai_chat_text(body)
+        return _extract_openai_chat_text(body, allow_reasoning_fallback=not self.disable_thinking)
 
     def _codex_responses_text(
         self,
@@ -372,7 +382,7 @@ def _extract_codex_stream_text(raw: str) -> str:
     return "".join(pieces).strip()
 
 
-def _extract_openai_chat_text(body: Dict[str, Any]) -> str:
+def _extract_openai_chat_text(body: Dict[str, Any], *, allow_reasoning_fallback: bool = True) -> str:
     content = ""
     choices = body.get("choices") or []
     if not choices:
@@ -386,7 +396,7 @@ def _extract_openai_chat_text(body: Dict[str, Any]) -> str:
     # Some reasoning models (Qwen 3.x, DeepSeek-R1, etc.) put thinking in
     # reasoning_content and the actual answer in content.  When content is
     # empty but reasoning_content contains a JSON block, extract it.
-    if not content.strip():
+    if allow_reasoning_fallback and not content.strip():
         reasoning = str(message.get("reasoning_content") or "")
         if reasoning:
             content = reasoning

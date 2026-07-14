@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from consolidating_local.llm_client import OpenAICompatibleEmbeddings, extract_json_object
+from consolidating_local.llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, extract_json_object
 from consolidating_local.store import MemoryStore
 from consolidating_local.wiki_export import MANIFEST_NAME, _safe_output_path, export_compiled_wiki
 
@@ -29,6 +29,65 @@ def test_embeddings_are_ordered_and_validated():
         "data": [{"index": 0, "embedding": [1, 2]}, {"index": 1, "embedding": [float("nan"), 4]}]
     }
     assert client.embed_texts(["a", "b"]) is None
+
+
+def test_no_thinking_mode_sends_qwen_chat_template_option():
+    client = OpenAICompatibleLLM(
+        model="qwen",
+        base_url="http://localhost",
+        disable_thinking=True,
+    )
+    requests = []
+
+    def fake_post(path, payload):
+        requests.append((path, payload))
+        client._record_success()
+        return {"choices": [{"message": {"content": '{"facts": []}'}}]}
+
+    client._post_json = fake_post
+    assert client.chat_json(system_prompt="extract", user_prompt="hello") == {"facts": []}
+    assert requests[0][0] == "/chat/completions"
+    assert requests[0][1]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_no_thinking_mode_rejects_reasoning_only_response():
+    client = OpenAICompatibleLLM(
+        model="qwen",
+        base_url="http://localhost",
+        disable_thinking=True,
+    )
+
+    def fake_post(_path, _payload):
+        client._record_success()
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": '{"facts": [{"content": "scratch"}]}',
+                    }
+                }
+            ]
+        }
+
+    client._post_json = fake_post
+    assert client.chat_json(system_prompt="extract", user_prompt="hello") is None
+    assert client.last_request_succeeded is False
+    assert client.circuit_state["last_error"] == "model response did not contain visible content"
+
+
+def test_default_mode_keeps_reasoning_fallback_without_sending_qwen_option():
+    client = OpenAICompatibleLLM(model="reasoner", base_url="http://localhost")
+    requests = []
+
+    def fake_post(_path, payload):
+        requests.append(payload)
+        client._record_success()
+        return {"choices": [{"message": {"content": "", "reasoning_content": '{"facts": []}'}}]}
+
+    client._post_json = fake_post
+    assert client.chat_json(system_prompt="extract", user_prompt="hello") == {"facts": []}
+    assert "chat_template_kwargs" not in requests[0]
 
 
 def test_wiki_output_paths_cannot_escape_export_root(tmp_path):

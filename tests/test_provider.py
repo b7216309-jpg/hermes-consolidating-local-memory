@@ -33,6 +33,8 @@ def test_defaults_are_local_and_do_not_rewrite_builtin_memory():
     assert all(item["key"] != "extractor_backend" for item in advanced)
     llm_model = next(item for item in advanced if item["key"] == "llm_model")
     assert llm_model["default"] == ""
+    llm_disable_thinking = next(item for item in advanced if item["key"] == "llm_disable_thinking")
+    assert llm_disable_thinking["default"] == "false"
 
 
 def test_encrypted_provider_reports_unavailable_without_required_key(monkeypatch):

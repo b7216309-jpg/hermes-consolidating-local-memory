@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.2.0 — 2026-07-14
+
+- Added opt-in strict non-thinking extraction through `llm_disable_thinking` for compatible OpenAI-style Qwen endpoints.
+- Matched Hermes compression by sending `chat_template_kwargs.enable_thinking=false` in the raw chat-completion request.
+- Rejected reasoning-only responses in strict mode so scratch reasoning cannot be parsed and stored as memory.
+- Preserved backward compatibility for other endpoints and Codex Responses backends.
+- Added transport, response-safety, and provider-integration regression coverage; validated the release against a live Qwen 35B extraction endpoint.
+
 ## 3.1.0 — 2026-07-14
 
 - Added `hermes consolidating_local onboard`, a guided user-profile interview with a full preview and explicit approval before any write.

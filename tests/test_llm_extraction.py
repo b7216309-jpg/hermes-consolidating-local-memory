@@ -87,6 +87,7 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
                 "db_path": str(tmp_path / "memory.db"),
                 "llm_model": "memory-extractor",
                 "llm_base_url": endpoint.base_url,
+                "llm_disable_thinking": True,
                 "llm_failure_cooldown_seconds": 1,
                 "queue_max_attempts": 5,
             }
@@ -108,7 +109,9 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
             assert len(facts) == 1
             prompt = endpoint.requests[-1]["messages"][-1]["content"]
             assert "seed_facts" not in prompt
+            assert endpoint.requests[-1]["chat_template_kwargs"] == {"enable_thinking": False}
             status = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "status"}))
             assert status["automatic_extraction"] == {"enabled": True, "backend": "llm"}
+            assert status["llm_disable_thinking"] is True
         finally:
             provider.shutdown()

@@ -1,4 +1,4 @@
-# consolidating_local 3.1
+# consolidating_local 3.2
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -39,6 +39,7 @@ Alongside the original actions, v2 adds `explain`, `working`, `procedure`, `inte
 
 - Automatic extraction is disabled unless both `llm_model` and `llm_base_url` are configured.
 - Automatic extraction is LLM-only. There is no rule-based extractor, hybrid extractor, or fallback.
+- `llm_disable_thinking: true` sends `chat_template_kwargs.enable_thinking=false` to compatible OpenAI-style chat endpoints and rejects reasoning-only responses.
 - Explicit Hermes memory-tool writes remain immediate and do not require an extraction model.
 - `retrieval_backend: fts` is the default.
 - `retrieval_backend: hybrid` reranks FTS candidates using an explicitly configured embedding endpoint.
@@ -60,6 +61,7 @@ plugins:
     shutdown_timeout_seconds: 10
     max_database_mb: 512
     retrieval_backend: fts
+    llm_disable_thinking: false
     builtin_snapshot_sync_enabled: false
     wiki_export_enabled: false
 ```

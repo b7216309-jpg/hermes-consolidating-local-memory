@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.1.0](https://img.shields.io/badge/version-3.1.0-14b8a6)](CHANGELOG.md)
+[![Version 3.2.0](https://img.shields.io/badge/version-3.2.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
 
 Version 3 removes the old heuristic extractor. Automatic fact extraction is now model-backed and opt-in. With no model configured, the provider still records redacted episodes, mirrors explicit Hermes memory writes exactly, and performs local full-text recall; it never guesses facts with rules.
 
-Version 3.1 adds review-first profile onboarding. It can seed facts, preferences, policies, procedures, and intentions into the exact local, user, or agent scope used by Hermes. Onboarding memories are `local_only`: they remain available to Hermes through local FTS5 but are withheld from remote embedding endpoints.
+Version 3.2 adds strict non-thinking extraction for compatible Qwen and OpenAI-style endpoints. Version 3.1 added review-first profile onboarding, which can seed facts, preferences, policies, procedures, and intentions into the exact local, user, or agent scope used by Hermes. Onboarding memories are `local_only`: they remain available to Hermes through local FTS5 but are withheld from remote embedding endpoints.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -184,6 +184,7 @@ plugins:
 
     llm_model: YOUR_LOCAL_QWEN_MODEL_NAME
     llm_base_url: http://WSL_HOST_OR_LAN_IP:8080/v1
+    llm_disable_thinking: true
     llm_timeout_seconds: 45
 
     retrieval_backend: hybrid
@@ -242,6 +243,7 @@ plugins:
   consolidating-local-memory:
     llm_model: your-model-name
     llm_base_url: http://127.0.0.1:8000/v1
+    llm_disable_thinking: false
     llm_timeout_seconds: 45
     llm_failure_cooldown_seconds: 120
     llm_max_input_chars: 4000
@@ -260,6 +262,18 @@ $env:CONSOLIDATING_MEMORY_LLM_API_KEY = "..."
 ```
 
 The provider never inherits Hermes' normal chat endpoint implicitly. Requiring an explicit endpoint avoids accidentally sending memory text to a service the operator did not choose. When no extraction endpoint is configured, explicit memory writes still work and the provider does not fall back to heuristic guessing.
+
+For a Qwen reasoning model served by llama.cpp, vLLM, or another endpoint that accepts Qwen chat-template arguments, enable strict non-thinking extraction:
+
+```yaml
+plugins:
+  consolidating-local-memory:
+    llm_model: your-qwen-model
+    llm_base_url: http://127.0.0.1:8080/v1
+    llm_disable_thinking: true
+```
+
+The plugin then sends `chat_template_kwargs.enable_thinking=false`, matching Hermes' compression mechanism. This saves reasoning tokens and makes short JSON extraction more reliable. Strict mode accepts only visible assistant content: a server that ignores the flag and returns only `reasoning_content` causes a recoverable extraction failure instead of allowing scratch reasoning into memory. Leave the option `false` for endpoints that do not support this request field. The option applies to OpenAI-compatible chat-completion endpoints; Codex Responses backends ignore it.
 
 ### Hybrid retrieval
 
@@ -511,7 +525,7 @@ python -m plugins.memory.consolidating_local.admin --db /path/to/database.db doc
 
 Version 3 removes `consolidator.py` and every rule-based extraction path. The obsolete `extractor_backend` setting is safely ignored if it remains in an old configuration. Existing durable facts are preserved; startup applies recorded additive migrations and rebuilds supporting indexes when necessary.
 
-Version 3.1 adds the onboarding module and scope-aware native CLI without replacing the memory schema or deleting existing records. Reinstall the plugin bundle so Hermes receives `onboarding.py`, the updated CLI registration, and the `local_only` hybrid privacy gate. Running onboarding against an existing profile is safe: unchanged entries are reported as `unchanged` and do not create duplicate evidence/history.
+Version 3.2 adds the optional `llm_disable_thinking` extraction setting without changing the database schema. Reinstall the plugin bundle, then enable the option only if the configured OpenAI-compatible endpoint supports Qwen chat-template arguments. Version 3.1 added the onboarding module and scope-aware native CLI; running onboarding against an existing profile remains safe because unchanged entries do not create duplicate evidence/history.
 
 ## Data locations
 
@@ -556,6 +570,7 @@ The provider should be selected and available; every `doctor` result should have
 | `consolidating_local` is not listed | Run `python install.py`; confirm `$HERMES_HOME/plugins/consolidating_local/plugin.yaml` exists; restart Hermes. |
 | Provider reports unavailable | If encryption is enabled, install `sqlcipher3` and set `CONSOLIDATING_MEMORY_DB_KEY` in the Hermes process environment. |
 | Explicit writes work but no automatic facts appear | Configure both `llm_model` and `llm_base_url`. This is intentional—there is no heuristic fallback. |
+| Extraction retries with `model response did not contain visible content` | A reasoning endpoint returned no final answer. If it supports Qwen chat-template arguments, set `llm_disable_thinking: true`; otherwise disable that option and inspect the endpoint's reasoning configuration. |
 | Semantically similar wording is missed | Default FTS is lexical. Configure `retrieval_backend: hybrid` plus both embedding settings. |
 | CLI shows an empty database | Local CLI and gateway users are isolated by default. Use `--scope-platform` plus `--scope-user-id`, or pass the exact scoped database with `--db`. |
 | Onboarded profile appears in CLI but not Telegram | Apply the same reviewed answer file to the Telegram scope; onboarding does not copy personal profiles across users automatically. |

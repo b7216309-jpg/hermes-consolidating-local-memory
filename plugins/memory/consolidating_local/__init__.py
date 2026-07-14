@@ -45,7 +45,7 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -479,6 +479,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "default": "",
             },
             {
+                "key": "llm_disable_thinking",
+                "description": "Ask compatible extraction endpoints to disable reasoning and require visible output",
+                "default": "false",
+            },
+            {
                 "key": "llm_timeout_seconds",
                 "description": "Timeout for local LLM extraction calls",
                 "default": "45",
@@ -624,6 +629,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             api_key=llm_api_key,
             timeout_seconds=self._cfg_int("llm_timeout_seconds", 45, 1, 300),
             failure_cooldown_seconds=self._cfg_int("llm_failure_cooldown_seconds", 120, 1, 86400),
+            disable_thinking=self._cfg_bool("llm_disable_thinking", False),
         )
         self._embedder = OpenAICompatibleEmbeddings(
             model=embedding_model,
@@ -1123,6 +1129,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         "retrieval_backend": self._effective_retrieval_backend(),
                         "llm_model": self._llm.model if self._llm else "",
                         "llm_base_url": self._llm.base_url if self._llm else "",
+                        "llm_disable_thinking": self._llm.disable_thinking if self._llm else False,
                         "llm_circuit": self._llm.circuit_state if self._llm else {},
                         "embedding_model": self._embedder.model if self._embedder else "",
                         "embedding_base_url": self._embedder.base_url if self._embedder else "",
@@ -1813,6 +1820,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "wiki_export_topic_limit": self._cfg_int("wiki_export_topic_limit", 100, 1, 10000),
             "llm_timeout_seconds": self._cfg_int("llm_timeout_seconds", 45, 1, 300),
             "llm_max_input_chars": self._cfg_int("llm_max_input_chars", 4000, 256, 100000),
+            "llm_disable_thinking": self._cfg_bool("llm_disable_thinking", False),
             "retrieval_backend": str(self._config.get("retrieval_backend", "fts") or "fts").strip().lower(),
             "embedding_timeout_seconds": self._cfg_int("embedding_timeout_seconds", 20, 1, 300),
             "embedding_candidate_limit": self._cfg_int("embedding_candidate_limit", 16, 1, 100),
