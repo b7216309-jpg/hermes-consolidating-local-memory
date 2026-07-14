@@ -33,6 +33,7 @@ from .consolidation import (
 from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank
 from .store import (
     MemoryStore,
+    _as_bool,
     _looks_like_credential,
     _looks_sensitive_for_export,
     fingerprint_text,
@@ -44,7 +45,7 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -2892,13 +2893,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
             ]
         embedding_sensitivities = [self._classify_sensitivity(clean)[0]]
+        local_only_result = False
         for section, rows in results.items():
             for row in rows:
+                if _as_bool(self._result_metadata(row).get("local_only")):
+                    local_only_result = True
                 embedding_sensitivities.append(str(row.get("sensitivity") or "normal"))
                 embedding_sensitivities.append(
                     self._classify_sensitivity(self._memory_text(section, row), self._result_metadata(row))[0]
                 )
-        remote_embedding_allowed = self._remote_processing_allowed(*embedding_sensitivities)
+        remote_embedding_allowed = not local_only_result and self._remote_processing_allowed(*embedding_sensitivities)
         if (
             clean
             and allow_embeddings
@@ -3055,7 +3059,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return
         key = subject_key or slugify(str(metadata.get("item_label") or fact.get("content") or "")[:48])
         # ── Build distinct label / value / content fields ──
-        # value = the short, concrete datum (e.g. "coffee", "Caudry", "light")
+        # value = the short, concrete datum (e.g. "coffee", "Paris", "light")
         value = str(
             metadata.get("value_label")
             or metadata.get("item_label")

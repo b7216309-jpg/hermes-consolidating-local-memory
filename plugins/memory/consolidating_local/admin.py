@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from .onboarding import collect_answers, load_answers, run_onboarding, write_answer_template
 from .store import MemoryStore
 
 
@@ -152,11 +153,21 @@ def main(argv: list[str] | None = None) -> int:
     retry_parser = subparsers.add_parser("retry-failed")
     retry_parser.add_argument("--confirm", action="store_true", help="Required to retry dead-letter operations")
     retry_parser.add_argument("--limit", type=int, default=100)
+    onboard_parser = subparsers.add_parser("onboard")
+    onboard_parser.add_argument("--answers", default="", help="Read answers from a JSON object")
+    onboard_parser.add_argument("--template", default="", help="Create a blank answer JSON file and exit")
+    onboard_parser.add_argument("--preview-only", action="store_true")
+    onboard_parser.add_argument("--yes", action="store_true")
+    onboard_parser.add_argument("--skip-sensitive", action="store_true")
     subparsers.add_parser("maintain")
     args = parser.parse_args(argv)
 
     db_path = Path(args.db).expanduser().resolve()
     encryption_key = os.environ.get("CONSOLIDATING_MEMORY_DB_KEY", "")
+    if args.command == "onboard" and args.template:
+        path = write_answer_template(args.template)
+        print(json.dumps({"success": True, "result": {"status": "template", "path": str(path)}}, indent=2))
+        return 0
     if args.command == "restore":
         if not args.confirm:
             parser.error("restore requires --confirm and Hermes must be stopped")
@@ -190,6 +201,15 @@ def main(argv: list[str] | None = None) -> int:
                 "remaining_failed": store.failed_operation_count(),
                 "pending": store.pending_operation_count(),
             }
+        elif args.command == "onboard":
+            answers = load_answers(args.answers) if args.answers else collect_answers()
+            result = run_onboarding(
+                store,
+                answers,
+                preview_only=bool(args.preview_only),
+                assume_yes=bool(args.yes),
+                skip_sensitive=bool(args.skip_sensitive),
+            )
         else:
             parser.error(f"unknown command: {args.command}")
         print(json.dumps({"success": True, "result": result}, ensure_ascii=False, indent=2, sort_keys=True))

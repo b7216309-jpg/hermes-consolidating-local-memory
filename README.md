@@ -2,12 +2,14 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.0.0](https://img.shields.io/badge/version-3.0.0-14b8a6)](CHANGELOG.md)
+[![Version 3.1.0](https://img.shields.io/badge/version-3.1.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
 
 Version 3 removes the old heuristic extractor. Automatic fact extraction is now model-backed and opt-in. With no model configured, the provider still records redacted episodes, mirrors explicit Hermes memory writes exactly, and performs local full-text recall; it never guesses facts with rules.
+
+Version 3.1 adds review-first profile onboarding. It can seed facts, preferences, policies, procedures, and intentions into the exact local, user, or agent scope used by Hermes. Onboarding memories are `local_only`: they remain available to Hermes through local FTS5 but are withheld from remote embedding endpoints.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -88,6 +90,21 @@ hermes consolidating_local doctor
 
 A healthy installation returns an `ok` status with valid SQLite integrity, matching FTS indexes, no dangling links, and no failed durable work.
 
+### WSL2 quick start
+
+Run installation and administration inside the same WSL distribution as Hermes. With the standard Hermes layout:
+
+```console
+wsl -d Ubuntu
+cd ~/src/hermes-consolidating-local-memory
+python3 install.py --hermes-home ~/.hermes
+~/.hermes/hermes-agent/venv/bin/hermes memory setup
+~/.hermes/hermes-agent/venv/bin/hermes consolidating_local doctor
+~/.hermes/hermes-agent/venv/bin/hermes gateway restart
+```
+
+If `hermes` is already on the WSL `PATH`, the shorter `hermes ...` form is equivalent. Installing from Windows into a Windows home directory does not update a separate WSL Hermes installation; pass the WSL `--hermes-home` explicitly or run `install.py` inside WSL.
+
 ## How it works
 
 ### Capture
@@ -146,6 +163,51 @@ plugins:
 ```
 
 All advanced options are optional.
+
+### Hardened hybrid example
+
+This example combines a local OpenAI-compatible extractor, inexpensive OpenAI embeddings, per-user isolation, SQLCipher, and fail-closed remote privacy:
+
+```yaml
+memory:
+  provider: consolidating_local
+
+plugins:
+  consolidating-local-memory:
+    db_path: $HERMES_HOME/consolidating_memory_encrypted.db
+    memory_scope: user
+    database_encryption: true
+    sensitive_memory: ask
+    allow_credential_memory: false
+    allow_sensitive_model_processing: false
+    export_redact_sensitive: true
+
+    llm_model: YOUR_LOCAL_QWEN_MODEL_NAME
+    llm_base_url: http://WSL_HOST_OR_LAN_IP:8080/v1
+    llm_timeout_seconds: 45
+
+    retrieval_backend: hybrid
+    embedding_model: text-embedding-3-small
+    embedding_base_url: https://api.openai.com/v1
+    embedding_timeout_seconds: 30
+    embedding_candidate_limit: 16
+    prefetch_cache_ttl_seconds: 120
+```
+
+Keep keys outside `config.yaml`. Hermes loads its private environment from the process environment or its protected environment file:
+
+```dotenv
+CONSOLIDATING_MEMORY_DB_KEY=GENERATE_A_LONG_RANDOM_VALUE
+CONSOLIDATING_MEMORY_EMBEDDING_API_KEY=YOUR_OPENAI_API_KEY
+# Only needed when the extraction endpoint requires authentication:
+CONSOLIDATING_MEMORY_LLM_API_KEY=YOUR_LOCAL_ENDPOINT_KEY
+```
+
+```console
+chmod 600 ~/.hermes/.env
+```
+
+Never commit `.env`, paste live keys into issues or chat, or reuse a key after accidental exposure.
 
 ### Scope and privacy
 
@@ -216,6 +278,20 @@ plugins:
 
 If required, set `CONSOLIDATING_MEMORY_EMBEDDING_API_KEY`. Both the embedding model and base URL are required; otherwise recall remains local FTS.
 
+For OpenAI, a low-cost configuration is:
+
+```yaml
+plugins:
+  consolidating-local-memory:
+    retrieval_backend: hybrid
+    embedding_model: text-embedding-3-small
+    embedding_base_url: https://api.openai.com/v1
+```
+
+`text-embedding-3-small` produces 1,536-dimensional vectors. See the [official OpenAI model page](https://developers.openai.com/api/docs/models/text-embedding-3-small) for current pricing and limits.
+
+Hybrid retrieval remains FTS-first. The provider selects bounded local candidates and only then asks the embedding endpoint to rerank them. It skips the remote call and keeps the FTS ordering when the query/results are sensitive, any result carries `local_only`, the endpoint is unavailable, or the circuit breaker is open. Onboarding entries and topic summaries derived from them carry `local_only` automatically.
+
 ### SQLCipher encryption
 
 Install SQLCipher support into the same Python environment that runs Hermes:
@@ -237,6 +313,27 @@ plugins:
 ```
 
 Encrypted mode fails closed: the provider is unavailable if the dependency or key is missing, and a wrong key cannot open the database. SQLite backups remain encrypted and complete. Portable JSON/wiki exports follow `export_redact_sensitive` but are not encrypted by the plugin; protect their destination separately.
+
+Enabling `database_encryption` does not convert an existing plaintext SQLite file in place. Use a new `db_path` and migrate deliberately:
+
+1. Stop Hermes and create a normal SQLite backup.
+2. Export the old database. Use `--include-sensitive` only in a protected directory when a complete migration is required.
+3. Install `sqlcipher3` into the Hermes Python environment.
+4. Set `CONSOLIDATING_MEMORY_DB_KEY`, enable encryption, and point `db_path` at a new filename.
+5. Import the protected JSON with `--confirm`, run `doctor`, and retain the old database until validation is complete.
+6. Securely remove the temporary unencrypted JSON when it is no longer required.
+
+```console
+hermes gateway stop
+hermes consolidating_local backup ~/memory-before-encryption.db
+hermes consolidating_local export ~/memory-migration.json --include-sensitive
+# Update config.yaml and ~/.hermes/.env, then:
+hermes consolidating_local import ~/memory-migration.json --confirm
+hermes consolidating_local doctor
+hermes gateway restart
+```
+
+Repeat migration per derived database when `memory_scope` is `user` or `agent`. Treat plaintext exports and old databases as secrets.
 
 ### Queue, retention, and consolidation
 
@@ -301,6 +398,58 @@ The provider exposes the `consolidating_memory` tool with 28 actions:
 
 Mutating or sensitive actions are rejected outside the primary agent context. The tool schema describes the required fields for each action directly to Hermes.
 
+## Guided onboarding
+
+`onboard` builds an initial user profile without creating a separate profile silo. Answers become normal memory objects:
+
+| Answer group | Stored as |
+| --- | --- |
+| Preferred name, pronouns, timezone, occupation, broad location | Pinned semantic facts |
+| Languages, response style/tone, preferred tools | Preferences |
+| Technical interests and active projects | Semantic facts |
+| Current goals | Prospective intentions |
+| Approval and never-remember rules | Policies |
+| A recurring workflow | Procedure |
+| Additional stable context | Semantic fact |
+
+The interactive flow asks 17 skippable questions, renders every proposed item, and defaults to cancellation. It never calls an extraction model. Credential-like answers are discarded without being copied into the preview or database. `--skip-sensitive` additionally excludes health, financial, identity, and precise-location entries.
+
+```console
+# Interactive interview; nothing is written until the final yes
+hermes consolidating_local onboard
+
+# File-driven workflow for review or team-assisted setup
+hermes consolidating_local onboard --template ~/hermes-onboarding.json
+# Edit the generated JSON, then preview without writing:
+hermes consolidating_local onboard --answers ~/hermes-onboarding.json --preview-only
+# Apply only after reviewing that preview:
+hermes consolidating_local onboard --answers ~/hermes-onboarding.json --yes
+
+# Exclude every answer classified as sensitive
+hermes consolidating_local onboard --skip-sensitive
+```
+
+The template is created with restrictive permissions where the platform supports them and refuses to overwrite an existing file. Inputs are bounded, unknown JSON keys fail validation, and identical reruns are true no-ops: they do not add duplicate facts, evidence, intentions, or history. Changed deterministic fields update or supersede the existing memory through the normal evidence/history machinery.
+
+All accepted onboarding entries carry `local_only` provenance. They remain visible through local FTS recall, but a hybrid result set containing them bypasses the remote embedding endpoint. Rebuilt topic summaries inherit the restriction.
+
+### Target the correct memory scope
+
+With the default `memory_scope: user`, local CLI memory and a Telegram user's memory are different encrypted databases. Apply the reviewed profile separately when it should be available in both places:
+
+```console
+# Local CLI scope
+hermes consolidating_local onboard --answers ~/hermes-onboarding.json --yes
+
+# The same Telegram user scope that Hermes derives at runtime
+hermes consolidating_local \
+  --scope-platform telegram \
+  --scope-user-id YOUR_TELEGRAM_USER_ID \
+  onboard --answers ~/hermes-onboarding.json --yes
+```
+
+The raw identity is used only to reproduce Hermes' SHA-256-derived scope path; it is not stored in the database filename. For `memory_scope: agent`, use `--scope-agent-identity` with the runtime platform and, when applicable, user ID. Omitting all scope options intentionally targets local/CLI memory. Scope options may be combined with `--db` when overriding the configured base path.
+
 ## Administration
 
 Native commands are available after Hermes discovers the plugin:
@@ -329,7 +478,16 @@ hermes consolidating_local retry-failed --confirm --limit 100
 hermes consolidating_local maintain
 ```
 
-For a user- or agent-scoped database, place `--db` before the subcommand:
+Root scope options work with every administration subcommand, not only onboarding:
+
+```console
+hermes consolidating_local \
+  --scope-platform telegram \
+  --scope-user-id YOUR_TELEGRAM_USER_ID \
+  doctor
+```
+
+When the exact database file is already known, place `--db` before the subcommand:
 
 ```console
 hermes consolidating_local --db /path/to/scoped.db doctor
@@ -353,17 +511,43 @@ python -m plugins.memory.consolidating_local.admin --db /path/to/database.db doc
 
 Version 3 removes `consolidator.py` and every rule-based extraction path. The obsolete `extractor_backend` setting is safely ignored if it remains in an old configuration. Existing durable facts are preserved; startup applies recorded additive migrations and rebuilds supporting indexes when necessary.
 
+Version 3.1 adds the onboarding module and scope-aware native CLI without replacing the memory schema or deleting existing records. Reinstall the plugin bundle so Hermes receives `onboarding.py`, the updated CLI registration, and the `local_only` hybrid privacy gate. Running onboarding against an existing profile is safe: unchanged entries are reported as `unchanged` and do not create duplicate evidence/history.
+
 ## Data locations
 
 | Data | Default location |
 | --- | --- |
 | Installed plugin | `$HERMES_HOME/plugins/consolidating_local/` |
 | Base/global database | `$HERMES_HOME/consolidating_memory.db` |
-| User/agent databases | Hashed, scope-isolated paths derived from `db_path` |
+| User/agent databases | `<db_stem>_scopes/<24-character SHA-256 prefix>.db` beside the configured base path |
 | Built-in snapshots | `$HERMES_HOME/memories/` when explicitly enabled and safe |
 | Markdown wiki | `$HERMES_HOME/consolidating_memory_wiki/` when enabled |
+| Recommended operational backups | A protected directory under `$HERMES_HOME/backups/` |
 
 The database is canonical. Snapshots and wiki pages are rebuildable views.
+
+## Ready-to-use checklist
+
+After installation or an upgrade, the following is a practical green-light check:
+
+```console
+# Provider discovery and selection
+hermes memory status
+
+# Local/CLI database
+hermes consolidating_local doctor
+
+# Optional gateway user database
+hermes consolidating_local \
+  --scope-platform telegram \
+  --scope-user-id YOUR_TELEGRAM_USER_ID \
+  doctor
+
+# Gateway runtime
+hermes gateway status
+```
+
+The provider should be selected and available; every `doctor` result should have `ok: true`, `integrity: ["ok"]`, matching FTS counts, and zero failed operations; the gateway should be active. For model-backed extraction or hybrid recall, also verify the configured `/v1/models` or `/v1/embeddings` endpoint from the Hermes host. Endpoint failure is non-destructive: FTS recall remains available and recoverable extraction work follows the durable retry policy.
 
 ## Troubleshooting
 
@@ -373,7 +557,10 @@ The database is canonical. Snapshots and wiki pages are rebuildable views.
 | Provider reports unavailable | If encryption is enabled, install `sqlcipher3` and set `CONSOLIDATING_MEMORY_DB_KEY` in the Hermes process environment. |
 | Explicit writes work but no automatic facts appear | Configure both `llm_model` and `llm_base_url`. This is intentional—there is no heuristic fallback. |
 | Semantically similar wording is missed | Default FTS is lexical. Configure `retrieval_backend: hybrid` plus both embedding settings. |
-| CLI shows an empty database | A scoped identity may use a derived path. Pass the exact scoped database with `--db`. |
+| CLI shows an empty database | Local CLI and gateway users are isolated by default. Use `--scope-platform` plus `--scope-user-id`, or pass the exact scoped database with `--db`. |
+| Onboarded profile appears in CLI but not Telegram | Apply the same reviewed answer file to the Telegram scope; onboarding does not copy personal profiles across users automatically. |
+| Hybrid recall does not call the embedding endpoint | Sensitive or `local_only` results intentionally disable remote reranking. Onboarding profile entries are always `local_only`. |
+| `file is not a database` after enabling encryption | A plaintext database was opened as SQLCipher or the key is wrong. Restore the correct key or migrate into a new encrypted `db_path`; do not convert in place. |
 | `doctor` reports failed work | Inspect the reported errors, correct the underlying cause, then use `retry-failed --confirm`. A task may have partially completed before failing. |
 | Sensitive memory is waiting | With `sensitive_memory: ask`, inspect and resolve the durable approval inbox using the `approval` tool action. |
 | A wiki export omits data | Sensitive material is redacted by default and export page limits may apply. |
@@ -386,6 +573,9 @@ The database is canonical. Snapshots and wiki pages are rebuildable views.
 - Extraction quality depends on the configured model. Evidence, correction, history, approval, and review mechanisms reduce risk but do not make model output infallible.
 - `global` scope intentionally shares memory. Do not use it for unrelated or untrusted users.
 - SQLite backups are complete and unredacted. Treat them as secrets even when portable exports are configured to redact sensitive records.
+- Onboarding's `local_only` flag protects against the plugin's remote embedding client. Memory recalled into Hermes context is still visible to Hermes' active chat model; choose that model and its data policy accordingly.
+- Keep database, LLM, and embedding keys out of `config.yaml`, source control, logs, screenshots, issues, and chat. Protect the environment file with mode `0600` and rotate any exposed key.
+- A raw gateway user ID is required to derive a user-scoped database from the CLI. It is hashed into the filename, but command history may still retain the raw argument; use an appropriately protected shell/session.
 
 ## Development
 

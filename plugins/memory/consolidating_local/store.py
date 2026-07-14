@@ -3133,6 +3133,8 @@ class MemoryStore:
                 if len(next_summary) > int(max_chars):
                     break
                 pieces.append(content)
+            topic_local_only = any(_as_bool(dict(fact.get("metadata") or {}).get("local_only")) for fact in top_facts)
+            topic_metadata_json = json.dumps({"local_only": True} if topic_local_only else {}, sort_keys=True)
             summary = " | ".join(pieces)[: int(max_chars)]
             category = str(top_facts[0]["category"]) if top_facts else "general"
             importance = max(int(fact["importance"]) for fact in top_facts) if top_facts else 5
@@ -3150,7 +3152,7 @@ class MemoryStore:
                 self._execute(
                     """
                     UPDATE topics
-                    SET title = ?, category = ?, summary = ?, metadata_json = '{}',
+                    SET title = ?, category = ?, summary = ?, metadata_json = ?,
                         sensitivity = ?, importance = ?, salience = ?, source_session_id = ?,
                         decay_half_life_days = ?, updated_at = ?
                     WHERE slug = ?
@@ -3159,6 +3161,7 @@ class MemoryStore:
                         title,
                         category,
                         summary,
+                        topic_metadata_json,
                         topic_sensitivity,
                         int(importance),
                         salience,
@@ -3177,13 +3180,14 @@ class MemoryStore:
                         slug, title, category, summary, metadata_json, sensitivity,
                         importance, salience, source_session_id, last_recalled_at,
                         decay_half_life_days, updated_at
-                    ) VALUES (?, ?, ?, ?, '{}', ?, ?, ?, ?, 0, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
                     """,
                     (
                         slug,
                         title,
                         category,
                         summary,
+                        topic_metadata_json,
                         topic_sensitivity,
                         int(importance),
                         salience,
@@ -3239,7 +3243,8 @@ class MemoryStore:
                 """
                 SELECT id, content, category, topic, importance, confidence, salience, belief_score,
                        observation_count, valid_from, valid_until, sensitivity, memory_class, pinned,
-                       updated_at, subject_key, value_key, polarity, exclusive, source_session_id
+                       updated_at, subject_key, value_key, polarity, exclusive, source_session_id,
+                       metadata_json
                 FROM facts
                 WHERE active = 1
                   AND (valid_from=0 OR valid_from <= memory_now())
@@ -3252,7 +3257,7 @@ class MemoryStore:
             "topics": self._fetchall(
                 """
                 SELECT id, slug, title, summary, category, sensitivity,
-                       importance, salience, updated_at, source_session_id
+                       importance, salience, updated_at, source_session_id, metadata_json
                 FROM topics
                 ORDER BY updated_at DESC
                 LIMIT ?
@@ -3290,7 +3295,8 @@ class MemoryStore:
             ),
             "preferences": self._fetchall(
                 """
-                SELECT id, preference_key, label, value, content, sensitivity, importance, salience, updated_at
+                SELECT id, preference_key, label, value, content, sensitivity, importance, salience,
+                       updated_at, metadata_json
                 FROM memory_preferences
                 WHERE active = 1
                 ORDER BY updated_at DESC
@@ -3300,7 +3306,8 @@ class MemoryStore:
             ),
             "policies": self._fetchall(
                 """
-                SELECT id, policy_key, label, content, sensitivity, importance, salience, updated_at
+                SELECT id, policy_key, label, content, sensitivity, importance, salience, updated_at,
+                       metadata_json
                 FROM memory_policies
                 WHERE active = 1
                 ORDER BY updated_at DESC
@@ -3563,7 +3570,7 @@ class MemoryStore:
                 return self._fetchall(
                     """
                     SELECT t.id, t.slug, t.title, t.summary, t.category, t.sensitivity,
-                           t.importance, t.salience, t.updated_at, t.source_session_id
+                           t.importance, t.salience, t.updated_at, t.source_session_id, t.metadata_json
                     FROM topics_fts idx
                     JOIN topics t ON t.id = idx.topic_id
                     WHERE topics_fts MATCH ?
@@ -3578,7 +3585,7 @@ class MemoryStore:
         return self._fetchall(
             """
             SELECT id, slug, title, summary, category, sensitivity, importance,
-                   salience, updated_at, source_session_id
+                   salience, updated_at, source_session_id, metadata_json
             FROM topics
             WHERE title LIKE ? OR summary LIKE ? OR slug LIKE ?
             ORDER BY salience DESC, importance DESC, updated_at DESC
@@ -3685,7 +3692,8 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT p.id, p.preference_key, p.label, p.value, p.content, p.sensitivity, p.source_session_id, p.importance, p.salience, p.updated_at
+                    SELECT p.id, p.preference_key, p.label, p.value, p.content, p.sensitivity,
+                           p.source_session_id, p.importance, p.salience, p.updated_at, p.metadata_json
                     FROM memory_preferences_fts idx
                     JOIN memory_preferences p ON p.id = idx.preference_id
                     WHERE memory_preferences_fts MATCH ?
@@ -3701,7 +3709,8 @@ class MemoryStore:
         active_sql = "" if include_inactive else "AND active = 1"
         return self._fetchall(
             f"""
-            SELECT id, preference_key, label, value, content, sensitivity, source_session_id, importance, salience, updated_at
+            SELECT id, preference_key, label, value, content, sensitivity, source_session_id,
+                   importance, salience, updated_at, metadata_json
             FROM memory_preferences
             WHERE (preference_key LIKE ? OR label LIKE ? OR value LIKE ? OR content LIKE ?)
               {active_sql}
@@ -3717,7 +3726,8 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT p.id, p.policy_key, p.label, p.content, p.sensitivity, p.source_session_id, p.importance, p.salience, p.updated_at
+                    SELECT p.id, p.policy_key, p.label, p.content, p.sensitivity, p.source_session_id,
+                           p.importance, p.salience, p.updated_at, p.metadata_json
                     FROM memory_policies_fts idx
                     JOIN memory_policies p ON p.id = idx.policy_id
                     WHERE memory_policies_fts MATCH ?
@@ -3733,7 +3743,8 @@ class MemoryStore:
         active_sql = "" if include_inactive else "AND active = 1"
         return self._fetchall(
             f"""
-            SELECT id, policy_key, label, content, sensitivity, source_session_id, importance, salience, updated_at
+            SELECT id, policy_key, label, content, sensitivity, source_session_id, importance,
+                   salience, updated_at, metadata_json
             FROM memory_policies
             WHERE (policy_key LIKE ? OR label LIKE ? OR content LIKE ?)
               {active_sql}

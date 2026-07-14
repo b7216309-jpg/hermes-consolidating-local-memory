@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.1.0 — 2026-07-14
+
+- Added `hermes consolidating_local onboard`, a guided user-profile interview with a full preview and explicit approval before any write.
+- Mapped onboarding answers into existing semantic facts, preferences, policies, procedures, and prospective intentions with deterministic keys and idempotent reruns.
+- Added JSON answer templates, non-interactive previews, confirmed application, strict input bounds, and a `--skip-sensitive` mode.
+- Added explicit platform/user/agent scope targeting that derives exactly the same privacy-preserving database path as the live provider.
+- Rejected credential-like onboarding answers without echoing their content into the plan or database.
+- Added `local_only` provenance so approved profile memories remain locally searchable without being sent to remote embedding endpoints; rebuilt topic summaries inherit the restriction.
+- Kept never-remember policies visible even when they name excluded sensitive categories, and stripped terminal BOM markers from piped first answers.
+- Added regression coverage for preview, cancellation, validation, credential rejection, atomic/idempotent writes, memory classification, exact scope derivation, topic propagation, and the live hybrid privacy gate.
+
 ## 3.0.0 — 2026-07-14
 
 - Removed the rule-based fact extractor, hybrid extractor mode, candidate seed facts, content guessing, and rule-based canonical rewriting.

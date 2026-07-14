@@ -1,4 +1,4 @@
-# consolidating_local 3.0
+# consolidating_local 3.1
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -70,14 +70,21 @@ Credentials are rejected even when other sensitive memories use the approval inb
 
 Configured LLM and embedding endpoints never receive text classified as sensitive by default. `allow_sensitive_model_processing: true` is a separate explicit opt-in; credentials still require `allow_credential_memory: true` as well. When model processing is blocked, the provider still captures the redacted episode, accepts explicit memory-tool writes, and uses local FTS recall.
 
+Onboarding adds a second remote-processing boundary: every accepted profile item has `metadata.local_only=true`. The item remains normally visible to local FTS and Hermes context, but any hybrid candidate set containing it skips the remote embedding client. This does not hide recalled context from Hermes' active chat model.
+
 For offline operations, stop Hermes and run:
 
 ```console
+hermes consolidating_local onboard
 hermes consolidating_local doctor
 hermes consolidating_local backup /path/to/backup.db
 hermes consolidating_local export /path/to/memory.json
 hermes consolidating_local retry-failed --confirm
 ```
+
+`onboard` performs a guided 17-question interview, renders the complete proposed profile, and requires explicit approval before writing. It classifies answers as facts, preferences, policies, procedures, or intentions. Credential-like answers are discarded. Identical reruns are no-ops and do not duplicate evidence/history. Use `onboard --template PATH` for a protected blank JSON answer file, `--answers PATH --preview-only` to inspect it, and `--answers PATH --yes` only after review. Add `--skip-sensitive` to omit health, financial, identity, and precise-location entries.
+
+For `memory_scope: user`, pass `--scope-platform PLATFORM --scope-user-id ID` before the subcommand to derive the same hashed database path as a gateway conversation. Omit them for local/CLI memory. Agent scope also accepts `--scope-agent-identity`. Scope flags work with onboarding, doctor, backup, restore, export, import, retry, and maintenance. Raw identity values are used only for hashing and are not placed in database filenames.
 
 Durable work uses exponential backoff and moves to a visible dead-letter queue after `queue_max_attempts`. `doctor` reports this as degraded; inspect its error details before using the explicit retry command because a failed task may already have completed part of its work. Portable JSON imports reconstruct durable memory state and relationships. SQLite backups remain complete and unredacted.
 
