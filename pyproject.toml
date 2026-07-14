@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-consolidating-local-memory"
+version = "3.0.0"
+description = "A durable local SQLite memory provider for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = ["PyYAML>=6.0"]
+authors = [{ name = "b7216309-jpg" }]
+keywords = ["hermes-agent", "memory", "sqlite", "agent", "local-first"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/b7216309-jpg/hermes-consolidating-local-memory"
+Issues = "https://github.com/b7216309-jpg/hermes-consolidating-local-memory/issues"
+
+[tool.setuptools.packages.find]
+where = ["plugins/memory"]
+include = ["consolidating_local*"]
+
+[tool.setuptools.package-data]
+consolidating_local = ["plugin.yaml", "README.md"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.15"]
+encryption = ["sqlcipher3>=0.6.2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

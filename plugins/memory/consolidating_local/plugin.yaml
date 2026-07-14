@@ -1,9 +1,10 @@
 name: consolidating_local
-version: 0.3.0
-description: "Local SQLite memory provider with layered sessions, compiled wiki export, provenance, and background consolidation."
+version: 3.0.0
+description: "Isolated, evidence-backed local memory with temporal, working, procedural, prospective, and autobiographical systems."
 hooks:
   - on_turn_start
   - on_session_end
+  - on_session_switch
   - on_pre_compress
   - on_memory_write
   - on_delegation

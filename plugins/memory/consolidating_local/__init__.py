@@ -1,35 +1,61 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import math
+import os
 import queue
 import re
+import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
 try:
     from agent.memory_provider import MemoryProvider
-except ModuleNotFoundError:
+except ModuleNotFoundError as exc:
+    if exc.name not in {"agent", "agent.memory_provider"}:
+        raise
+
     class MemoryProvider:  # type: ignore[override]
         pass
 
-from .consolidator import (
-    build_candidate,
+
+from .consolidation import (
     build_consolidation_plan,
-    extract_candidate_facts_from_messages,
-    extract_candidate_facts_from_turn,
-    infer_category,
-    infer_topic,
+    message_content_text,
     normalize_candidate_fact,
     run_consolidation,
 )
-from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank, load_hermes_model_defaults
-from .store import MemoryStore, normalize_text, normalize_whitespace, pretty_topic, slugify
+from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank
+from .store import (
+    MemoryStore,
+    _looks_like_credential,
+    _looks_sensitive_for_export,
+    fingerprint_text,
+    normalize_text,
+    normalize_whitespace,
+    pretty_topic,
+    slugify,
+)
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
+__version__ = "3.0.0"
+
+
+def _flag(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().casefold() in {"1", "true", "yes", "on"}
+
 
 TOOL_SCHEMA = {
     "name": "consolidating_memory",
@@ -51,13 +77,47 @@ TOOL_SCHEMA = {
         "- review: inspect and advance due spaced-review items.\n"
         "- decay: apply salience decay now.\n"
         "- export: write the compiled markdown wiki mirror."
+        "\n- explain: show a fact's evidence, provenance, and revision history."
+        "\n- working/procedure/intention/timeline: manage working, procedural, prospective, and autobiographical memory."
+        "\n- approval: inspect or resolve sensitive-memory consent requests."
+        "\n- associate/merge/split/pin: curate links and fact structure."
+        "\n- doctor/maintain/backup/export_json: operate and repair the store."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "remember", "forget", "recent", "contradictions", "status", "consolidate", "journal", "distill", "history", "policy", "review", "decay", "export"],
+                "enum": [
+                    "search",
+                    "remember",
+                    "forget",
+                    "recent",
+                    "contradictions",
+                    "status",
+                    "consolidate",
+                    "journal",
+                    "distill",
+                    "history",
+                    "policy",
+                    "review",
+                    "decay",
+                    "export",
+                    "explain",
+                    "working",
+                    "procedure",
+                    "intention",
+                    "timeline",
+                    "approval",
+                    "associate",
+                    "merge",
+                    "split",
+                    "pin",
+                    "doctor",
+                    "maintain",
+                    "backup",
+                    "export_json",
+                ],
             },
             "query": {"type": "string", "description": "Search or forget query."},
             "scope": {
@@ -75,13 +135,40 @@ TOOL_SCHEMA = {
             "importance": {"type": "integer", "description": "Importance score from 1 to 10."},
             "fact_id": {"type": "integer", "description": "Specific fact id to forget."},
             "memory_type": {"type": "string", "description": "fact, preference, journal, summary, or policy."},
-            "session_id": {"type": "string", "description": "Session identifier for journals, distillation, and recall links."},
+            "session_id": {
+                "type": "string",
+                "description": "Session identifier for journals, distillation, and recall links.",
+            },
             "subject_key": {"type": "string", "description": "Exclusive subject key or history filter."},
             "since_days": {"type": "integer", "description": "History or contradiction age filter in days."},
             "include_inactive": {"type": "boolean", "description": "Whether to include inactive memory items."},
             "key": {"type": "string", "description": "Preference or policy key."},
             "value": {"type": "string", "description": "Preference value."},
-            "label": {"type": "string", "description": "Optional label for journals, summaries, preferences, or policies."},
+            "label": {
+                "type": "string",
+                "description": "Optional label for journals, summaries, preferences, or policies.",
+            },
+            "dry_run": {"type": "boolean", "description": "Preview a destructive or expensive action."},
+            "confirm": {"type": "boolean", "description": "Confirm an exact destructive operation."},
+            "approved": {"type": "boolean", "description": "Explicit consent for a sensitive memory."},
+            "explicit_correction": {
+                "type": "boolean",
+                "description": "Mark a direct user correction as strong evidence.",
+            },
+            "pinned": {"type": "boolean", "description": "Protect a fact from decay and budget pruning."},
+            "status": {"type": "string", "description": "Status filter or target status."},
+            "due_at": {"type": "number", "description": "Unix timestamp for a prospective memory."},
+            "ttl_seconds": {"type": "number", "description": "Working-memory lifetime."},
+            "steps": {"type": "array", "items": {"type": "string"}},
+            "prerequisites": {"type": "array", "items": {"type": "string"}},
+            "ids": {"type": "array", "items": {"type": "integer"}},
+            "contents": {"type": "array", "items": {"type": "string"}},
+            "left_kind": {"type": "string"},
+            "left_id": {"type": "string"},
+            "right_kind": {"type": "string"},
+            "right_id": {"type": "string"},
+            "relation": {"type": "string"},
+            "destination": {"type": "string", "description": "Backup or JSON export destination."},
         },
         "required": ["action"],
     },
@@ -127,12 +214,11 @@ def _load_plugin_config() -> dict:
 
 class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def __init__(self, config: dict | None = None):
-        self._config = config or _load_plugin_config()
+        self._config = dict(config) if config is not None else _load_plugin_config()
         self._store: MemoryStore | None = None
         self._llm: OpenAICompatibleLLM | None = None
         self._embedder: OpenAICompatibleEmbeddings | None = None
         self._hermes_home = Path("~/.hermes").expanduser()
-        self._llm_backend = "heuristic"
         self._retrieval_backend = "fts"
         self._session_id = ""
         self._task_queue: queue.Queue[tuple[str, Dict[str, Any]] | None] = queue.Queue()
@@ -141,22 +227,135 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._prefetch_cache: Dict[str, Dict[str, Any]] = {}
         self._prefetch_lock = threading.Lock()
         self._consolidation_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._consolidation_requested = False
+        self._accepting_tasks = False
+        self._draining = False
+        self._write_enabled = True
         self._last_scan_at = 0.0
+        self._scope_id = "legacy"
+        self._owner_id = f"{os.getpid()}-{uuid.uuid4().hex}"
+        self._queue_metrics = {"enqueued": 0, "dropped_prefetch": 0, "spooled": 0, "failed": 0}
 
     @property
     def name(self) -> str:
         return "consolidating_local"
 
     def is_available(self) -> bool:
+        if self._cfg_bool("database_encryption", False):
+            if not env_or_blank("CONSOLIDATING_MEMORY_DB_KEY"):
+                return False
+            try:
+                from sqlcipher3 import dbapi2 as _sqlcipher  # noqa: F401
+            except ImportError:
+                return False
         return True
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
+        # The provider is usable without configuration. Keeping Hermes' setup
+        # wizard empty avoids prompting for every optional tuning knob.
+        return []
+
+    def get_advanced_config_schema(self) -> List[Dict[str, Any]]:
+        """Machine-readable reference for optional config.yaml settings."""
         return [
             {
                 "key": "db_path",
                 "description": "SQLite database path",
                 "default": "$HERMES_HOME/consolidating_memory.db",
+            },
+            {
+                "key": "memory_scope",
+                "description": "Isolation boundary for gateway users and agents",
+                "default": "user",
+                "choices": ["user", "agent", "global"],
+            },
+            {
+                "key": "sensitive_memory",
+                "description": "Admission policy for health, financial, identity, location, or credential memories",
+                "default": "ask",
+                "choices": ["deny", "ask", "allow"],
+            },
+            {
+                "key": "allow_credential_memory",
+                "description": "Permit credentials to follow sensitive_memory instead of always denying them",
+                "default": "false",
+            },
+            {
+                "key": "allow_sensitive_model_processing",
+                "description": "Permit configured LLM and embedding endpoints to receive sensitive memory text",
+                "default": "false",
+            },
+            {
+                "key": "conflict_policy",
+                "description": "Choose evidence-weighted or last-write-wins contradiction resolution",
+                "default": "evidence",
+                "choices": ["evidence", "newest"],
+            },
+            {
+                "key": "never_remember_categories",
+                "description": "Comma-separated categories rejected before storage",
+                "default": "",
+            },
+            {
+                "key": "queue_max_size",
+                "description": "Maximum in-memory background tasks before durable spooling",
+                "default": "256",
+            },
+            {
+                "key": "queue_max_attempts",
+                "description": "Attempts before a poison durable task moves to the recoverable dead-letter queue",
+                "default": "5",
+            },
+            {
+                "key": "shutdown_timeout_seconds",
+                "description": "Maximum graceful worker-drain wait before remaining queued work stays durable",
+                "default": "10",
+            },
+            {
+                "key": "max_database_mb",
+                "description": "Soft database size budget used by maintenance",
+                "default": "512",
+            },
+            {
+                "key": "trace_retention_days",
+                "description": "Retention for inactive turn traces",
+                "default": "30",
+            },
+            {
+                "key": "history_retention_days",
+                "description": "Retention for append-only operational history",
+                "default": "180",
+            },
+            {
+                "key": "sensitive_retention_days",
+                "description": "Retention for inactive sensitive facts",
+                "default": "30",
+            },
+            {
+                "key": "consolidation_max_batches",
+                "description": "Maximum immediate passes while a backlog remains",
+                "default": "4",
+            },
+            {
+                "key": "consolidation_batch_size",
+                "description": "Episode buffers processed per atomic consolidation pass",
+                "default": "250",
+            },
+            {
+                "key": "working_memory_capacity",
+                "description": "Maximum working-memory slots per session",
+                "default": "12",
+            },
+            {
+                "key": "database_encryption",
+                "description": "Require SQLCipher using CONSOLIDATING_MEMORY_DB_KEY",
+                "default": "false",
+            },
+            {
+                "key": "export_redact_sensitive",
+                "description": "Omit sensitive memories from portable and wiki exports",
+                "default": "true",
             },
             {
                 "key": "min_hours",
@@ -269,25 +468,24 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "default": "100",
             },
             {
-                "key": "extractor_backend",
-                "description": "Fact extraction backend",
-                "default": "hybrid",
-                "choices": ["heuristic", "hybrid", "llm"],
-            },
-            {
                 "key": "llm_model",
-                "description": "OpenAI-compatible local model name (blank = Hermes default model)",
+                "description": "OpenAI-compatible model for automatic fact extraction (requires llm_base_url)",
                 "default": "",
             },
             {
                 "key": "llm_base_url",
-                "description": "OpenAI-compatible base URL (blank = Hermes default base_url)",
+                "description": "Opt-in OpenAI-compatible base URL (requires llm_model)",
                 "default": "",
             },
             {
                 "key": "llm_timeout_seconds",
                 "description": "Timeout for local LLM extraction calls",
                 "default": "45",
+            },
+            {
+                "key": "llm_failure_cooldown_seconds",
+                "description": "Base cooldown after three consecutive model endpoint failures",
+                "default": "120",
             },
             {
                 "key": "llm_max_input_chars",
@@ -302,12 +500,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             },
             {
                 "key": "embedding_model",
-                "description": "OpenAI-compatible embedding model name (blank = use llm model/default model)",
+                "description": "Opt-in OpenAI-compatible embedding model name",
                 "default": "",
             },
             {
                 "key": "embedding_base_url",
-                "description": "OpenAI-compatible embedding base URL (blank = use llm base_url/default base_url)",
+                "description": "Opt-in embedding base URL (requires embedding_model)",
                 "default": "",
             },
             {
@@ -320,10 +518,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "description": "How many text candidates hybrid retrieval reranks",
                 "default": "16",
             },
+            {
+                "key": "prefetch_cache_ttl_seconds",
+                "description": "Maximum age of a synchronous recall cache entry",
+                "default": "120",
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         config_path = Path(hermes_home) / "config.yaml"
+        temp_path: Path | None = None
         try:
             import yaml
 
@@ -331,46 +535,129 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             if config_path.exists():
                 with open(config_path, encoding="utf-8") as handle:
                     existing = yaml.safe_load(handle) or {}
-            existing.setdefault("plugins", {})
+            if not isinstance(existing, dict):
+                existing = {}
+            if not isinstance(existing.get("plugins"), dict):
+                existing["plugins"] = {}
             existing["plugins"][PLUGIN_CONFIG_KEY] = values
-            with open(config_path, "w", encoding="utf-8") as handle:
-                yaml.dump(existing, handle, default_flow_style=False, sort_keys=False)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            rendered = yaml.safe_dump(existing, default_flow_style=False, sort_keys=False, allow_unicode=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                newline="",
+                dir=config_path.parent,
+                prefix=".config.yaml.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(rendered)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            os.replace(temp_path, config_path)
         except Exception as exc:
             logger.warning("Failed to save config for %s: %s", self.name, exc)
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink()
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        if self._store is not None or (self._worker and self._worker.is_alive()):
+            self.shutdown()
+        if self._worker and self._worker.is_alive():
+            raise RuntimeError("Previous memory worker did not stop; refusing unsafe reinitialization")
         hermes_home = Path(str(kwargs.get("hermes_home") or Path("~/.hermes").expanduser()))
         self._hermes_home = hermes_home
+        agent_context = str(kwargs.get("agent_context") or "primary").strip().lower()
+        platform = str(kwargs.get("platform") or "cli").strip().lower()
+        self._write_enabled = agent_context == "primary" and platform != "cron"
         db_path = str(self._config.get("db_path", "$HERMES_HOME/consolidating_memory.db"))
         db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
-        defaults = load_hermes_model_defaults(hermes_home)
-        llm_model = str(self._config.get("llm_model") or defaults.get("model") or "").strip()
-        llm_base_url = str(self._config.get("llm_base_url") or defaults.get("base_url") or "").strip()
+        base_db_path = Path(db_path).expanduser()
+        scope_mode = str(self._config.get("memory_scope") or "user").strip().lower()
+        if scope_mode not in {"user", "agent", "global"}:
+            scope_mode = "user"
+        user_id = normalize_whitespace(
+            str(
+                kwargs.get("user_id")
+                or kwargs.get("user_id_alt")
+                or kwargs.get("platform_user_id")
+                or kwargs.get("owner_id")
+                or kwargs.get("chat_id")
+                or ""
+            )
+        )
+        agent_identity = normalize_whitespace(
+            str(kwargs.get("agent_identity") or kwargs.get("agent_name") or kwargs.get("agent_workspace") or "")
+        )
+        scope_parts: List[str] = []
+        local_platform = platform in {"cli", "cron", "local", "terminal", "shell"}
+        if scope_mode == "user" and not user_id and not local_platform:
+            raise RuntimeError(
+                f"memory_scope=user requires user_id for platform {platform!r}; refusing a shared database"
+            )
+        if scope_mode == "agent" and not (user_id or agent_identity) and not local_platform:
+            raise RuntimeError(f"memory_scope=agent requires an agent or user identity for platform {platform!r}")
+        if scope_mode == "user" and user_id:
+            scope_parts = ["user", platform, user_id]
+        elif scope_mode == "agent" and (user_id or agent_identity):
+            scope_parts = ["agent", platform, user_id or "anonymous", agent_identity or "default"]
+        if scope_parts:
+            raw_scope = "\x1f".join(scope_parts)
+            digest = hashlib.sha256(raw_scope.encode("utf-8")).hexdigest()[:24]
+            self._scope_id = f"{scope_mode}:{digest}"
+            scopes_dir = base_db_path.parent / f"{base_db_path.stem}_scopes"
+            db_path = str(scopes_dir / f"{digest}{base_db_path.suffix or '.db'}")
+        else:
+            self._scope_id = "global" if scope_mode == "global" else "legacy-local"
+        llm_model = str(self._config.get("llm_model") or "").strip()
+        llm_base_url = str(self._config.get("llm_base_url") or "").strip()
         llm_api_key = env_or_blank("CONSOLIDATING_MEMORY_LLM_API_KEY")
-        embedding_model = str(self._config.get("embedding_model") or llm_model or defaults.get("model") or "").strip()
-        embedding_base_url = str(self._config.get("embedding_base_url") or llm_base_url or defaults.get("base_url") or "").strip()
+        embedding_model = str(self._config.get("embedding_model") or "").strip()
+        embedding_base_url = str(self._config.get("embedding_base_url") or "").strip()
         embedding_api_key = env_or_blank("CONSOLIDATING_MEMORY_EMBEDDING_API_KEY") or llm_api_key
         self._llm = OpenAICompatibleLLM(
             model=llm_model,
             base_url=llm_base_url,
             api_key=llm_api_key,
-            timeout_seconds=int(self._config.get("llm_timeout_seconds", 120)),
+            timeout_seconds=self._cfg_int("llm_timeout_seconds", 45, 1, 300),
+            failure_cooldown_seconds=self._cfg_int("llm_failure_cooldown_seconds", 120, 1, 86400),
         )
-        self._llm_backend = str(self._config.get("extractor_backend", "hybrid") or "hybrid").strip().lower()
         self._embedder = OpenAICompatibleEmbeddings(
             model=embedding_model,
             base_url=embedding_base_url,
             api_key=embedding_api_key,
-            timeout_seconds=int(self._config.get("embedding_timeout_seconds", 20)),
+            timeout_seconds=self._cfg_int("embedding_timeout_seconds", 20, 1, 300),
+            failure_cooldown_seconds=self._cfg_int("llm_failure_cooldown_seconds", 120, 1, 86400),
         )
         self._retrieval_backend = str(self._config.get("retrieval_backend", "fts") or "fts").strip().lower()
+        if self._retrieval_backend not in {"fts", "hybrid"}:
+            self._retrieval_backend = "fts"
         self._session_id = session_id
-        self._store = MemoryStore(db_path=db_path)
-        self._store.ensure_memory_session(session_id, label=session_id)
-        self._sync_builtin_snapshot(reason="initialize")
+        encryption_key = ""
+        if self._cfg_bool("database_encryption", False):
+            encryption_key = env_or_blank("CONSOLIDATING_MEMORY_DB_KEY")
+            if not encryption_key:
+                raise RuntimeError("database_encryption is enabled but CONSOLIDATING_MEMORY_DB_KEY is not set")
+        self._store = MemoryStore(
+            db_path=db_path,
+            encryption_key=encryption_key,
+            conflict_policy=str(self._config.get("conflict_policy") or "evidence").strip().lower(),
+        )
+        self._store.set_state("memory_scope", self._scope_id)
+        if self._write_enabled:
+            self._store.ensure_memory_session(session_id, label=session_id, status="open")
+            self._sync_builtin_snapshot(reason="initialize")
+        self._task_queue = queue.Queue(maxsize=self._cfg()["queue_max_size"])
+        self._queue_metrics = {"enqueued": 0, "dropped_prefetch": 0, "spooled": 0, "failed": 0}
         self._stop_event.clear()
+        self._draining = False
+        self._accepting_tasks = True
         self._worker = threading.Thread(target=self._worker_loop, name="consolidating-memory", daemon=True)
         self._worker.start()
+        if self._write_enabled:
+            self._enqueue("maintenance")
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -381,11 +668,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         last_text = "never"
         if last:
             last_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(last["finished_at"])))
-        backend_desc = self._llm_backend
-        if self._llm and self._llm.enabled:
-            backend_desc += f" via {self._llm.model}"
-        elif self._llm_backend != "heuristic":
-            backend_desc += " (LLM unavailable, using fallback)"
+        backend_desc = (
+            f"LLM via {self._llm.model}" if self._llm and self._llm.enabled else "disabled (tool writes only)"
+        )
         retrieval_desc = self._retrieval_backend
         if self._retrieval_backend == "hybrid" and (not self._embedder or not self._embedder.supports_embeddings):
             retrieval_desc += " (embeddings unavailable, using FTS fallback)"
@@ -414,13 +699,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return ""
         with self._prefetch_lock:
             cached = self._prefetch_cache.get(key)
-            if cached and cached.get("query") == clean:
+            cache_age = time.time() - float(cached.get("created_at") or 0.0) if cached else float("inf")
+            if cached and cached.get("query") == clean and cache_age <= self._cfg()["prefetch_cache_ttl_seconds"]:
                 return str(cached.get("rendered") or "")
         cues = self._build_retrieval_cues(query=clean, args={}, session_id=key)
-        results = self._search_memory(clean, scope="all", limit=self._cfg()["prefetch_limit"], session_id=key, cues=cues)
+        results = self._search_memory(
+            clean,
+            scope="all",
+            limit=self._cfg()["prefetch_limit"],
+            session_id=key,
+            cues=cues,
+            touch_recall=self._write_enabled,
+            allow_embeddings=False,
+        )
         rendered = self._render_prefetch(clean, results, cues=cues)
-        with self._prefetch_lock:
-            self._prefetch_cache[key] = {"query": clean, "rendered": rendered, "created_at": time.time()}
+        self._cache_prefetch(key, clean, rendered)
         return rendered
 
     def get_context(self, *, session_id: str = "", query: str = "") -> str:
@@ -438,22 +731,35 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return
         self._enqueue("prefetch", query=clean, session_id=session_id or self._session_id)
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        if not self._write_enabled:
+            return
         self._enqueue(
             "sync_turn",
             session_id=session_id or self._session_id,
             user_content=user_content or "",
             assistant_content=assistant_content or "",
+            messages=list(messages or []),
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        if not self._store:
+        if not self._store or not self._write_enabled:
             return
         cooldown = float(self._cfg()["scan_cooldown_seconds"])
         now = time.time()
         if now - self._last_scan_at < cooldown:
             return
         self._last_scan_at = now
+        last_maintenance = float(self._store.get_state("last_maintenance_at", "0") or 0)
+        if now - last_maintenance >= 86400:
+            self._enqueue("maintenance")
         plan = build_consolidation_plan(
             self._store,
             min_hours=self._cfg()["min_hours"],
@@ -463,18 +769,17 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             self._request_consolidation(reason="turn_gate")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._store:
+        if not self._store or not self._write_enabled:
             return
         self._enqueue("extract_messages", session_id=self._session_id, messages=messages or [], source="session_end")
         self._request_consolidation(reason="session_end")
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        if not self._store:
+        if not self._store or not self._write_enabled:
             return ""
-        candidates = extract_candidate_facts_from_messages(messages or [])
-        if self._llm_backend != "heuristic":
-            candidates = self._extract_messages_facts(messages or [])
+        candidates = self._extract_messages_facts(messages or [])
         inserted = 0
+        preserved_candidates: List[Dict[str, Any]] = []
         source_refs: List[Dict[str, Any]] = []
         for candidate in candidates[:6]:
             result = self._store_candidate(
@@ -483,8 +788,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 session_id=self._session_id,
             )
             fact_id = dict(result.get("fact") or {}).get("id")
-            if fact_id is not None and len(source_refs) < 3:
-                source_refs.append({"kind": "fact", "id": fact_id})
+            if fact_id is not None:
+                preserved_candidates.append(candidate)
+                if len(source_refs) < 3:
+                    source_refs.append({"kind": "fact", "id": fact_id})
             if result["action"] == "inserted":
                 inserted += 1
         if inserted > 0:
@@ -492,11 +799,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 max_facts=self._cfg()["max_topic_facts"],
                 max_chars=self._cfg()["topic_summary_chars"],
             )
-        if not candidates:
+        if not preserved_candidates:
             return ""
-        summary = "; ".join(str(item["content"]) for item in candidates[:3])
+        summary = "; ".join(str(item["content"]) for item in preserved_candidates[:3])
         if self._store:
             artifacts = self._store.get_session_artifacts(self._session_id, limit=8)
+            summary_sensitivity, _ = self._classify_sensitivity(summary)
             self._store.upsert_summary(
                 label="Pre-compression Handoff",
                 summary=summary[: self._cfg()["session_summary_chars"]],
@@ -508,6 +816,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 salience=0.72,
                 source_refs=source_refs or self._collect_summary_refs(artifacts, per_section=2),
                 reason="precompress",
+                sensitivity=summary_sensitivity,
             )
         return (
             "Memory provider preserved pre-compression signals. Preserve these points in the summary: "
@@ -515,10 +824,58 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             + ("" if inserted == 0 else f" ({inserted} new durable facts stored)")
         )
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        self._enqueue("mirror_memory", action=action, target=target, content=content)
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        if not self._write_enabled:
+            return
+        provenance = dict(metadata or {})
+        execution_context = str(provenance.get("execution_context") or "").strip().lower()
+        if execution_context in {"cron", "flush", "subagent"}:
+            return
+        self._enqueue(
+            "mirror_memory",
+            action=action,
+            target=target,
+            content=content,
+            metadata=provenance,
+        )
+
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **kwargs,
+    ) -> None:
+        clean_id = normalize_whitespace(new_session_id)
+        if not clean_id:
+            return
+        previous = self._session_id
+        self._session_id = clean_id
+        self._invalidate_prefetch_cache(previous, clean_id)
+        if not self._store or not self._write_enabled:
+            return
+        self._store.ensure_memory_session(clean_id, label=clean_id, status="open")
+        parent = normalize_whitespace(parent_session_id or previous)
+        if parent and parent != clean_id and not reset:
+            self._store.add_link(
+                "session",
+                clean_id,
+                "session",
+                parent,
+                "rewound_from" if rewound else "continues_from",
+            )
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        if not self._write_enabled:
+            return
         content = f"Delegated task completed. Task: {normalize_whitespace(task)} Result: {normalize_whitespace(result)}"
         self._enqueue(
             "remember_fact",
@@ -534,6 +891,29 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [TOOL_SCHEMA]
 
+    def backup_paths(self) -> List[str]:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = Path(get_hermes_home()).expanduser().resolve()
+        except Exception:
+            hermes_home = Path("~/.hermes").expanduser().resolve()
+        paths: List[str] = []
+        configured_db = str(self._config.get("db_path") or "$HERMES_HOME/consolidating_memory.db")
+        configured = [configured_db]
+        if str(self._config.get("memory_scope") or "user").strip().lower() in {"user", "agent"}:
+            base = Path(configured_db.replace("$HERMES_HOME", str(hermes_home))).expanduser()
+            configured.append(str(base.parent / f"{base.stem}_scopes"))
+        if self._store:
+            configured.append(self._store.db_path)
+        if self._cfg_bool("wiki_export_enabled", False):
+            configured.append(str(self._config.get("wiki_export_dir") or "$HERMES_HOME/consolidating_memory_wiki"))
+        for raw in configured:
+            path = Path(raw.replace("$HERMES_HOME", str(hermes_home))).expanduser().resolve()
+            if path != hermes_home and hermes_home not in path.parents and str(path) not in paths:
+                paths.append(str(path))
+        return paths
+
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if tool_name != TOOL_SCHEMA["name"]:
             raise NotImplementedError(f"{self.name} does not handle tool {tool_name}")
@@ -541,11 +921,47 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return json.dumps({"success": False, "error": "Provider not initialized."})
 
         action = str(args.get("action") or "").strip()
-        limit = max(1, min(int(args.get("limit") or 8), 50))
+        try:
+            limit = max(1, min(int(args.get("limit") or 8), 50))
+        except (TypeError, ValueError, OverflowError):
+            limit = 8
         session_id = str(args.get("session_id") or self._session_id).strip()
-        include_inactive = bool(args.get("include_inactive") or False)
+        include_inactive = _flag(args.get("include_inactive"))
         valid_scopes = {"all", "facts", "topics", "episodes", "summaries", "journals", "preferences", "policies"}
         valid_memory_types = {"fact", "summary", "journal", "preference", "policy"}
+        mutating = action in {
+            "remember",
+            "journal",
+            "distill",
+            "review",
+            "decay",
+            "export",
+            "associate",
+            "merge",
+            "split",
+            "pin",
+            "maintain",
+            "backup",
+            "export_json",
+        }
+        mutating = mutating or (action == "forget" and not _flag(args.get("dry_run")))
+        mutating = mutating or (action == "consolidate" and not _flag(args.get("dry_run")))
+        mutating = mutating or (action == "working" and bool(args.get("content") or args.get("status") == "clear"))
+        mutating = mutating or (action == "procedure" and bool(args.get("steps") or args.get("status")))
+        mutating = mutating or (action == "intention" and bool(args.get("content") or args.get("fact_id") is not None))
+        mutating = mutating or (action == "timeline" and bool(args.get("content")))
+        mutating = mutating or action == "approval"
+        mutating = mutating or (action == "doctor" and _flag(args.get("confirm")))
+        mutating = mutating or (action == "policy" and bool(str(args.get("content") or "").strip()))
+        if mutating and not self._write_enabled:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Sensitive or mutating memory actions are disabled outside the primary agent context.",
+                }
+            )
+        if mutating:
+            self._invalidate_prefetch_cache()
 
         try:
             if action == "search":
@@ -561,6 +977,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     session_id=session_id,
                     include_inactive=include_inactive,
                     cues=cues,
+                    touch_recall=self._write_enabled,
                 )
                 payload: Dict[str, Any] = {"success": True, "action": action, "results": results}
                 if str(cues.get("mode") or "") == "provenance" and str(cues.get("subject_key") or ""):
@@ -568,6 +985,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         subject_key=str(cues.get("subject_key") or ""),
                         facts=list(results.get("facts", [])),
                         limit=max(3, min(limit, 6)),
+                        query=query,
                     )
                 if str(cues.get("mode") or "") in {"summary", "workflow"}:
                     mode_snapshot = self._mode_snapshot_entries(
@@ -588,62 +1006,95 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if memory_type not in valid_memory_types:
                     return json.dumps({"success": False, "error": f"Unsupported memory_type: {memory_type}"})
                 if fact_id is not None:
-                    removed = self._store.deactivate_memory_item(memory_type, int(fact_id), reason="tool_forget", source="tool")
+                    if _flag(args.get("dry_run")):
+                        preview = (
+                            self._store.explain_fact(int(fact_id))
+                            if memory_type == "fact"
+                            else {"id": int(fact_id), "memory_type": memory_type}
+                        )
+                        return json.dumps({"success": True, "action": action, "dry_run": True, "candidate": preview})
+                    removed = self._store.deactivate_memory_item(
+                        memory_type, int(fact_id), reason="tool_forget", source="tool"
+                    )
                     self._store.rebuild_topics(
                         max_facts=self._cfg()["max_topic_facts"],
                         max_chars=self._cfg()["topic_summary_chars"],
                     )
                     if removed:
                         self._sync_builtin_snapshot(reason="tool_forget")
-                    return json.dumps({"success": removed, "action": action, "fact_id": int(fact_id), "memory_type": memory_type})
+                    return json.dumps(
+                        {"success": removed, "action": action, "fact_id": int(fact_id), "memory_type": memory_type}
+                    )
                 query = str(args.get("query") or "").strip()
                 if not query:
                     return json.dumps({"success": False, "error": "query or fact_id is required for forget"})
-                if memory_type == "fact":
-                    removed_count = self._store.deactivate_matching(query, limit=limit)
+                section = (
+                    "facts"
+                    if memory_type == "fact"
+                    else {
+                        "summary": "summaries",
+                        "journal": "journals",
+                        "preference": "preferences",
+                        "policy": "policies",
+                    }[memory_type]
+                )
+                preview = self._search_memory(
+                    query,
+                    scope=section,
+                    limit=limit,
+                    session_id=session_id,
+                    include_inactive=False,
+                    touch_recall=False,
+                ).get(section, [])
+                if _flag(args.get("dry_run")) or not _flag(args.get("confirm")):
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "action": action,
+                            "dry_run": True,
+                            "requires_confirmation": True,
+                            "candidates": preview,
+                            "instruction": "Repeat with fact_id for an exact deletion. Query deletion is refused when ambiguous.",
+                        }
+                    )
+                if len(preview) != 1 or preview[0].get("id") is None:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "action": action,
+                            "error": "Query deletion requires exactly one match; use fact_id.",
+                            "candidates": preview,
+                        }
+                    )
+                removed = self._store.deactivate_memory_item(
+                    memory_type, int(preview[0]["id"]), reason="tool_forget", source="tool"
+                )
+                if removed:
                     self._store.rebuild_topics(
-                        max_facts=self._cfg()["max_topic_facts"],
-                        max_chars=self._cfg()["topic_summary_chars"],
+                        max_facts=self._cfg()["max_topic_facts"], max_chars=self._cfg()["topic_summary_chars"]
                     )
-                else:
-                    section = f"{memory_type}s" if not memory_type.endswith("s") else memory_type
-                    if memory_type == "summary":
-                        section = "summaries"
-                    elif memory_type == "journal":
-                        section = "journals"
-                    elif memory_type == "preference":
-                        section = "preferences"
-                    elif memory_type == "policy":
-                        section = "policies"
-                    results = self._search_memory(
-                        query,
-                        scope=section,
-                        limit=limit,
-                        session_id=session_id,
-                        include_inactive=include_inactive,
-                        touch_recall=False,
-                    )
-                    removed_count = 0
-                    for row in results.get(section, []):
-                        if row.get("id") is None:
-                            continue
-                        if self._store.deactivate_memory_item(memory_type, int(row["id"]), reason="tool_forget", source="tool"):
-                            removed_count += 1
-                if removed_count > 0:
                     self._sync_builtin_snapshot(reason="tool_forget")
-                return json.dumps({"success": True, "action": action, "removed_count": removed_count})
+                return json.dumps({"success": removed, "action": action, "removed_id": preview[0]["id"]})
 
             if action == "recent":
-                return json.dumps(
-                    {"success": True, "action": action, "results": self._store.recent_items(limit=limit)}
-                )
+                recent = self._store.recent_items(limit=limit)
+                for section, rows in recent.items():
+                    recent[section] = [row for row in rows if not _looks_sensitive_for_export(row)]
+                return json.dumps({"success": True, "action": action, "results": recent})
 
             if action == "contradictions":
+                contradiction_query = str(args.get("query") or "")
                 return json.dumps(
                     {
                         "success": True,
                         "action": action,
-                        "results": self._store.recent_contradictions(limit=limit, max_age_days=args.get("since_days")),
+                        "results": self._visible_sensitive_rows(
+                            self._store.recent_contradictions(
+                                limit=limit,
+                                max_age_days=args.get("since_days"),
+                            ),
+                            contradiction_query,
+                        ),
                     }
                 )
 
@@ -661,16 +1112,25 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         "counts": self._store.counts(),
                         "plan": plan,
                         "last_consolidation": self._store.last_consolidation(),
-                        "recent_contradictions": self._store.recent_contradictions(limit=3),
-                        "extractor_backend": self._llm_backend,
+                        "recent_contradictions": self._visible_sensitive_rows(
+                            self._store.recent_contradictions(limit=3), ""
+                        ),
+                        "automatic_extraction": {
+                            "enabled": bool(self._llm and self._llm.enabled),
+                            "backend": "llm" if self._llm and self._llm.enabled else "disabled",
+                        },
                         "retrieval_backend": self._effective_retrieval_backend(),
                         "llm_model": self._llm.model if self._llm else "",
                         "llm_base_url": self._llm.base_url if self._llm else "",
+                        "llm_circuit": self._llm.circuit_state if self._llm else {},
                         "embedding_model": self._embedder.model if self._embedder else "",
                         "embedding_base_url": self._embedder.base_url if self._embedder else "",
                         "embedding_enabled": bool(self._embedder and self._embedder.supports_embeddings),
+                        "embedding_circuit": self._embedder.circuit_state if self._embedder else {},
                         "last_decay_at": self._store.get_state("last_decay_at", ""),
-                        "latest_session_summaries": self._store.latest_session_summaries(limit=3),
+                        "latest_session_summaries": self._visible_sensitive_rows(
+                            self._store.latest_session_summaries(limit=3), ""
+                        ),
                         "review": review_status,
                         "wiki_export": {
                             "enabled": self._cfg()["wiki_export_enabled"],
@@ -680,11 +1140,47 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                             "last_export_stats": self._load_state_json("last_wiki_export_stats"),
                         },
                         "builtin_snapshot": self._load_state_json("last_builtin_snapshot_sync"),
+                        "scope": self._scope_id,
+                        "database_path": self._store.db_path,
+                        "database_size_bytes": self._store.database_size_bytes(),
+                        "logical_database_size_bytes": self._store.logical_database_size_bytes(),
+                        "queue": {
+                            **self._queue_metrics,
+                            "in_memory": self._task_queue.qsize(),
+                            "durable": self._store.pending_operation_count(),
+                            "dead_letter": self._store.failed_operation_count(),
+                        },
+                        "working_memory": self._visible_sensitive_rows(
+                            self._store.list_working_memory(session_id, limit=4), ""
+                        ),
+                        "due_intentions": self._visible_sensitive_rows(
+                            self._store.list_intentions(due_only=True, limit=4), ""
+                        ),
+                        "pending_approvals": [
+                            {
+                                key: row.get(key)
+                                for key in ("id", "sensitivity", "reason", "status", "session_id", "created_at")
+                            }
+                            for row in self._store.list_approvals(limit=4)
+                        ],
                         "config": self._cfg(),
                     }
                 )
 
             if action == "consolidate":
+                if _flag(args.get("dry_run")):
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "action": action,
+                            "dry_run": True,
+                            "plan": build_consolidation_plan(
+                                self._store,
+                                min_hours=self._cfg()["min_hours"],
+                                min_sessions=self._cfg()["min_sessions"],
+                            ),
+                        }
+                    )
                 result = self._run_consolidation(force=True, reason="manual")
                 return json.dumps({"success": True, "action": action, "result": result})
 
@@ -693,6 +1189,24 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 content = str(args.get("content") or "").strip()
                 if not content:
                     return json.dumps({"success": False, "error": "content is required for journal"})
+                journal_candidate = {
+                    "content": content,
+                    "category": "general",
+                    "topic": "journal",
+                    "importance": int(args.get("importance") or 6),
+                    "confidence": 1.0,
+                    "metadata": {"source_role": "user"},
+                    "_memory_type": "journal",
+                    "_tool_args": dict(args),
+                }
+                admission = self._admit_candidate(
+                    journal_candidate,
+                    source="tool_journal",
+                    session_id=session_id,
+                    approved=_flag(args.get("approved")),
+                )
+                if admission["decision"] != "allowed":
+                    return json.dumps({"success": True, "action": action, "result": admission})
                 result = self._store.add_journal(
                     label=label,
                     content=content,
@@ -701,6 +1215,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     metadata={"session_id": session_id} if session_id else None,
                     importance=int(args.get("importance") or 6),
                     salience=0.62,
+                    sensitivity=str(admission.get("sensitivity") or "normal"),
                 )
                 return json.dumps({"success": True, "action": action, "result": result})
 
@@ -716,26 +1231,56 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     limit=limit,
                     since_days=args.get("since_days"),
                 )
+                results = [row for row in results if not _looks_sensitive_for_export(row)]
                 return json.dumps({"success": True, "action": action, "results": results})
 
             if action == "policy":
                 key = str(args.get("key") or args.get("query") or "").strip()
                 content = str(args.get("content") or "").strip()
                 if content:
+                    policy_candidate = {
+                        "content": content,
+                        "category": "workflow",
+                        "topic": "policies",
+                        "importance": int(args.get("importance") or 9),
+                        "confidence": 1.0,
+                        "metadata": {"source_role": "user"},
+                        "_memory_type": "policy",
+                        "_tool_args": dict(args),
+                    }
+                    admission = self._admit_candidate(
+                        policy_candidate,
+                        source="tool_policy",
+                        session_id=session_id,
+                        approved=_flag(args.get("approved")),
+                    )
+                    if admission["decision"] != "allowed":
+                        return json.dumps({"success": True, "action": action, "result": admission})
                     result = self._store.upsert_policy(
                         key=key or slugify(args.get("label") or content[:40]),
                         label=str(args.get("label") or key or "Policy"),
                         content=content,
                         metadata={"session_id": session_id},
                         importance=int(args.get("importance") or 9),
+                        sensitivity=str(admission.get("sensitivity") or "normal"),
                     )
                     if session_id:
                         self._store.add_link("policy", result["id"], "session", session_id, "captured_in")
                     self._sync_builtin_snapshot(reason="tool_policy")
                     return json.dumps({"success": True, "action": action, "result": result})
                 if not key:
-                    return json.dumps({"success": True, "action": action, "results": self._store.recent_items(limit=limit).get("policies", [])})
-                results = self._search_memory(key, scope="policies", limit=limit, session_id=session_id, include_inactive=include_inactive)
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "action": action,
+                            "results": self._visible_sensitive_rows(
+                                self._store.recent_items(limit=limit).get("policies", []), ""
+                            ),
+                        }
+                    )
+                results = self._search_memory(
+                    key, scope="policies", limit=limit, session_id=session_id, include_inactive=include_inactive
+                )
                 return json.dumps({"success": True, "action": action, "results": results.get("policies", [])})
 
             if action == "review":
@@ -746,7 +1291,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     return json.dumps({"success": False, "error": f"Scope {scope} is not reviewable"})
                 review_scope = scope
                 due = self._store.review_due(scope=review_scope, limit=limit)
-                cues = self._build_retrieval_cues(query=str(args.get("query") or "").strip(), args=args, session_id=session_id)
+                review_query = str(args.get("query") or "")
+                for section in ("facts", "summaries", "journals", "preferences", "policies"):
+                    due[section] = self._visible_sensitive_rows(due.get(section, []), review_query)
+                cues = self._build_retrieval_cues(query=review_query.strip(), args=args, session_id=session_id)
                 for section, rows in due.items():
                     for row in rows:
                         row["review_prompt"] = self._review_prompt(section, row)
@@ -773,8 +1321,435 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 return json.dumps({"success": True, "action": action, "result": result})
 
             if action == "export":
+                if not self._cfg()["export_redact_sensitive"] and not _flag(args.get("confirm")):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "Unredacted wiki export requires confirm=true because it may expose private memory",
+                        }
+                    )
                 result = self._export_compiled_wiki(reason="tool")
                 return json.dumps({"success": True, "action": action, "result": result})
+
+            if action == "explain":
+                if args.get("fact_id") is None:
+                    return json.dumps({"success": False, "error": "fact_id is required for explain"})
+                return json.dumps(
+                    {"success": True, "action": action, "result": self._store.explain_fact(int(args["fact_id"]))}
+                )
+
+            if action == "working":
+                content = str(args.get("content") or "").strip()
+                if str(args.get("status") or "").lower() == "clear":
+                    count = self._store.clear_working_memory(session_id, str(args.get("key") or ""))
+                    return json.dumps({"success": True, "action": action, "cleared": count})
+                if content:
+                    working_candidate = {
+                        "content": content,
+                        "category": "workflow",
+                        "topic": "working-memory",
+                        "importance": int(args.get("importance") or 7),
+                        "confidence": 1.0,
+                        "metadata": {"source_role": "user"},
+                        "_memory_type": "working",
+                        "_tool_args": dict(args),
+                    }
+                    admission = self._admit_candidate(
+                        working_candidate,
+                        source="tool_working",
+                        session_id=session_id,
+                        approved=_flag(args.get("approved")),
+                    )
+                    if admission["decision"] != "allowed":
+                        return json.dumps({"success": True, "action": action, "result": admission})
+                    result = self._store.set_working_memory(
+                        session_id=session_id,
+                        memory_key=str(args.get("key") or args.get("label") or "focus"),
+                        content=content,
+                        priority=int(args.get("importance") or 7),
+                        ttl_seconds=float(args.get("ttl_seconds") or 3600),
+                        capacity=self._cfg()["working_memory_capacity"],
+                        sensitivity=str(admission.get("sensitivity") or "normal"),
+                    )
+                    return json.dumps({"success": True, "action": action, "result": result})
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "results": self._visible_sensitive_rows(
+                            self._store.list_working_memory(session_id, limit=limit), str(args.get("query") or "")
+                        ),
+                    }
+                )
+
+            if action == "procedure":
+                raw_steps = args.get("steps")
+                raw_prerequisites = args.get("prerequisites")
+                if raw_steps is not None and not isinstance(raw_steps, (list, tuple)):
+                    return json.dumps({"success": False, "error": "steps must be an array of strings"})
+                if raw_prerequisites is not None and not isinstance(raw_prerequisites, (list, tuple)):
+                    return json.dumps({"success": False, "error": "prerequisites must be an array of strings"})
+                steps = list(raw_steps or [])
+                prerequisites = list(raw_prerequisites or [])
+                if steps:
+                    procedure_content = " ".join(
+                        [
+                            str(args.get("label") or args.get("key") or "Procedure"),
+                            *(str(step) for step in steps),
+                            *(str(item) for item in prerequisites),
+                            str(args.get("content") or ""),
+                            str(args.get("value") or ""),
+                        ]
+                    )
+                    procedure_candidate = {
+                        "content": procedure_content,
+                        "category": "workflow",
+                        "topic": "procedures",
+                        "importance": int(args.get("importance") or 7),
+                        "confidence": 1.0,
+                        "metadata": {"source_role": "user"},
+                        "_memory_type": "procedure",
+                        "_tool_args": dict(args),
+                    }
+                    admission = self._admit_candidate(
+                        procedure_candidate,
+                        source="tool_procedure",
+                        session_id=session_id,
+                        approved=_flag(args.get("approved")),
+                    )
+                    if admission["decision"] != "allowed":
+                        return json.dumps({"success": True, "action": action, "result": admission})
+                    result = self._store.upsert_procedure(
+                        procedure_key=str(args.get("key") or args.get("label") or args.get("query") or "procedure"),
+                        label=str(args.get("label") or args.get("key") or "Procedure"),
+                        steps=steps,
+                        prerequisites=prerequisites,
+                        success_criteria=str(args.get("content") or ""),
+                        failure_recovery=str(args.get("value") or ""),
+                        sensitivity=str(admission.get("sensitivity") or "normal"),
+                    )
+                    return json.dumps({"success": True, "action": action, "result": result})
+                if str(args.get("status") or "").lower() in {"success", "failed", "failure"}:
+                    result = self._store.record_procedure_result(
+                        str(args.get("key") or args.get("query") or ""),
+                        success=str(args.get("status") or "").lower() == "success",
+                    )
+                    return json.dumps({"success": True, "action": action, "result": result})
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "results": self._visible_sensitive_rows(
+                            self._store.list_procedures(str(args.get("query") or ""), limit=limit),
+                            str(args.get("query") or ""),
+                        ),
+                    }
+                )
+
+            if action == "intention":
+                if args.get("fact_id") is not None and args.get("status"):
+                    result = self._store.resolve_intention(int(args["fact_id"]), status=str(args["status"]))
+                    return json.dumps({"success": True, "action": action, "result": result})
+                if str(args.get("content") or "").strip():
+                    intention_candidate = {
+                        "content": " ".join(
+                            (str(args["content"]), str(args.get("query") or ""), str(args.get("value") or ""))
+                        ),
+                        "category": "workflow",
+                        "topic": "intentions",
+                        "importance": int(args.get("importance") or 6),
+                        "confidence": 1.0,
+                        "metadata": {"source_role": "user"},
+                        "_memory_type": "intention",
+                        "_tool_args": dict(args),
+                    }
+                    admission = self._admit_candidate(
+                        intention_candidate,
+                        source="tool_intention",
+                        session_id=session_id,
+                        approved=_flag(args.get("approved")),
+                    )
+                    if admission["decision"] != "allowed":
+                        return json.dumps({"success": True, "action": action, "result": admission})
+                    result = self._store.add_intention(
+                        intention=str(args["content"]),
+                        due_at=float(args.get("due_at") or 0),
+                        condition_text=str(args.get("query") or ""),
+                        recurrence=str(args.get("value") or ""),
+                        importance=int(args.get("importance") or 6),
+                        session_id=session_id,
+                        sensitivity=str(admission.get("sensitivity") or "normal"),
+                    )
+                    return json.dumps({"success": True, "action": action, "result": result})
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "results": self._visible_sensitive_rows(
+                            self._store.list_intentions(due_only=bool(args.get("status") == "due"), limit=limit),
+                            str(args.get("query") or ""),
+                        ),
+                    }
+                )
+
+            if action == "timeline":
+                if str(args.get("content") or "").strip():
+                    timeline_candidate = {
+                        "content": str(args["content"]),
+                        "category": "general",
+                        "topic": "life-events",
+                        "importance": int(args.get("importance") or 6),
+                        "confidence": 1.0,
+                        "metadata": {"kind": "life_event", "source_role": "user"},
+                        "_memory_type": "timeline",
+                        "_tool_args": dict(args),
+                    }
+                    admission = self._admit_candidate(
+                        timeline_candidate,
+                        source="tool_timeline",
+                        session_id=session_id,
+                        approved=_flag(args.get("approved")),
+                    )
+                    if admission["decision"] != "allowed":
+                        return json.dumps({"success": True, "action": action, "result": admission})
+                    result = self._store.upsert_autobiographical_event(
+                        event_key=str(
+                            args.get("key") or args.get("label") or fingerprint_text(str(args["content"]))[:16]
+                        ),
+                        content=str(args["content"]),
+                        event_at=float(args.get("due_at") or time.time()),
+                        importance=int(args.get("importance") or 6),
+                        sensitivity=str(admission.get("sensitivity") or "normal"),
+                    )
+                    return json.dumps({"success": True, "action": action, "result": result})
+                timeline_query = str(args.get("query") or "")
+                events = [
+                    row
+                    for row in self._store.list_autobiographical_events(timeline_query, limit=limit)
+                    if str(row.get("sensitivity") or "normal") == "normal"
+                    or self._query_allows_sensitive(timeline_query, str(row.get("sensitivity") or ""))
+                ]
+                return json.dumps({"success": True, "action": action, "results": events})
+
+            if action == "approval":
+                if args.get("fact_id") is None:
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "action": action,
+                            "results": self._store.list_approvals(
+                                status=str(args.get("status") or "pending"), limit=limit
+                            ),
+                        }
+                    )
+                if "approved" not in args:
+                    return json.dumps(
+                        {"success": False, "error": "approved=true or false is required to resolve an approval"}
+                    )
+                approval = self._store.resolve_approval(
+                    int(args["fact_id"]),
+                    approved=_flag(args.get("approved")),
+                    resolution=str(args.get("content") or ""),
+                )
+                stored: Dict[str, Any] | None = None
+                if _flag(args.get("approved")):
+                    candidate = dict(approval.get("candidate") or {})
+                    source = str(candidate.pop("_source", "approved_sensitive"))
+                    source_session = str(candidate.pop("_session_id", session_id))
+                    tool_args = candidate.pop("_tool_args", None)
+                    special_type = candidate.pop("_memory_type", "")
+                    if special_type == "preference" and isinstance(tool_args, dict):
+                        stored = self._remember_from_tool({**tool_args, "approved": True}, session_id=source_session)
+                    elif special_type == "journal" and isinstance(tool_args, dict):
+                        stored = self._store.add_journal(
+                            label=str(tool_args.get("label") or "Journal"),
+                            content=str(tool_args.get("content") or ""),
+                            session_id=source_session,
+                            journal_type=str(tool_args.get("memory_type") or "note"),
+                            metadata={"session_id": source_session},
+                            importance=int(tool_args.get("importance") or 6),
+                            salience=0.62,
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                        )
+                    elif special_type == "timeline" and isinstance(tool_args, dict):
+                        timeline_content = str(tool_args.get("content") or "")
+                        stored = self._store.upsert_autobiographical_event(
+                            event_key=str(
+                                tool_args.get("key")
+                                or tool_args.get("label")
+                                or fingerprint_text(timeline_content)[:16]
+                            ),
+                            content=timeline_content,
+                            event_at=float(tool_args.get("due_at") or time.time()),
+                            importance=int(tool_args.get("importance") or 6),
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                        )
+                    elif special_type == "distill" and isinstance(tool_args, dict):
+                        stored = self._distill_memory({**tool_args, "approved": True}, session_id=source_session)
+                    elif special_type == "policy" and isinstance(tool_args, dict):
+                        policy_content = str(tool_args.get("content") or "")
+                        stored = self._store.upsert_policy(
+                            key=str(tool_args.get("key") or tool_args.get("query") or slugify(policy_content[:40])),
+                            label=str(tool_args.get("label") or tool_args.get("key") or "Policy"),
+                            content=policy_content,
+                            metadata={"session_id": source_session},
+                            importance=int(tool_args.get("importance") or 9),
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                            reason="approved_sensitive_policy",
+                        )
+                    elif special_type == "working" and isinstance(tool_args, dict):
+                        stored = self._store.set_working_memory(
+                            session_id=source_session,
+                            memory_key=str(tool_args.get("key") or tool_args.get("label") or "focus"),
+                            content=str(tool_args.get("content") or ""),
+                            priority=int(tool_args.get("importance") or 7),
+                            ttl_seconds=float(tool_args.get("ttl_seconds") or 3600),
+                            capacity=self._cfg()["working_memory_capacity"],
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                        )
+                    elif special_type == "procedure" and isinstance(tool_args, dict):
+                        stored = self._store.upsert_procedure(
+                            procedure_key=str(
+                                tool_args.get("key") or tool_args.get("label") or tool_args.get("query") or "procedure"
+                            ),
+                            label=str(tool_args.get("label") or tool_args.get("key") or "Procedure"),
+                            steps=list(tool_args.get("steps") or []),
+                            prerequisites=list(tool_args.get("prerequisites") or []),
+                            success_criteria=str(tool_args.get("content") or ""),
+                            failure_recovery=str(tool_args.get("value") or ""),
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                        )
+                    elif special_type == "intention" and isinstance(tool_args, dict):
+                        stored = self._store.add_intention(
+                            intention=str(tool_args.get("content") or ""),
+                            due_at=float(tool_args.get("due_at") or 0),
+                            condition_text=str(tool_args.get("query") or ""),
+                            recurrence=str(tool_args.get("value") or ""),
+                            importance=int(tool_args.get("importance") or 6),
+                            session_id=source_session,
+                            sensitivity=str(approval.get("sensitivity") or "normal"),
+                        )
+                    else:
+                        stored = self._store_candidate(
+                            candidate, source=source, session_id=source_session, approved=True
+                        )
+                return json.dumps({"success": True, "action": action, "approval": approval, "stored": stored})
+
+            if action == "associate":
+                result = self._store.associate(
+                    str(args.get("left_kind") or "fact"),
+                    str(args.get("left_id") or args.get("fact_id") or ""),
+                    str(args.get("right_kind") or "fact"),
+                    str(args.get("right_id") or ""),
+                    str(args.get("relation") or "associated"),
+                )
+                return json.dumps({"success": True, "action": action, "result": result})
+
+            if action == "merge":
+                loser_ids = args.get("ids")
+                if args.get("fact_id") is None or not isinstance(loser_ids, (list, tuple)) or not loser_ids:
+                    return json.dumps({"success": False, "error": "fact_id (winner) and ids (losers) are required"})
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "result": self._store.merge_facts(int(args["fact_id"]), list(loser_ids)),
+                    }
+                )
+
+            if action == "split":
+                replacement_contents = args.get("contents")
+                if (
+                    args.get("fact_id") is None
+                    or not isinstance(replacement_contents, (list, tuple))
+                    or len(replacement_contents) < 2
+                ):
+                    return json.dumps(
+                        {"success": False, "error": "fact_id and at least two replacement contents are required"}
+                    )
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "result": self._store.split_fact(int(args["fact_id"]), list(replacement_contents)),
+                    }
+                )
+
+            if action == "pin":
+                if args.get("fact_id") is None:
+                    return json.dumps({"success": False, "error": "fact_id is required for pin"})
+                return json.dumps(
+                    {
+                        "success": True,
+                        "action": action,
+                        "result": self._store.pin_fact(int(args["fact_id"]), _flag(args.get("pinned"), True)),
+                    }
+                )
+
+            if action == "doctor":
+                return json.dumps(
+                    {"success": True, "action": action, "result": self._store.doctor(repair=_flag(args.get("confirm")))}
+                )
+
+            if action == "maintain":
+                result = self._store.maintain(
+                    episode_retention_hours=float(self._cfg()["episode_body_retention_hours"]),
+                    trace_retention_days=float(self._cfg()["trace_retention_days"]),
+                    history_retention_days=float(self._cfg()["history_retention_days"]),
+                    sensitive_retention_days=float(self._cfg()["sensitive_retention_days"]),
+                    max_database_mb=float(self._cfg()["max_database_mb"]),
+                )
+                return json.dumps({"success": True, "action": action, "result": result})
+
+            if action == "backup":
+                destination = str(args.get("destination") or "").strip()
+                if not destination:
+                    scope_suffix = self._scope_id.replace(":", "-")
+                    destination = str(
+                        self._hermes_home / "backups" / f"consolidating-memory-{scope_suffix}-{time.time_ns()}.db"
+                    )
+                target = Path(destination).expanduser().resolve()
+                if not target.is_relative_to(self._hermes_home.resolve()) and not _flag(args.get("confirm")):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "Backing up outside HERMES_HOME requires confirm=true because backups contain unredacted memory",
+                        }
+                    )
+                return json.dumps({"success": True, "action": action, "path": self._store.backup_to(destination)})
+
+            if action == "export_json":
+                destination = str(args.get("destination") or "").strip()
+                redact_sensitive = bool(self._cfg()["export_redact_sensitive"])
+                if not redact_sensitive and not _flag(args.get("confirm")):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": "Unredacted export requires confirm=true because it may expose private memory",
+                        }
+                    )
+                data = self._store.export_data(redact_sensitive=redact_sensitive)
+                if not destination:
+                    return json.dumps({"success": True, "action": action, "result": data})
+                path = Path(destination).expanduser().resolve()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temp_export: Path | None = None
+                try:
+                    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+                        json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        temp_export = Path(handle.name)
+                    os.replace(temp_export, path)
+                    temp_export = None
+                    try:
+                        os.chmod(path, 0o600)
+                    except OSError:
+                        pass
+                finally:
+                    if temp_export and temp_export.exists():
+                        temp_export.unlink()
+                return json.dumps({"success": True, "action": action, "path": str(path)})
 
             return json.dumps({"success": False, "error": f"Unknown action: {action}"})
         except Exception as exc:
@@ -782,43 +1757,100 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return json.dumps({"success": False, "error": str(exc)})
 
     def shutdown(self) -> None:
-        self._stop_event.set()
-        self._task_queue.put(None)
+        with self._state_lock:
+            if not self._accepting_tasks and self._store is None:
+                return
+            self._accepting_tasks = False
+            self._draining = True
+        try:
+            self._task_queue.put_nowait(None)
+        except queue.Full:
+            self._spool_queued_tasks(preserve_sentinel=False)
+            self._task_queue.put_nowait(None)
         if self._worker and self._worker.is_alive():
-            self._worker.join(timeout=5.0)
+            self._worker.join(timeout=float(self._cfg()["shutdown_timeout_seconds"]))
+        if self._worker and self._worker.is_alive():
+            spooled = self._spool_queued_tasks(preserve_sentinel=True)
+            logger.error(
+                "Memory worker did not drain before the shutdown deadline; left the database open and spooled %s queued tasks",
+                spooled,
+            )
+            return
+        self._stop_event.set()
         if self._store:
             self._store.close()
+            self._store = None
+        self._worker = None
+        self._invalidate_prefetch_cache()
 
     def _cfg(self) -> Dict[str, Any]:
+        sensitive_memory = str(self._config.get("sensitive_memory") or "ask").strip().lower()
+        if sensitive_memory not in {"deny", "ask", "allow"}:
+            sensitive_memory = "ask"
         return {
-            "min_hours": int(self._config.get("min_hours", 24)),
-            "min_sessions": int(self._config.get("min_sessions", 5)),
-            "scan_cooldown_seconds": int(self._config.get("scan_cooldown_seconds", 600)),
-            "prefetch_limit": int(self._config.get("prefetch_limit", 8)),
-            "max_topic_facts": int(self._config.get("max_topic_facts", 5)),
-            "topic_summary_chars": int(self._config.get("topic_summary_chars", 650)),
-            "session_summary_chars": int(self._config.get("session_summary_chars", 900)),
-            "prune_after_days": int(self._config.get("prune_after_days", 90)),
-            "episode_body_retention_hours": float(self._config.get("episode_body_retention_hours", 24)),
-            "decay_half_life_days": float(self._config.get("decay_half_life_days", 90)),
-            "reconsolidation_window_hours": float(self._config.get("reconsolidation_window_hours", 6)),
+            "min_hours": self._cfg_int("min_hours", 24, 0, 8760),
+            "min_sessions": self._cfg_int("min_sessions", 5, 1, 10000),
+            "scan_cooldown_seconds": self._cfg_int("scan_cooldown_seconds", 600, 1, 86400),
+            "prefetch_limit": self._cfg_int("prefetch_limit", 8, 1, 50),
+            "max_topic_facts": self._cfg_int("max_topic_facts", 5, 1, 100),
+            "topic_summary_chars": self._cfg_int("topic_summary_chars", 650, 100, 10000),
+            "session_summary_chars": self._cfg_int("session_summary_chars", 900, 100, 20000),
+            "prune_after_days": self._cfg_int("prune_after_days", 90, 1, 36500),
+            "episode_body_retention_hours": self._cfg_float("episode_body_retention_hours", 24, 0, 87600),
+            "decay_half_life_days": self._cfg_float("decay_half_life_days", 90, 0.01, 36500),
+            "reconsolidation_window_hours": self._cfg_float("reconsolidation_window_hours", 6, 0, 8760),
             "review_intervals_days": str(self._config.get("review_intervals_days", "1,3,7,14,30")),
-            "decay_min_salience": float(self._config.get("decay_min_salience", 0.15)),
-            "builtin_snapshot_sync_enabled": self._cfg_bool("builtin_snapshot_sync_enabled", True),
+            "decay_min_salience": self._cfg_float("decay_min_salience", 0.15, 0, 1),
+            "builtin_snapshot_sync_enabled": self._cfg_bool("builtin_snapshot_sync_enabled", False),
             "builtin_memory_dir": str(self._config.get("builtin_memory_dir", "$HERMES_HOME/memories")),
-            "builtin_snapshot_user_chars": int(self._config.get("builtin_snapshot_user_chars", 1375)),
-            "builtin_snapshot_memory_chars": int(self._config.get("builtin_snapshot_memory_chars", 2200)),
+            "builtin_snapshot_user_chars": self._cfg_int("builtin_snapshot_user_chars", 1375, 100, 100000),
+            "builtin_snapshot_memory_chars": self._cfg_int("builtin_snapshot_memory_chars", 2200, 100, 100000),
             "wiki_export_enabled": self._cfg_bool("wiki_export_enabled", False),
             "wiki_export_dir": str(self._config.get("wiki_export_dir", "$HERMES_HOME/consolidating_memory_wiki")),
             "wiki_export_on_consolidate": self._cfg_bool("wiki_export_on_consolidate", True),
-            "wiki_export_session_limit": int(self._config.get("wiki_export_session_limit", 50)),
-            "wiki_export_topic_limit": int(self._config.get("wiki_export_topic_limit", 100)),
-            "llm_timeout_seconds": int(self._config.get("llm_timeout_seconds", 120)),
-            "llm_max_input_chars": int(self._config.get("llm_max_input_chars", 4000)),
+            "wiki_export_session_limit": self._cfg_int("wiki_export_session_limit", 50, 1, 10000),
+            "wiki_export_topic_limit": self._cfg_int("wiki_export_topic_limit", 100, 1, 10000),
+            "llm_timeout_seconds": self._cfg_int("llm_timeout_seconds", 45, 1, 300),
+            "llm_max_input_chars": self._cfg_int("llm_max_input_chars", 4000, 256, 100000),
             "retrieval_backend": str(self._config.get("retrieval_backend", "fts") or "fts").strip().lower(),
-            "embedding_timeout_seconds": int(self._config.get("embedding_timeout_seconds", 20)),
-            "embedding_candidate_limit": int(self._config.get("embedding_candidate_limit", 16)),
+            "embedding_timeout_seconds": self._cfg_int("embedding_timeout_seconds", 20, 1, 300),
+            "embedding_candidate_limit": self._cfg_int("embedding_candidate_limit", 16, 1, 100),
+            "prefetch_cache_ttl_seconds": self._cfg_float("prefetch_cache_ttl_seconds", 120, 0, 86400),
+            "memory_scope": str(self._config.get("memory_scope") or "user").strip().lower(),
+            "sensitive_memory": sensitive_memory,
+            "allow_credential_memory": self._cfg_bool("allow_credential_memory", False),
+            "allow_sensitive_model_processing": self._cfg_bool("allow_sensitive_model_processing", False),
+            "conflict_policy": str(self._config.get("conflict_policy") or "evidence").strip().lower(),
+            "queue_max_size": self._cfg_int("queue_max_size", 256, 8, 100000),
+            "queue_max_attempts": self._cfg_int("queue_max_attempts", 5, 1, 100),
+            "shutdown_timeout_seconds": self._cfg_float("shutdown_timeout_seconds", 10, 1, 60),
+            "max_database_mb": self._cfg_float("max_database_mb", 512, 16, 102400),
+            "trace_retention_days": self._cfg_float("trace_retention_days", 30, 1, 36500),
+            "history_retention_days": self._cfg_float("history_retention_days", 180, 1, 36500),
+            "sensitive_retention_days": self._cfg_float("sensitive_retention_days", 30, 1, 36500),
+            "consolidation_max_batches": self._cfg_int("consolidation_max_batches", 4, 1, 100),
+            "consolidation_batch_size": self._cfg_int("consolidation_batch_size", 250, 1, 5000),
+            "working_memory_capacity": self._cfg_int("working_memory_capacity", 12, 1, 100),
+            "database_encryption": self._cfg_bool("database_encryption", False),
+            "export_redact_sensitive": self._cfg_bool("export_redact_sensitive", True),
+            "llm_failure_cooldown_seconds": self._cfg_int("llm_failure_cooldown_seconds", 120, 1, 86400),
         }
+
+    def _cfg_int(self, key: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(self._config.get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        return max(minimum, min(maximum, value))
+
+    def _cfg_float(self, key: str, default: float, minimum: float, maximum: float) -> float:
+        try:
+            value = float(self._config.get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        return max(minimum, min(maximum, value))
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
         raw = self._config.get(key, default)
@@ -828,7 +1860,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def _wiki_export_dir(self) -> Path:
         raw = str(self._cfg()["wiki_export_dir"] or "$HERMES_HOME/consolidating_memory_wiki")
-        return Path(raw.replace("$HERMES_HOME", str(self._hermes_home))).expanduser()
+        root = Path(raw.replace("$HERMES_HOME", str(self._hermes_home))).expanduser()
+        if self._scope_id.startswith(("user:", "agent:")):
+            return root / "scopes" / self._scope_id.split(":", 1)[1]
+        return root
 
     def _builtin_memory_dir(self) -> Path:
         raw = str(self._cfg()["builtin_memory_dir"] or "$HERMES_HOME/memories")
@@ -837,26 +1872,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _builtin_memory_path(self, target: str) -> Path:
         name = "USER.md" if target == "user" else "MEMORY.md"
         return self._builtin_memory_dir() / name
-
-    def _candidate_for_memory_line(self, text: str) -> Dict[str, Any] | None:
-        clean = normalize_whitespace(text)
-        if not clean:
-            return None
-        facts: List[Dict[str, Any]] = []
-        for raw in extract_candidate_facts_from_messages([{"role": "assistant", "content": clean}]):
-            if not isinstance(raw, dict):
-                continue
-            normalized = normalize_candidate_fact(raw, source_role="assistant")
-            if normalized:
-                facts.append(normalized)
-        canonical = self._canonicalize_candidates(facts)
-        if not canonical:
-            return None
-        target = normalize_text(clean)
-        for candidate in canonical:
-            if normalize_text(str(candidate.get("content") or "")) == target:
-                return candidate
-        return canonical[0]
 
     def _strip_auto_memory_block(self, text: str) -> str:
         if not text:
@@ -895,199 +1910,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         lines.append(AUTO_MEMORY_BLOCK_END)
         return "\n".join(lines).strip()
 
-    def _looks_like_user_profile_text(self, text: str) -> bool:
-        clean = normalize_text(text)
-        return clean.startswith(
-            (
-                "user prefers ",
-                "users favorite ",
-                "user likes ",
-                "user dislikes ",
-                "user is allergic to ",
-                "user is not allergic to ",
-                "user is from ",
-                "user grew up in ",
-                "user lives in ",
-                "user pronouns are ",
-                "user is ",
-                "users timezone is ",
-                "user timezone is ",
-            )
-        )
-
-    def _sanitize_mirror_memory_text(self, text: str) -> str:
-        clean = normalize_whitespace(text)
-        if not clean:
-            return ""
-        clean = re.sub(
-            r"^(?:please\s+remember\s+this(?:\s+long-term\s+project\s+fact)?(?:\s+(?:workflow|safety)\s+rule)?\s+for\s+future\s+sessions:|"
-            r"correction\s+for\s+future\s+sessions:|"
-            r"lower[- ]priority(?:\s+(?:note|preference|personal\s+detail|environment\s+note))?:)\s*",
-            "",
-            clean,
-            flags=re.IGNORECASE,
-        )
-        clean = re.sub(r"^\[[A-Z0-9-]+\]\s*", "", clean)
-        clean = re.sub(
-            r"\b(?:please\s+(?:acknowledge|confirm|reply|say)\b.*|reply\s+briefly\b.*|"
-            r"acknowledge\s+it\s+briefly\b.*|confirm\s+once\s+you\s+stored\s+it\b.*|"
-            r"once\s+you\s+stored\s+it\b.*|after\s+handling\s+it\b.*|once\s+you\s+understand\b.*|"
-            r"in\s+one\s+short\s+sentence\b.*|in\s+one\s+sentence\b.*)$",
-            "",
-            clean,
-            flags=re.IGNORECASE,
-        )
-        clean = normalize_whitespace(clean.strip(" -:"))
-        return clean
-
-    def _extract_mirror_memory_candidates(self, content: str) -> List[Dict[str, Any]]:
-        clean = self._sanitize_mirror_memory_text(content)
+    def _mirror_memory_candidates(self, content: str) -> List[Dict[str, Any]]:
+        clean = normalize_whitespace(content)
         if not clean:
             return []
-        candidates: List[Dict[str, Any]] = []
-        for raw in extract_candidate_facts_from_messages([{"role": "user", "content": clean}]):
-            if not isinstance(raw, dict):
-                continue
-            normalized = normalize_candidate_fact(raw, source_role="user")
-            if normalized:
-                candidates.append(normalized)
-        if not candidates:
-            return []
-        canonical = self._canonicalize_candidates(self._dedupe_candidates(candidates))
-        filtered: List[Dict[str, Any]] = []
-        for candidate in canonical:
-            metadata = dict(candidate.get("metadata") or {})
-            subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
-            if not subject_key:
-                continue
-            filtered.append(candidate)
-        return filtered
-
-    def _mirror_candidate_target(self, candidate: Dict[str, Any], default_target: str) -> str:
-        metadata = dict(candidate.get("metadata") or {})
-        subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
-        if subject_key.startswith("user:"):
-            return "user"
-        if subject_key:
-            return "memory"
-        return "user" if default_target == "user" else "memory"
-
-    @staticmethod
-    def _is_snapshot_worthy(text: str, subject_key: str = "") -> bool:
-        """Return False for content that should never appear in MEMORY.md / USER.md."""
-        lower = (text or "").lower()
-        if len(lower) < 6:
-            return False
-        # Reject raw conversation fragments (questions, broken grammar, meta-talk).
-        if lower.endswith("?") and not any(
-            k in lower for k in ("prefer", "schedule", "allerg", "born", "live")
-        ):
-            return False
-        # Reject agent self-description / system status.
-        if any(phrase in lower for phrase in (
-            "plugin is running",
-            "plugin is operational",
-            "memory is active",
-            "sql db consolidation",
-            "system confirms",
-            "memory usage is not",
-            "hermes prioritizes",
-            "hermes avoids",
-            "hermes is a",
-            "hermes optimizes",
-            "agent views its internal",
-            "nothing to save",
-        )):
-            return False
-        # Reject subject keys that describe transient system state.
-        subj = (subject_key or "").lower()
-        if any(subj.startswith(p) for p in (
-            "system:", "plugin:", "memory:sql",
-            "general:roleplay", "assistant:",
-        )):
-            return False
-
-        # --- Fix 2: Reject unresolved variable placeholders ---
-        clean = (text or "").strip()
-        if re.match(
-            r'^(?:User|The user)\s+(?:is|lives in|prefers|has)\s+\w+\.\s*$',
-            clean, re.IGNORECASE,
-        ):
-            word = clean.rstrip('.').split()[-1].lower()
-            if word in ('status', 'location', 'value', 'unknown', 'none', 'default'):
-                return False
-
-        # Reject "User likes <slug>" where the value looks like a DB key
-        m = re.match(r'^User\s+(?:likes|dislikes)\s+(\S+)\.\s*$', clean, re.IGNORECASE)
-        if m:
-            val = m.group(1)
-            if '_' in val or val.lower() in (
-                'food', 'hobby', 'enjoyment', 'status', 'location',
-            ):
-                return False
-
-        # --- Fix 3: Ephemeral subject keys that should not persist ---
-        _EPHEMERAL_SNAPSHOT_KEYS = {
-            'user:mood', 'user:mood:easter', 'user:daily_activity',
-            'user:game_phase', 'user:resource:tokens',
-            'user:session_pattern', 'user:coding_state',
-            'user:log_focus', 'user:file_request',
-            'user:next_activity_choice', 'user:hobby_status',
-        }
-        _EPHEMERAL_SNAPSHOT_PREFIXES = (
-            'memory:durable_storage',
-            'environment:memory_plugin_status',
-            'environment:last_reflection_date',
-            'environment:philosophical_log',
-            'environment:agent_memory_structure',
-            'general:identity_file_location',
+        candidate = normalize_candidate_fact(
+            {
+                "content": clean,
+                "category": "general",
+                "topic": "hermes-memory",
+                "importance": 7,
+                "confidence": 0.95,
+            },
+            source_role="tool",
         )
-        if subj in _EPHEMERAL_SNAPSHOT_KEYS:
-            return False
-        for prefix in _EPHEMERAL_SNAPSHOT_PREFIXES:
-            if subj.startswith(prefix):
-                return False
-
-        # --- Fix 5: Reject meta/self-referential content about memory system ---
-        meta_patterns = (
-            'memory and sql db consolidation',
-            'consolidating_memory plugin',
-            'durable memory is being stored',
-            'dedicated .soul. file structure',
-            'memory system is categorized',
-            'memory.md and user.md',
-        )
-        for pattern in meta_patterns:
-            if pattern in lower:
-                return False
-
-        return True
-
-    # Subject-key prefixes that should share a single snapshot slot.
-    # Only the highest-salience entry from each group is kept.
-    _SNAPSHOT_SUBJECT_GROUPS: Dict[str, str] = {
-        "hardware:gpu": "hardware:rig",
-        "hardware:cpu": "hardware:rig",
-        "hardware:ram": "hardware:rig",
-        "hardware:rig": "hardware:rig",
-        "hardware:monitor": "hardware:rig",
-        "hardware:storage": "hardware:rig",
-        "hardware:motherboard": "hardware:rig",
-        "environment:os": "environment:setup",
-        "environment:shell": "environment:setup",
-        "environment:editor": "environment:setup",
-        "environment:ide": "environment:setup",
-        "environment:terminal": "environment:setup",
-    }
-
-    @classmethod
-    def _snapshot_group(cls, subject_key: str) -> str:
-        """Return the dedup group for a subject_key, or the key itself."""
-        lower = (subject_key or "").lower()
-        for prefix, group in cls._SNAPSHOT_SUBJECT_GROUPS.items():
-            if lower == prefix or lower.startswith(prefix + "_") or lower.startswith(prefix + ":"):
-                return group
-        return subject_key
+        return [candidate] if candidate else []
 
     def _build_builtin_snapshot_entries(self) -> Dict[str, List[Dict[str, Any]]]:
         if not self._store:
@@ -1095,7 +1932,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         snapshot = self._store.prompt_snapshot_rows()
         entries: Dict[str, List[Dict[str, Any]]] = {"user": [], "memory": []}
         seen_subjects: Dict[str, set[str]] = {"user": set(), "memory": set()}
-        seen_groups: Dict[str, set[str]] = {"user": set(), "memory": set()}
         seen_texts: Dict[str, set[str]] = {"user": set(), "memory": set()}
 
         def add_entry(
@@ -1111,22 +1947,14 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             clean_subject = normalize_whitespace(subject_key)
             if not clean_text:
                 return
-            if not self._is_snapshot_worthy(clean_text, clean_subject):
-                return
             normalized_text = normalize_text(clean_text)
             if normalized_text in seen_texts[target]:
                 return
             if clean_subject and clean_subject in seen_subjects[target]:
                 return
-            # Group dedup: only one entry per hardware/environment group.
-            group = self._snapshot_group(clean_subject)
-            if group and group != clean_subject and group in seen_groups[target]:
-                return
             seen_texts[target].add(normalized_text)
             if clean_subject:
                 seen_subjects[target].add(clean_subject)
-            if group:
-                seen_groups[target].add(group)
             entries[target].append(
                 {
                     "text": clean_text,
@@ -1190,10 +2018,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def _line_should_be_replaced(
         self,
-        target: str,
         raw_line: str,
         *,
-        subject_keys: set[str],
         normalized_contents: set[str],
     ) -> bool:
         clean_line = raw_line.strip()
@@ -1204,17 +2030,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         text = clean_line[2:].strip() if clean_line.startswith("- ") else clean_line
         if normalize_text(text) in normalized_contents:
             return True
-        candidate = self._candidate_for_memory_line(text)
-        metadata = dict(candidate.get("metadata") or {}) if candidate else {}
-        subject_key = normalize_whitespace(str(metadata.get("subject_key") or ""))
-        if not subject_key:
-            subject_key = self._infer_subject_key_from_query(text)
-        if not subject_key or subject_key not in subject_keys:
-            return False
-        candidate_target = "user" if subject_key.startswith("user:") or str((candidate or {}).get("category") or "") == "user_pref" else "memory"
-        return candidate_target == target
+        return False
 
-    def _write_builtin_snapshot_file(self, target: str, entries: List[Dict[str, Any]], *, limit_chars: int) -> Dict[str, Any]:
+    def _write_builtin_snapshot_file(
+        self, target: str, entries: List[Dict[str, Any]], *, limit_chars: int
+    ) -> Dict[str, Any]:
         path = self._builtin_memory_path(target)
         path.parent.mkdir(parents=True, exist_ok=True)
         existing = ""
@@ -1224,12 +2044,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             except Exception:
                 existing = path.read_text(encoding="utf-8", errors="ignore")
         stripped = self._strip_auto_memory_block(existing)
-        subject_keys = {normalize_whitespace(str(entry.get("subject_key") or "")) for entry in entries if str(entry.get("subject_key") or "").strip()}
-        normalized_contents = {normalize_text(str(entry.get("text") or "")) for entry in entries if str(entry.get("text") or "").strip()}
+        normalized_contents = {
+            normalize_text(str(entry.get("text") or "")) for entry in entries if str(entry.get("text") or "").strip()
+        }
         preserved_lines = [
             line.rstrip()
             for line in stripped.splitlines()
-            if not self._line_should_be_replaced(target, line, subject_keys=subject_keys, normalized_contents=normalized_contents)
+            if not self._line_should_be_replaced(line, normalized_contents=normalized_contents)
         ]
         selected = self._select_snapshot_entries(entries, limit_chars=max(int(limit_chars), 0))
         block = self._build_snapshot_block(selected)
@@ -1253,7 +2074,27 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             normalized += "\n"
         changed = normalize_whitespace(existing) != normalize_whitespace(normalized)
         if changed:
-            path.write_text(normalized, encoding="utf-8")
+            temporary: Path | None = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    "w",
+                    encoding="utf-8",
+                    dir=path.parent,
+                    delete=False,
+                ) as handle:
+                    handle.write(normalized)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    temporary = Path(handle.name)
+                os.replace(temporary, path)
+                temporary = None
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            finally:
+                if temporary and temporary.exists():
+                    temporary.unlink()
         return {
             "path": str(path),
             "changed": changed,
@@ -1264,6 +2105,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _sync_builtin_snapshot(self, *, reason: str) -> Dict[str, Any]:
         if not self._store or not self._cfg()["builtin_snapshot_sync_enabled"]:
             return {"success": False, "reason": "disabled"}
+        if self._scope_id.startswith(("user:", "agent:")):
+            result = {
+                "success": False,
+                "reason": "scoped memory cannot safely write shared Hermes USER.md or MEMORY.md files",
+            }
+            self._store.set_state("last_builtin_snapshot_sync", json.dumps(result, sort_keys=True))
+            return result
         try:
             entries = self._build_builtin_snapshot_entries()
             result = {
@@ -1340,6 +2188,26 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if metadata:
             return metadata
         return self._json_dict(row.get("metadata_json"))
+
+    @staticmethod
+    def _query_allows_sensitive(query: str, sensitivity: str) -> bool:
+        clean = normalize_text(query)
+        markers = {
+            "credential": ("password", "passphrase", "credential", "api key", "token", "private key", "secret"),
+            "health": ("health", "medical", "diagnosis", "medication", "surgery", "allergy"),
+            "financial": ("financial", "bank", "iban", "credit card", "salary", "income", "debt"),
+            "identity": ("identity", "date of birth", "dob", "passport", "social security", "national id"),
+            "location": ("address", "exact location", "home location", "where do i live"),
+        }
+        return any(marker in clean for marker in markers.get(normalize_text(sensitivity), ()))
+
+    def _visible_sensitive_rows(self, rows: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+        return [
+            row
+            for row in rows
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(query, str(row.get("sensitivity") or ""))
+        ]
 
     def _decorate_search_results(self, results: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
         decorated: Dict[str, List[Dict[str, Any]]] = {}
@@ -1526,9 +2394,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 )
                 if row_subject != clean_subject:
                     continue
-                text = normalize_whitespace(
-                    str(row.get("content") or row.get("label") or row.get("value") or "")
-                )
+                text = normalize_whitespace(str(row.get("content") or row.get("label") or row.get("value") or ""))
                 if not text:
                     continue
                 return {
@@ -1609,6 +2475,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         subject_key: str,
         facts: List[Dict[str, Any]] | None = None,
         limit: int = 4,
+        query: str = "",
     ) -> List[Dict[str, Any]]:
         clean_subject = normalize_whitespace(subject_key)
         if not clean_subject or not self._store:
@@ -1676,6 +2543,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             metadata = self._json_dict(payload.get("metadata"))
             if not metadata:
                 metadata = self._json_dict(payload.get("metadata_json"))
+            sensitivity = str(payload.get("sensitivity") or "normal")
+            if sensitivity == "normal":
+                sensitivity, _ = self._classify_sensitivity(str(payload.get("content") or ""), metadata)
+            if sensitivity != "normal" and not self._query_allows_sensitive(query, sensitivity):
+                continue
             push(
                 content=str(payload.get("content") or ""),
                 source_label=str(metadata.get("source_label") or ""),
@@ -1763,14 +2635,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         topic = normalize_whitespace(str(args.get("topic") or ""))
         if query and not subject_key:
             subject_key = self._infer_subject_key_from_query(query)
-        if query and not category:
-            inferred_category = infer_category(query)
-            if inferred_category in {"user_pref", "project", "environment", "workflow"}:
-                category = inferred_category
-        if query and not topic:
-            inferred_topic = infer_topic(query, category or "general", subject_key) or ""
-            if inferred_topic and slugify(inferred_topic) not in {"general", "notes", "memory"}:
-                topic = inferred_topic
         return {
             "query": normalize_whitespace(query),
             "session_id": normalize_whitespace(session_id),
@@ -1795,7 +2659,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         row_category = normalize_whitespace(str(row.get("category") or ""))
         if category_cue and row_category and row_category == category_cue:
             bonus += 0.08
-        row_subject = normalize_whitespace(str(row.get("subject_key") or row.get("preference_key") or row.get("policy_key") or ""))
+        row_subject = normalize_whitespace(
+            str(row.get("subject_key") or row.get("preference_key") or row.get("policy_key") or "")
+        )
         if subject_key_cue and row_subject and row_subject == subject_key_cue:
             bonus += 0.2
         return bonus
@@ -1855,7 +2721,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             adjustment += 0.02
         return adjustment
 
-    def _filter_results_for_mode(self, results: Dict[str, List[Dict[str, Any]]], cues: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+    def _filter_results_for_mode(
+        self, results: Dict[str, List[Dict[str, Any]]], cues: Dict[str, Any]
+    ) -> Dict[str, List[Dict[str, Any]]]:
         mode = str(cues.get("mode") or "")
         filtered = {section: list(rows) for section, rows in results.items()}
         has_direct = any(filtered.get(section) for section in ("facts", "preferences", "policies"))
@@ -1890,7 +2758,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if section == "journals":
             return f"What note matters from {str(row.get('label') or 'this journal entry')}?"
         if section == "preferences":
-            return f"What preference do we hold for {str(row.get('label') or row.get('preference_key') or 'this item')}?"
+            return (
+                f"What preference do we hold for {str(row.get('label') or row.get('preference_key') or 'this item')}?"
+            )
         if section == "policies":
             return f"What policy should guide {str(row.get('label') or row.get('policy_key') or 'this workflow')}?"
         return f"What should we recall about {section}?"
@@ -1922,7 +2792,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             right_norm += float(right_value) * float(right_value)
         if left_norm <= 0.0 or right_norm <= 0.0:
             return 0.0
-        return numerator / ((left_norm ** 0.5) * (right_norm ** 0.5))
+        return numerator / ((left_norm**0.5) * (right_norm**0.5))
 
     def _search_memory(
         self,
@@ -1934,6 +2804,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         include_inactive: bool = False,
         cues: Dict[str, Any] | None = None,
         touch_recall: bool = True,
+        allow_embeddings: bool = True,
     ) -> Dict[str, List[Dict[str, Any]]]:
         if not self._store:
             return {}
@@ -1941,17 +2812,50 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         cue_map = dict(cues or {})
         if session_id and not cue_map.get("session_id"):
             cue_map["session_id"] = normalize_whitespace(session_id)
-        candidate_limit = self._cfg()["embedding_candidate_limit"] if self._effective_retrieval_backend() == "hybrid" else limit
+        candidate_limit = (
+            self._cfg()["embedding_candidate_limit"] if self._effective_retrieval_backend() == "hybrid" else limit
+        )
         results = self._store.search(clean, scope=scope, limit=int(candidate_limit), include_inactive=include_inactive)
         results = self._decorate_search_results(results)
-        if str(cue_map.get("mode") or "") == "provenance" and str(cue_map.get("subject_key") or "") and not results.get("facts"):
+        results["facts"] = [
+            row
+            for row in results.get("facts", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        results["journals"] = [
+            row
+            for row in results.get("journals", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        results["summaries"] = [
+            row
+            for row in results.get("summaries", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        for sensitive_section in ("topics", "episodes", "preferences", "policies"):
+            results[sensitive_section] = [
+                row
+                for row in results.get(sensitive_section, [])
+                if str(row.get("sensitivity") or "normal") == "normal"
+                or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+            ]
+        if str(cue_map.get("subject_key") or "") and not results.get("facts"):
             subject_results = self._store.search(
                 str(cue_map.get("subject_key") or ""),
                 scope="facts",
                 limit=max(int(candidate_limit), 3),
                 include_inactive=include_inactive,
             )
-            results["facts"] = self._decorate_search_results(subject_results).get("facts", [])[: self._section_limit("facts", limit)]
+            subject_facts = self._decorate_search_results(subject_results).get("facts", [])
+            results["facts"] = [
+                row
+                for row in subject_facts
+                if str(row.get("sensitivity") or "normal") == "normal"
+                or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+            ][: self._section_limit("facts", limit)]
         if (
             str(cue_map.get("mode") or "") in {"current_state", "provenance"}
             and not str(cue_map.get("subject_key") or "")
@@ -1962,7 +2866,47 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 limit=limit,
                 include_inactive=include_inactive,
             )
-        if clean and self._effective_retrieval_backend() == "hybrid" and self._embedder and self._embedder.supports_embeddings:
+        results["facts"] = [
+            row
+            for row in results.get("facts", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        results["journals"] = [
+            row
+            for row in results.get("journals", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        results["summaries"] = [
+            row
+            for row in results.get("summaries", [])
+            if str(row.get("sensitivity") or "normal") == "normal"
+            or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+        ]
+        for sensitive_section in ("topics", "episodes", "preferences", "policies"):
+            results[sensitive_section] = [
+                row
+                for row in results.get(sensitive_section, [])
+                if str(row.get("sensitivity") or "normal") == "normal"
+                or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+            ]
+        embedding_sensitivities = [self._classify_sensitivity(clean)[0]]
+        for section, rows in results.items():
+            for row in rows:
+                embedding_sensitivities.append(str(row.get("sensitivity") or "normal"))
+                embedding_sensitivities.append(
+                    self._classify_sensitivity(self._memory_text(section, row), self._result_metadata(row))[0]
+                )
+        remote_embedding_allowed = self._remote_processing_allowed(*embedding_sensitivities)
+        if (
+            clean
+            and allow_embeddings
+            and remote_embedding_allowed
+            and self._effective_retrieval_backend() == "hybrid"
+            and self._embedder
+            and self._embedder.supports_embeddings
+        ):
             query_vector = self._embedder.embed_texts([clean])
             if query_vector:
                 query_embedding = query_vector[0]
@@ -1972,7 +2916,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     texts = [self._memory_text(section, row) for row in rows]
                     vectors = self._embedder.embed_texts(texts)
                     if not vectors or len(vectors) != len(rows):
-                        logger.debug("Hybrid retrieval: embedding mismatch for section %s (%s vectors vs %s rows), falling back to FTS scoring", section, len(vectors) if vectors else 0, len(rows))
+                        logger.debug(
+                            "Hybrid retrieval: embedding mismatch for section %s (%s vectors vs %s rows), falling back to FTS scoring",
+                            section,
+                            len(vectors) if vectors else 0,
+                            len(rows),
+                        )
                         continue
                     scored: List[Dict[str, Any]] = []
                     for index, (row, vector) in enumerate(zip(rows, vectors)):
@@ -1985,7 +2934,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                         cue_bonus = self._cue_bonus(section, row, cue_map)
                         mode_adjustment = self._section_mode_adjustment(section, row, cue_map)
-                        score = (0.5 * similarity) + (0.2 * salience) + (0.1 * importance) + (0.08 * recency) + (0.07 * rank_prior) + cue_bonus + mode_adjustment
+                        score = (
+                            (0.5 * similarity)
+                            + (0.2 * salience)
+                            + (0.1 * importance)
+                            + (0.08 * recency)
+                            + (0.07 * rank_prior)
+                            + cue_bonus
+                            + mode_adjustment
+                        )
                         item = dict(row)
                         item["hybrid_score"] = round(score, 5)
                         item["cue_match_score"] = round(cue_bonus, 5)
@@ -2005,15 +2962,59 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     rank_prior = max(0.0, 1.0 - (index / max(len(rows), 1)))
                     cue_bonus = self._cue_bonus(section, row, cue_map)
                     mode_adjustment = self._section_mode_adjustment(section, row, cue_map)
-                    score = (0.38 * rank_prior) + (0.3 * salience) + (0.16 * importance) + (0.16 * recency) + cue_bonus + mode_adjustment
+                    score = (
+                        (0.38 * rank_prior)
+                        + (0.3 * salience)
+                        + (0.16 * importance)
+                        + (0.16 * recency)
+                        + cue_bonus
+                        + mode_adjustment
+                    )
                     item = dict(row)
-                    item["heuristic_score"] = round(score, 5)
+                    item["lexical_score"] = round(score, 5)
                     item["cue_match_score"] = round(cue_bonus, 5)
                     item["mode_adjustment_score"] = round(mode_adjustment, 5)
                     scored.append(item)
-                scored.sort(key=lambda item: float(item.get("heuristic_score") or 0.0), reverse=True)
+                scored.sort(key=lambda item: float(item.get("lexical_score") or 0.0), reverse=True)
                 results[section] = scored[: self._section_limit(section, limit)]
-        results = self._filter_results_for_mode(results, cue_map)
+        if scope == "all":
+            results = self._filter_results_for_mode(results, cue_map)
+        direct_fact_ids = [int(row["id"]) for row in results.get("facts", []) if row.get("id") is not None]
+        if direct_fact_ids:
+            associated = self._store.associated_facts(direct_fact_ids, limit=max(2, min(limit, 6)))
+            seen_fact_ids = set(direct_fact_ids)
+            for row in associated:
+                if str(row.get("sensitivity") or "normal") != "normal" and not self._query_allows_sensitive(
+                    clean, str(row.get("sensitivity") or "")
+                ):
+                    continue
+                fact_id = int(row.get("id") or 0)
+                if fact_id <= 0 or fact_id in seen_fact_ids:
+                    continue
+                row["retrieval_reason"] = "associative_pattern_completion"
+                results.setdefault("facts", []).append(row)
+                seen_fact_ids.add(fact_id)
+                if len(results["facts"]) >= self._section_limit("facts", limit):
+                    break
+        results["working"] = (
+            self._visible_sensitive_rows(self._store.list_working_memory(session_id, limit=4), clean)
+            if session_id
+            else []
+        )
+        results["intentions"] = self._visible_sensitive_rows(self._store.intentions_for_context(clean, limit=4), clean)
+        results["procedures"] = (
+            self._visible_sensitive_rows(self._store.list_procedures(clean, limit=3), clean) if clean else []
+        )
+        results["timeline"] = (
+            [
+                row
+                for row in self._store.list_autobiographical_events(clean, limit=3)
+                if str(row.get("sensitivity") or "normal") == "normal"
+                or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
+            ]
+            if clean
+            else []
+        )
         if touch_recall and clean:
             self._store.touch_recall_batch(
                 results,
@@ -2028,13 +3029,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     # response style, explicit likes/dislikes, favorites).  Other user:* facts
     # (physical attributes, schedule, financials, etc.) stay as facts only.
     _PREFERENCE_WORTHY_PREFIXES = (
-        "user:preference:", "user:favorite:", "user:response_style",
-        "user:response_tone", "user:answer_format", "user:vibe",
-        "user:diet", "user:allergy:", "user:pronouns",
+        "user:preference:",
+        "user:favorite:",
+        "user:response_style",
+        "user:response_tone",
+        "user:answer_format",
+        "user:vibe",
+        "user:diet",
+        "user:allergy:",
+        "user:pronouns",
     )
 
     def _candidate_to_preference(self, candidate: Dict[str, Any], fact: Dict[str, Any]) -> None:
         if not self._store:
+            return
+        if str(fact.get("sensitivity") or "normal") != "normal":
             return
         metadata = dict(candidate.get("metadata") or fact.get("metadata") or {})
         subject_key = str(metadata.get("subject_key") or "")
@@ -2073,12 +3082,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         label = fact_content
         # content = full sentence for context injection
         content = fact_content
-        # If value is the same as content, try to shorten label to "key: value" form
-        if value and value != fact_content:
-            # We have a distinct short value — good
-            pass
-        else:
-            # Fallback: extract value from content by stripping common prefixes
+        if not value or value == fact_content:
             value = fact_content
         preference = self._store.upsert_preference(
             key=key,
@@ -2098,6 +3102,88 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if fact.get("source_session_id"):
             self._store.add_link("preference", preference["id"], "session", fact["source_session_id"], "captured_in")
 
+    def _classify_sensitivity(self, content: str, metadata: Dict[str, Any] | None = None) -> tuple[str, str]:
+        meta = dict(metadata or {})
+        subject = normalize_text(str(meta.get("subject_key") or ""))
+        text = normalize_text(content)
+        combined = f"{subject} {text}"
+        if _looks_like_credential(content) or re.search(
+            r"\b(password|passphrase|api[_ -]?key|access[_ -]?token|private[_ -]?key|secret)\b", combined
+        ):
+            return "credential", "credential or secret material"
+        if any(token in combined for token in ("health", "medical", "diagnosis", "medication", "surgery", "allerg")):
+            return "health", "health information"
+        if any(token in combined for token in ("financial", "bank", "iban", "credit card", "salary", "income", "debt")):
+            return "financial", "financial information"
+        if any(token in combined for token in ("date of birth", "dob", "passport", "social security", "national id")):
+            return "identity", "identity information"
+        if any(token in subject for token in ("address", "exact_location", "home_location")):
+            return "location", "precise location"
+        return "normal", ""
+
+    def _remote_processing_allowed(self, *sensitivities: str) -> bool:
+        kinds = {normalize_text(value) or "normal" for value in sensitivities}
+        if kinds <= {"normal"}:
+            return True
+        if not self._cfg()["allow_sensitive_model_processing"]:
+            return False
+        return "credential" not in kinds or self._cfg()["allow_credential_memory"]
+
+    def _category_is_blocked(self, category: str) -> bool:
+        blocked = {
+            normalize_text(value)
+            for value in str(self._config.get("never_remember_categories") or "").split(",")
+            if normalize_text(value)
+        }
+        clean_category = normalize_text(category)
+        if clean_category in blocked:
+            return True
+        if not self._store:
+            return False
+        for policy in self._store.list_policies(limit=200):
+            key = normalize_text(str(policy.get("policy_key") or ""))
+            if key in {f"never_remember:{clean_category}", f"never-remember-{clean_category}"}:
+                return True
+        return False
+
+    def _admit_candidate(
+        self,
+        candidate: Dict[str, Any],
+        *,
+        source: str,
+        session_id: str,
+        approved: bool = False,
+    ) -> Dict[str, Any]:
+        category = str(candidate.get("category") or "general")
+        if self._category_is_blocked(category):
+            return {
+                "decision": "denied",
+                "reason": f"category {category!r} is blocked by policy",
+                "sensitivity": "normal",
+            }
+        sensitivity, reason = self._classify_sensitivity(
+            str(candidate.get("content") or ""), dict(candidate.get("metadata") or {})
+        )
+        if sensitivity == "credential" and not self._cfg()["allow_credential_memory"]:
+            return {
+                "decision": "denied",
+                "reason": "credential memory is disabled; set allow_credential_memory only for an intentional exception",
+                "sensitivity": sensitivity,
+            }
+        if sensitivity == "normal" or approved or self._cfg()["sensitive_memory"] == "allow":
+            return {"decision": "allowed", "reason": reason, "sensitivity": sensitivity}
+        if self._cfg()["sensitive_memory"] == "deny":
+            return {"decision": "denied", "reason": reason, "sensitivity": sensitivity}
+        if not self._store:
+            return {"decision": "denied", "reason": "store unavailable", "sensitivity": sensitivity}
+        approval = self._store.request_approval(
+            candidate={**candidate, "_source": source, "_session_id": session_id},
+            sensitivity=sensitivity,
+            reason=reason,
+            session_id=session_id,
+        )
+        return {"decision": "pending", "reason": reason, "sensitivity": sensitivity, "approval": approval}
+
     def _store_candidate(
         self,
         candidate: Dict[str, Any],
@@ -2105,9 +3191,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         source: str,
         session_id: str,
         observed_at: float | None = None,
+        approved: bool = False,
     ) -> Dict[str, Any]:
         if not self._store:
             return {}
+        self._invalidate_prefetch_cache()
+        admission = self._admit_candidate(candidate, source=source, session_id=session_id, approved=approved)
+        if admission["decision"] != "allowed":
+            return {"action": admission["decision"], "fact": {}, **admission}
+        metadata = dict(candidate.get("metadata") or {})
+        source_role = str(metadata.get("source_role") or candidate.get("source_role") or "unknown")
         result = self._store.upsert_fact(
             content=str(candidate["content"]),
             category=str(candidate["category"]),
@@ -2115,23 +3208,28 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             source=source,
             importance=int(candidate["importance"]),
             confidence=float(candidate["confidence"]),
-            metadata=dict(candidate.get("metadata") or {}),
+            metadata=metadata,
             observed_at=observed_at,
             source_session_id=session_id,
             history_reason=source,
+            source_role=source_role,
+            explicit_correction=bool(metadata.get("explicit_correction")),
+            sensitivity=str(admission.get("sensitivity") or "normal"),
+            memory_class="autobiographical" if str(metadata.get("kind") or "") == "life_event" else "semantic",
+            pinned=bool(candidate.get("pinned") or metadata.get("pinned")),
         )
         self._candidate_to_preference(candidate, dict(result.get("fact") or {}))
-        return result
-
-    def _write_consolidation_fact(self, candidate: Dict[str, Any], episode: Dict[str, Any]) -> Dict[str, Any]:
-        result = self._store_candidate(
-            candidate,
-            source="episode_extract",
-            session_id=str(episode.get("session_id") or self._session_id),
-            observed_at=float(episode.get("created_at") or time.time()),
-        )
-        if self._store and dict(result.get("fact") or {}).get("id") is not None and episode.get("id") is not None:
-            self._store.add_link("fact", result["fact"]["id"], "episode", int(episode["id"]), "derived_from_episode")
+        fact = dict(result.get("fact") or {})
+        if str(metadata.get("kind") or "") == "life_event" and fact.get("id") is not None:
+            event = self._store.upsert_autobiographical_event(
+                event_key=f"fact-{fact['id']}",
+                content=str(candidate.get("content") or ""),
+                event_at=float(observed_at or time.time()),
+                importance=int(candidate.get("importance") or 6),
+                metadata={"fact_id": fact["id"], "session_id": session_id},
+                sensitivity=str(admission.get("sensitivity") or "normal"),
+            )
+            self._store.add_link("fact", fact["id"], "autobiographical_event", event["id"], "represented_by")
         return result
 
     def _remember_from_tool(self, args: Dict[str, Any], *, session_id: str) -> Dict[str, Any]:
@@ -2144,6 +3242,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             value = str(args.get("value") or content or "").strip()
             if not value:
                 raise ValueError("value or content is required for remember memory_type=preference")
+            candidate = {
+                "content": content or value,
+                "category": "user_pref",
+                "topic": str(args.get("topic") or "preferences"),
+                "importance": importance,
+                "confidence": 0.9,
+                "metadata": {"subject_key": str(args.get("subject_key") or ""), "source_role": "user"},
+                "_memory_type": "preference",
+                "_tool_args": dict(args),
+            }
+            admission = self._admit_candidate(
+                candidate, source="tool", session_id=session_id, approved=_flag(args.get("approved"))
+            )
+            if admission["decision"] != "allowed":
+                return {"memory_type": "preference", "action": admission["decision"], **admission}
             result = self._store.upsert_preference(
                 key=str(args.get("key") or args.get("subject_key") or slugify(str(args.get("label") or value)[:48])),
                 label=str(args.get("label") or content or value),
@@ -2153,6 +3266,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 importance=importance,
                 salience=0.9,
                 reason="tool_remember",
+                sensitivity=str(admission.get("sensitivity") or "normal"),
             )
             if session_id:
                 self._store.add_link("preference", result["id"], "session", session_id, "captured_in")
@@ -2169,6 +3283,24 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 metadata["value_key"] = str(args.get("value"))
         category = str(args.get("category") or "general")
         topic = str(args.get("topic") or category)
+        candidate = {
+            "content": content,
+            "category": category,
+            "topic": topic,
+            "importance": importance,
+            "confidence": 0.9,
+            "pinned": _flag(args.get("pinned")),
+            "metadata": {
+                **metadata,
+                "source_role": "user",
+                "explicit_correction": _flag(args.get("explicit_correction")) or "correction" in content.lower(),
+            },
+        }
+        admission = self._admit_candidate(
+            candidate, source="tool", session_id=session_id, approved=_flag(args.get("approved"))
+        )
+        if admission["decision"] != "allowed":
+            return {"memory_type": "fact", "action": admission["decision"], **admission}
         result = self._store.upsert_fact(
             content=content,
             category=category,
@@ -2179,6 +3311,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             metadata=metadata,
             source_session_id=session_id,
             history_reason="tool_remember",
+            source_role="user",
+            explicit_correction=_flag(args.get("explicit_correction")) or "correction" in content.lower(),
+            sensitivity=str(admission.get("sensitivity") or "normal"),
+            pinned=_flag(args.get("pinned")),
         )
         self._candidate_to_preference(
             {
@@ -2227,10 +3363,18 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         traces = [str(item.get("content") or "") for item in artifacts.get("traces", [])[:3] if item.get("content")]
         if traces:
             parts.append("Recent flow: " + " | ".join(traces))
-        preferences = [str(item.get("content") or item.get("label") or "") for item in artifacts.get("preferences", [])[:2] if item.get("content") or item.get("label")]
+        preferences = [
+            str(item.get("content") or item.get("label") or "")
+            for item in artifacts.get("preferences", [])[:2]
+            if item.get("content") or item.get("label")
+        ]
         if preferences:
             parts.append("Preferences: " + " | ".join(preferences))
-        policies = [str(item.get("content") or item.get("label") or "") for item in artifacts.get("policies", [])[:2] if item.get("content") or item.get("label")]
+        policies = [
+            str(item.get("content") or item.get("label") or "")
+            for item in artifacts.get("policies", [])[:2]
+            if item.get("content") or item.get("label")
+        ]
         if policies:
             parts.append("Policies: " + " | ".join(policies))
         if messages and not parts:
@@ -2240,6 +3384,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if isinstance(content, list):
                     content = " ".join(str(block.get("text", "")) for block in content if isinstance(block, dict))
                 clean = normalize_whitespace(str(content or ""))
+                sensitivity, _ = self._classify_sensitivity(clean)
+                sensitive_allowed = self._cfg()["sensitive_memory"] == "allow" and (
+                    sensitivity != "credential" or self._cfg()["allow_credential_memory"]
+                )
+                if sensitivity != "normal" and not sensitive_allowed:
+                    continue
                 if clean:
                     snippets.append(clean[:160])
             if snippets:
@@ -2263,13 +3413,18 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         label = str(args.get("label") or "Session Summary").strip()
         summary_type = str(args.get("memory_type") or "session").strip() or "session"
         content = str(args.get("content") or "").strip()
-        limit = max(int(args.get("limit") or 8), 8)
+        try:
+            limit = max(8, min(int(args.get("limit") or 8), 50))
+        except (TypeError, ValueError, OverflowError):
+            limit = 8
         artifacts = self._store.get_session_artifacts(clean_session, limit=limit) if clean_session else {}
         if not content and clean_session:
             content = self._build_summary_text(artifacts=artifacts)
         if not content:
             query = str(args.get("query") or "").strip()
-            search_results = self._search_memory(query, scope="all", limit=limit, session_id=clean_session or session_id)
+            search_results = self._search_memory(
+                query, scope="all", limit=limit, session_id=clean_session or session_id
+            )
             parts = []
             for section in ("summaries", "facts", "journals"):
                 texts = [self._memory_text(section, item) for item in search_results.get(section, [])[:3]]
@@ -2279,6 +3434,24 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             artifacts = search_results
         if not content:
             raise ValueError("Nothing available to distill.")
+        distill_candidate = {
+            "content": content,
+            "category": "general",
+            "topic": "summary",
+            "importance": max(int(args.get("importance") or 7), 7),
+            "confidence": 1.0,
+            "metadata": {"source_role": "user"},
+            "_memory_type": "distill",
+            "_tool_args": dict(args),
+        }
+        admission = self._admit_candidate(
+            distill_candidate,
+            source="tool_distill",
+            session_id=clean_session or session_id,
+            approved=_flag(args.get("approved")),
+        )
+        if admission["decision"] != "allowed":
+            return admission
         refs: List[Dict[str, Any]] = []
         for section in ("facts", "journals", "traces", "summaries", "preferences", "policies", "episodes"):
             for item in artifacts.get(section, [])[:8]:
@@ -2296,17 +3469,22 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             salience=0.7,
             source_refs=refs,
             reason="tool_distill",
+            sensitivity=str(admission.get("sensitivity") or "normal"),
         )
         return result
 
     def _export_compiled_wiki(self, *, reason: str) -> Dict[str, Any]:
         if not self._store:
             return {"status": "uninitialized"}
+        export_root = self._wiki_export_dir().resolve()
+        if export_root == self._hermes_home.resolve():
+            raise ValueError("wiki_export_dir must be a dedicated subdirectory, not HERMES_HOME itself")
         result = export_compiled_wiki(
             self._store,
-            export_dir=self._wiki_export_dir(),
+            export_dir=export_root,
             session_limit=self._cfg()["wiki_export_session_limit"],
             topic_limit=self._cfg()["wiki_export_topic_limit"],
+            redact_sensitive=self._cfg()["export_redact_sensitive"],
         )
         result["reason"] = reason
         result["enabled"] = self._cfg()["wiki_export_enabled"]
@@ -2316,63 +3494,342 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._store.set_state("last_wiki_export_stats", json.dumps(result, sort_keys=True))
         return result
 
-    def _enqueue(self, kind: str, **payload: Any) -> None:
-        if self._stop_event.is_set():
-            return
-        self._task_queue.put((kind, payload))
+    def _enqueue(self, kind: str, **payload: Any) -> bool:
+        if kind == "sync_turn" and not payload.get("_operation_key"):
+            payload["_operation_key"] = uuid.uuid4().hex
+        with self._state_lock:
+            if not self._accepting_tasks:
+                return False
+            if kind == "mirror_memory" and self._store:
+                self._store.enqueue_operation(kind, self._durable_payload(kind, payload))
+                self._queue_metrics["spooled"] += 1
+                try:
+                    self._task_queue.put_nowait(("drain_durable", {}))
+                    self._queue_metrics["enqueued"] += 1
+                except queue.Full:
+                    pass
+                return True
+            try:
+                self._task_queue.put_nowait((kind, payload))
+                self._queue_metrics["enqueued"] += 1
+                return True
+            except queue.Full:
+                if kind == "prefetch":
+                    self._queue_metrics["dropped_prefetch"] += 1
+                    return False
+                if self._store:
+                    self._store.enqueue_operation(kind, self._durable_payload(kind, payload))
+                    self._queue_metrics["spooled"] += 1
+                    return True
+                self._queue_metrics["failed"] += 1
+                return False
+
+    def _durable_payload(self, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove raw sensitive transcripts before an overflow task reaches SQLite."""
+        durable = dict(payload)
+        allow_sensitive = self._cfg()["sensitive_memory"] == "allow"
+        allow_credentials = self._cfg()["allow_credential_memory"]
+        if kind == "sync_turn":
+            messages = [item for item in durable.get("messages", []) if isinstance(item, dict)]
+            raw = " ".join(
+                (
+                    str(durable.get("user_content") or ""),
+                    str(durable.get("assistant_content") or ""),
+                    json.dumps(messages, ensure_ascii=False, default=str),
+                )
+            )
+            sensitivity, _ = self._classify_sensitivity(raw)
+            if sensitivity != "normal" and not (allow_sensitive and (sensitivity != "credential" or allow_credentials)):
+                durable["user_content"] = "[Sensitive user content omitted from durable queue]"
+                durable["assistant_content"] = "[Sensitive assistant content omitted from durable queue]"
+                durable["messages"] = []
+        elif kind == "extract_messages":
+            messages = [item for item in durable.get("messages", []) if isinstance(item, dict)]
+            sensitivity, _ = self._classify_sensitivity(json.dumps(messages, ensure_ascii=False, default=str))
+            if sensitivity != "normal" and not (allow_sensitive and (sensitivity != "credential" or allow_credentials)):
+                durable["messages"] = []
+        elif kind in {"mirror_memory", "remember_fact"}:
+            sensitivity, _ = self._classify_sensitivity(
+                str(durable.get("content") or ""), dict(durable.get("metadata") or {})
+            )
+            if (sensitivity == "credential" and not allow_credentials) or (
+                sensitivity != "normal" and self._cfg()["sensitive_memory"] == "deny"
+            ):
+                return {"_privacy_denied": True}
+        return durable
 
     def _request_consolidation(self, *, reason: str) -> None:
-        if self._consolidation_requested:
+        with self._state_lock:
+            if not self._accepting_tasks or self._consolidation_requested:
+                return
+            self._consolidation_requested = True
+            try:
+                self._task_queue.put_nowait(("consolidate", {"reason": reason}))
+                self._queue_metrics["enqueued"] += 1
+            except queue.Full:
+                if self._store:
+                    self._store.enqueue_operation("consolidate", {"reason": reason})
+                    self._queue_metrics["spooled"] += 1
+                else:
+                    self._queue_metrics["failed"] += 1
+                    self._consolidation_requested = False
+
+    def _spool_queued_tasks(self, *, preserve_sentinel: bool) -> int:
+        """Move accepted FIFO work to SQLite without waiting for a queue slot."""
+        spooled = 0
+        saw_sentinel = False
+        while True:
+            try:
+                item = self._task_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if item is None:
+                    saw_sentinel = True
+                    continue
+                kind, payload = item
+                if kind == "prefetch":
+                    self._queue_metrics["dropped_prefetch"] += 1
+                    continue
+                if kind == "drain_durable":
+                    continue
+                if self._store:
+                    self._store.enqueue_operation(kind, self._durable_payload(kind, payload))
+                    self._queue_metrics["spooled"] += 1
+                    spooled += 1
+                else:
+                    self._queue_metrics["failed"] += 1
+            finally:
+                self._task_queue.task_done()
+        if preserve_sentinel and saw_sentinel:
+            self._task_queue.put_nowait(None)
+        return spooled
+
+    def _dispatch_task(self, kind: str, payload: Dict[str, Any]) -> None:
+        if _flag(payload.get("_privacy_denied")):
             return
-        self._consolidation_requested = True
-        self._enqueue("consolidate", reason=reason)
+        if kind == "sync_turn":
+            self._handle_sync_turn(payload)
+        elif kind == "prefetch":
+            self._handle_prefetch(payload)
+        elif kind == "mirror_memory":
+            self._handle_mirror_memory(payload)
+        elif kind == "remember_fact":
+            self._handle_remember_fact(payload)
+        elif kind == "extract_messages":
+            self._handle_extract_messages(payload)
+        elif kind == "consolidate":
+            self._run_consolidation(force=False, reason=str(payload.get("reason") or "auto"))
+        elif kind == "drain_durable":
+            self._drain_durable_operations(limit=100)
+        elif kind == "maintenance":
+            if not self._store:
+                return
+            stats = self._store.maintain(
+                episode_retention_hours=float(self._cfg()["episode_body_retention_hours"]),
+                trace_retention_days=float(self._cfg()["trace_retention_days"]),
+                history_retention_days=float(self._cfg()["history_retention_days"]),
+                sensitive_retention_days=float(self._cfg()["sensitive_retention_days"]),
+                max_database_mb=float(self._cfg()["max_database_mb"]),
+            )
+            self._store.set_state("last_maintenance_at", time.time())
+            self._store.set_state("last_maintenance_stats", json.dumps(stats, sort_keys=True))
+        else:
+            raise ValueError(f"Unknown durable memory operation: {kind}")
+
+    def _drain_durable_operations(self, *, limit: int = 100) -> int:
+        if not self._store:
+            return 0
+        drained = 0
+        max_attempts = int(self._cfg()["queue_max_attempts"])
+        for operation in self._store.claim_operations(limit=limit, max_attempts=max_attempts):
+            operation_kind = str(operation.get("operation_type") or "")
+            try:
+                self._dispatch_task(
+                    operation_kind,
+                    dict(operation.get("payload") or {}),
+                )
+            except Exception as exc:
+                failed = self._store.fail_operation(
+                    int(operation["id"]),
+                    str(exc),
+                    max_attempts=max_attempts,
+                )
+                self._queue_metrics["failed"] += 1
+                logger.warning(
+                    "Durable memory operation %s %s after attempt %s: %s",
+                    operation.get("id"),
+                    "moved to dead letter" if failed.get("status") == "failed" else "will retry",
+                    operation.get("attempts"),
+                    exc,
+                )
+            else:
+                self._store.complete_operation(int(operation["id"]))
+                drained += 1
+            finally:
+                if operation_kind == "consolidate":
+                    with self._state_lock:
+                        self._consolidation_requested = False
+        return drained
 
     def _worker_loop(self) -> None:
-        while not self._stop_event.is_set():
+        while True:
             try:
-                item = self._task_queue.get(timeout=0.5)
+                item = self._task_queue.get(timeout=1.0)
             except queue.Empty:
+                # A failed durable operation may become eligible after its
+                # backoff while Hermes is otherwise idle. Wake it without
+                # requiring a new user turn or process restart.
+                if self._store and self._store.pending_operation_count():
+                    self._drain_durable_operations(limit=10)
                 continue
             if item is None:
+                while self._store and self._store.pending_operation_count():
+                    if self._drain_durable_operations(limit=1000) == 0:
+                        break
+                self._task_queue.task_done()
                 break
             kind, payload = item
             try:
-                if kind == "sync_turn":
-                    self._handle_sync_turn(payload)
-                elif kind == "prefetch":
-                    self._handle_prefetch(payload)
-                elif kind == "mirror_memory":
-                    self._handle_mirror_memory(payload)
-                elif kind == "remember_fact":
-                    self._handle_remember_fact(payload)
-                elif kind == "extract_messages":
-                    self._handle_extract_messages(payload)
-                elif kind == "consolidate":
-                    self._run_consolidation(force=False, reason=str(payload.get("reason") or "auto"))
+                self._dispatch_task(kind, payload)
+                if self._store and self._store.pending_operation_count():
+                    self._drain_durable_operations(limit=10)
             except Exception as exc:
-                logger.warning("Memory worker task %s failed: %s", kind, exc)
+                self._queue_metrics["failed"] += 1
+                replay_id: int | None = None
+                if self._store and kind not in {"prefetch", "drain_durable"}:
+                    try:
+                        replay_id = self._store.enqueue_operation(kind, self._durable_payload(kind, payload))
+                        self._queue_metrics["spooled"] += 1
+                    except Exception:
+                        logger.exception("Failed to spool memory worker task %s after dispatch failure", kind)
+                logger.warning(
+                    "Memory worker task %s failed%s: %s",
+                    kind,
+                    f"; queued durable replay {replay_id}" if replay_id is not None else "",
+                    exc,
+                )
             finally:
                 if kind == "consolidate":
-                    self._consolidation_requested = False
+                    with self._state_lock:
+                        self._consolidation_requested = False
                 self._task_queue.task_done()
+
+        # When shutdown timed out because a model request was still in flight,
+        # the caller cannot safely close this connection. The worker owns the
+        # final close once it has consumed the sentinel and all ready durable
+        # work, preventing a permanent connection/thread leak.
+        if self._draining:
+            store = self._store
+            if store:
+                store.close()
+            with self._state_lock:
+                if self._store is store:
+                    self._store = None
+            self._stop_event.set()
+            self._invalidate_prefetch_cache()
+
+    def _invalidate_prefetch_cache(self, *session_ids: str) -> None:
+        with self._prefetch_lock:
+            if not session_ids:
+                self._prefetch_cache.clear()
+                return
+            for session_id in session_ids:
+                if session_id:
+                    self._prefetch_cache.pop(session_id, None)
+
+    def _cache_prefetch(self, session_id: str, query: str, rendered: str) -> None:
+        with self._prefetch_lock:
+            self._prefetch_cache[session_id] = {
+                "query": query,
+                "rendered": rendered,
+                "created_at": time.time(),
+            }
+            if len(self._prefetch_cache) > 64:
+                oldest = min(
+                    self._prefetch_cache,
+                    key=lambda key: float(self._prefetch_cache[key].get("created_at") or 0.0),
+                )
+                self._prefetch_cache.pop(oldest, None)
 
     def _handle_sync_turn(self, payload: Dict[str, Any]) -> None:
         if not self._store:
             return
+        self._invalidate_prefetch_cache()
         session_id = str(payload.get("session_id") or self._session_id)
+        original_user_content = str(payload.get("user_content") or "")
+        original_assistant_content = str(payload.get("assistant_content") or "")
+        capture_user_content = original_user_content
+        capture_assistant_content = original_assistant_content
+        raw_sensitivity, _ = self._classify_sensitivity(f"{original_user_content} {original_assistant_content}")
+        raw_sensitive_allowed = self._cfg()["sensitive_memory"] == "allow" and (
+            raw_sensitivity != "credential" or self._cfg()["allow_credential_memory"]
+        )
+        if raw_sensitivity != "normal" and not raw_sensitive_allowed:
+            capture_user_content = "[Sensitive user content omitted from raw episode storage]"
+            capture_assistant_content = "[Sensitive assistant content omitted from raw episode storage]"
         episode = self._store.append_episode(
             session_id=session_id,
-            user_content=str(payload.get("user_content") or ""),
-            assistant_content=str(payload.get("assistant_content") or ""),
+            user_content=capture_user_content,
+            assistant_content=capture_assistant_content,
+            sensitivity=raw_sensitivity,
+            operation_key=str(payload.get("_operation_key") or ""),
         )
+        extracted = 0
+        extracted_ids: List[int] = []
+        for candidate in self._extract_turn_facts(
+            user_content=original_user_content,
+            assistant_content=original_assistant_content,
+            created_at=float(episode.get("created_at") or time.time()),
+        )[:10]:
+            result = self._store_candidate(
+                candidate,
+                source="turn_extract",
+                session_id=session_id,
+                observed_at=float(episode.get("created_at") or time.time()),
+            )
+            fact_id = dict(result.get("fact") or {}).get("id")
+            if fact_id is not None:
+                self._store.add_link("fact", fact_id, "episode", int(episode["id"]), "derived_from_episode")
+                extracted += 1
+                extracted_ids.append(int(fact_id))
+        if len(extracted_ids) > 1:
+            self._store.associate_fact_group(extracted_ids, relation="same_turn")
+        if extracted:
+            self._store.rebuild_topics(
+                max_facts=self._cfg()["max_topic_facts"],
+                max_chars=self._cfg()["topic_summary_chars"],
+            )
         trace_parts = []
-        user_content = normalize_whitespace(str(payload.get("user_content") or ""))
-        assistant_content = normalize_whitespace(str(payload.get("assistant_content") or ""))
+        user_content = normalize_whitespace(capture_user_content)
+        assistant_content = normalize_whitespace(capture_assistant_content)
+        if user_content:
+            self._store.set_working_memory(
+                session_id=session_id,
+                memory_key="current-request",
+                content=user_content[:1000],
+                priority=9,
+                ttl_seconds=6 * 3600,
+                capacity=self._cfg()["working_memory_capacity"],
+                metadata={"episode_id": episode.get("id"), "kind": "current_request"},
+                sensitivity=raw_sensitivity,
+            )
         if user_content:
             trace_parts.append(f"user: {user_content}")
         if assistant_content:
             trace_parts.append(f"assistant: {assistant_content[:300]}")
         if trace_parts:
+            messages = [item for item in payload.get("messages", []) if isinstance(item, dict)]
+            roles = [str(item.get("role") or item.get("type") or "") for item in messages]
+            tool_names: List[str] = []
+            for message in messages:
+                for call in message.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    name = str(function.get("name") or call.get("name") or "").strip()
+                    if name and name not in tool_names:
+                        tool_names.append(name)
             self._store.append_trace(
                 session_id=session_id,
                 label="Turn Trace",
@@ -2380,6 +3837,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 trace_type="turn",
                 salience=0.48,
                 source_episode_id=int(episode.get("id") or 0),
+                metadata={"message_roles": roles, "tool_names": tool_names[:12], "facts_extracted": extracted},
+                sensitivity=raw_sensitivity,
             )
 
     def _handle_prefetch(self, payload: Dict[str, Any]) -> None:
@@ -2390,24 +3849,34 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not query:
             return
         cues = self._build_retrieval_cues(query=query, args={}, session_id=session_id)
-        results = self._search_memory(query, scope="all", limit=self._cfg()["prefetch_limit"], session_id=session_id, cues=cues)
+        results = self._search_memory(
+            query,
+            scope="all",
+            limit=self._cfg()["prefetch_limit"],
+            session_id=session_id,
+            cues=cues,
+            touch_recall=self._write_enabled,
+        )
         rendered = self._render_prefetch(query, results, cues=cues)
-        with self._prefetch_lock:
-            self._prefetch_cache[session_id] = {"query": query, "rendered": rendered, "created_at": time.time()}
+        self._cache_prefetch(session_id, query, rendered)
 
     def _handle_mirror_memory(self, payload: Dict[str, Any]) -> None:
         if not self._store:
             return
+        self._invalidate_prefetch_cache()
         action = str(payload.get("action") or "")
         target = str(payload.get("target") or "")
         content = str(payload.get("content") or "").strip()
-        if not content:
+        provenance = dict(payload.get("metadata") or {})
+        old_text = normalize_whitespace(str(provenance.get("old_text") or ""))
+        session_id = normalize_whitespace(str(provenance.get("session_id") or self._session_id))
+        if not content and not old_text:
             return
-        candidates = self._extract_mirror_memory_candidates(content)
+        candidates = self._mirror_memory_candidates(old_text if action == "remove" and old_text else content)
         if action == "remove":
             removal_texts = [normalize_whitespace(str(candidate.get("content") or "")) for candidate in candidates]
             if not removal_texts:
-                removal_texts = [normalize_whitespace(self._sanitize_mirror_memory_text(content) or content)]
+                removal_texts = [normalize_whitespace(content)]
             for clean in removal_texts:
                 if not clean:
                     continue
@@ -2433,37 +3902,31 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             )
             self._sync_builtin_snapshot(reason="mirror_memory_remove")
         else:
+            if action == "replace" and old_text:
+                self._store.deactivate_matching(old_text, limit=10)
+                for old_candidate in self._mirror_memory_candidates(old_text):
+                    old_content = normalize_whitespace(str(old_candidate.get("content") or ""))
+                    if old_content:
+                        self._store.deactivate_matching(old_content, limit=10)
             if not candidates:
                 return
             for candidate in candidates:
-                effective_target = self._mirror_candidate_target(candidate, target)
+                effective_target = "user" if target == "user" else "memory"
                 metadata = {
                     **dict(candidate.get("metadata") or {}),
                     "target": target,
                     "action": action,
                     "snapshot_target": effective_target,
+                    "hermes_write": provenance,
                 }
-                result = self._store.upsert_fact(
-                    content=str(candidate.get("content") or ""),
-                    category=str(candidate.get("category") or "general"),
-                    topic=str(candidate.get("topic") or infer_topic(str(candidate.get("content") or ""), str(candidate.get("category") or "general"))),
-                    source=f"builtin_memory:{effective_target}",
-                    importance=int(candidate.get("importance") or 8),
-                    confidence=float(candidate.get("confidence") or 0.85),
-                    metadata=metadata,
-                    source_session_id=self._session_id,
-                    history_reason="mirror_memory",
-                )
-                self._candidate_to_preference(
+                self._store_candidate(
                     {
-                        "content": str(candidate.get("content") or ""),
-                        "category": str(candidate.get("category") or "general"),
-                        "topic": str(candidate.get("topic") or "builtin-memory"),
-                        "importance": int(candidate.get("importance") or 8),
-                        "confidence": float(candidate.get("confidence") or 0.85),
-                        "metadata": metadata,
+                        **candidate,
+                        "topic": str(candidate.get("topic") or "hermes-memory"),
+                        "metadata": {**metadata, "source_role": "tool"},
                     },
-                    dict(result.get("fact") or {}),
+                    source=f"builtin_memory:{effective_target}",
+                    session_id=session_id,
                 )
             self._store.rebuild_topics(
                 max_facts=self._cfg()["max_topic_facts"],
@@ -2474,27 +3937,22 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _handle_remember_fact(self, payload: Dict[str, Any]) -> None:
         if not self._store:
             return
-        result = self._store.upsert_fact(
-            content=str(payload.get("content") or ""),
-            category=str(payload.get("category") or "general"),
-            topic=str(payload.get("topic") or "general"),
-            source=str(payload.get("source") or "manual"),
-            importance=int(payload.get("importance") or 5),
-            confidence=float(payload.get("confidence") or 0.7),
-            metadata=dict(payload.get("metadata") or {}),
-            source_session_id=str(payload.get("session_id") or self._session_id),
-            history_reason=str(payload.get("source") or "manual"),
-        )
-        self._candidate_to_preference(
+        self._invalidate_prefetch_cache()
+        source = str(payload.get("source") or "manual")
+        self._store_candidate(
             {
                 "content": str(payload.get("content") or ""),
                 "category": str(payload.get("category") or "general"),
                 "topic": str(payload.get("topic") or "general"),
                 "importance": int(payload.get("importance") or 5),
                 "confidence": float(payload.get("confidence") or 0.7),
-                "metadata": dict(payload.get("metadata") or {}),
+                "metadata": {
+                    **dict(payload.get("metadata") or {}),
+                    "source_role": "assistant" if source == "delegation" else "tool",
+                },
             },
-            dict(result.get("fact") or {}),
+            source=source,
+            session_id=str(payload.get("session_id") or self._session_id),
         )
         self._store.rebuild_topics(
             max_facts=self._cfg()["max_topic_facts"],
@@ -2505,6 +3963,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _handle_extract_messages(self, payload: Dict[str, Any]) -> None:
         if not self._store:
             return
+        self._invalidate_prefetch_cache()
         session_id = str(payload.get("session_id") or self._session_id)
         messages = list(payload.get("messages") or [])
         source = str(payload.get("source") or "messages")
@@ -2514,6 +3973,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             fact_id = dict(result.get("fact") or {}).get("id")
             if fact_id is not None:
                 inserted_ids.append(int(fact_id))
+        if len(inserted_ids) > 1:
+            self._store.associate_fact_group(inserted_ids, relation="same_session_extract")
         self._store.rebuild_topics(
             max_facts=self._cfg()["max_topic_facts"],
             max_chars=self._cfg()["topic_summary_chars"],
@@ -2521,7 +3982,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if session_id:
             artifacts = self._store.get_session_artifacts(session_id, limit=8)
             summary = self._build_summary_text(artifacts=artifacts, messages=messages)
+            summary_sensitivity = "normal"
             if summary:
+                summary_sensitivity, _ = self._classify_sensitivity(summary)
                 self._store.upsert_summary(
                     label="Session Summary",
                     summary=summary,
@@ -2533,35 +3996,69 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     salience=0.72,
                     source_refs=self._collect_summary_refs(artifacts, per_section=4),
                     reason=source,
+                    sensitivity=summary_sensitivity,
                 )
             # Always close the session at session_end, even without a summary.
             if source == "session_end" or summary:
-                self._store.close_memory_session(session_id, summary=summary or "")
+                self._store.close_memory_session(
+                    session_id,
+                    summary=summary or "",
+                    sensitivity=summary_sensitivity,
+                )
         self._sync_builtin_snapshot(reason=f"extract_messages:{source}")
 
     def _run_consolidation(self, *, force: bool, reason: str) -> Dict[str, Any]:
         if not self._store:
             return {"status": "uninitialized"}
+        self._invalidate_prefetch_cache()
         if not self._consolidation_lock.acquire(blocking=False):
             return {"status": "busy"}
+        lease_acquired = False
         try:
-            result = run_consolidation(
-                self._store,
-                min_hours=self._cfg()["min_hours"],
-                min_sessions=self._cfg()["min_sessions"],
-                max_topic_facts=self._cfg()["max_topic_facts"],
-                topic_summary_chars=self._cfg()["topic_summary_chars"],
-                prune_after_days=self._cfg()["prune_after_days"],
-                session_summary_chars=self._cfg()["session_summary_chars"],
-                episode_retention_hours=float(self._cfg()["episode_body_retention_hours"]),
-                decay_half_life_days=float(self._cfg()["decay_half_life_days"]),
-                decay_min_salience=float(self._cfg()["decay_min_salience"]),
-                extractor=self._extract_turn_facts,
-                fact_writer=self._write_consolidation_fact,
-                force=force,
-                reason=reason,
+            lease_acquired = self._store.acquire_lease(
+                "consolidation", self._owner_id, ttl_seconds=max(300, self._cfg()["llm_timeout_seconds"] * 4)
             )
-            if result.get("status") == "completed" and self._cfg()["wiki_export_enabled"] and self._cfg()["wiki_export_on_consolidate"]:
+            if not lease_acquired:
+                return {"status": "busy", "reason": "another process owns the consolidation lease"}
+            batches: List[Dict[str, Any]] = []
+            result: Dict[str, Any] = {"status": "skipped"}
+            for batch_index in range(self._cfg()["consolidation_max_batches"]):
+                self._store.acquire_lease(
+                    "consolidation",
+                    self._owner_id,
+                    ttl_seconds=max(300, self._cfg()["llm_timeout_seconds"] * 4),
+                )
+                result = run_consolidation(
+                    self._store,
+                    min_hours=self._cfg()["min_hours"],
+                    min_sessions=self._cfg()["min_sessions"],
+                    max_topic_facts=self._cfg()["max_topic_facts"],
+                    topic_summary_chars=self._cfg()["topic_summary_chars"],
+                    prune_after_days=self._cfg()["prune_after_days"],
+                    session_summary_chars=self._cfg()["session_summary_chars"],
+                    episode_retention_hours=float(self._cfg()["episode_body_retention_hours"]),
+                    decay_half_life_days=float(self._cfg()["decay_half_life_days"]),
+                    decay_min_salience=float(self._cfg()["decay_min_salience"]),
+                    episode_batch_size=self._cfg()["consolidation_batch_size"],
+                    force=force or batch_index > 0,
+                    reason=reason if batch_index == 0 else f"{reason}:backlog",
+                )
+                batches.append(dict(result))
+                if result.get("status") != "completed" or int(result.get("backlog_remaining") or 0) <= 0:
+                    break
+            result = {**result, "batches_completed": len(batches), "batch_stats": batches}
+            result["maintenance"] = self._store.maintain(
+                episode_retention_hours=float(self._cfg()["episode_body_retention_hours"]),
+                trace_retention_days=float(self._cfg()["trace_retention_days"]),
+                history_retention_days=float(self._cfg()["history_retention_days"]),
+                sensitive_retention_days=float(self._cfg()["sensitive_retention_days"]),
+                max_database_mb=float(self._cfg()["max_database_mb"]),
+            )
+            if (
+                result.get("status") == "completed"
+                and self._cfg()["wiki_export_enabled"]
+                and self._cfg()["wiki_export_on_consolidate"]
+            ):
                 try:
                     result["wiki_export"] = self._export_compiled_wiki(reason=f"consolidation:{reason}")
                 except Exception as exc:
@@ -2571,33 +4068,27 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 result["builtin_snapshot"] = self._sync_builtin_snapshot(reason=f"consolidation:{reason}")
             return result
         finally:
+            if lease_acquired and self._store:
+                self._store.release_lease("consolidation", self._owner_id)
             self._consolidation_lock.release()
 
     def _extract_messages_facts(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
-        if self._llm_backend == "heuristic":
-            return extract_candidate_facts_from_messages(messages)
+        pending_user = ""
         for message in messages:
-            role = str(message.get("role") or message.get("type") or "")
-            content = message.get("content", "")
-            if isinstance(content, list):
-                content = " ".join(
-                    str(block.get("text", ""))
-                    for block in content
-                    if isinstance(block, dict)
-                )
-            text = str(content or "")
+            role = str(message.get("role") or message.get("type") or "").strip().casefold()
+            text = message_content_text(message.get("content", ""))
             if not text:
                 continue
-            source_role = "assistant" if "assistant" in role else "user"
-            if source_role == "assistant" and "remember" not in text.lower():
-                continue
-            candidates.extend(
-                self._extract_turn_facts(
-                    user_content=text if source_role == "user" else "",
-                    assistant_content=text if source_role == "assistant" else "",
-                )
-            )
+            if role in {"user", "human"}:
+                if pending_user:
+                    candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=""))
+                pending_user = text
+            elif role in {"assistant", "ai"}:
+                candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=text))
+                pending_user = ""
+        if pending_user:
+            candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=""))
         return self._dedupe_candidates(candidates)
 
     def _extract_turn_facts(
@@ -2607,57 +4098,37 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         assistant_content: str,
         created_at: float | None = None,
     ) -> List[Dict[str, Any]]:
-        heuristic = extract_candidate_facts_from_turn(
+        if not self._llm or not self._llm.enabled:
+            return []
+        sensitivity = self._classify_sensitivity(f"{user_content} {assistant_content}")[0]
+        if not self._remote_processing_allowed(sensitivity):
+            return []
+        return self._llm_extract_turn_facts(
             user_content=user_content,
             assistant_content=assistant_content,
             created_at=created_at,
         )
-        if self._llm_backend == "heuristic" or not self._llm or not self._llm.enabled:
-            return self._canonicalize_candidates(heuristic)
-        llm_facts = self._llm_extract_turn_facts(
-            user_content=user_content,
-            assistant_content=assistant_content,
-            heuristic=heuristic,
-            created_at=created_at,
-        )
-        if not llm_facts:
-            return self._canonicalize_candidates(heuristic)
-        if self._llm_backend == "llm":
-            return self._canonicalize_candidates(llm_facts)
-        return self._canonicalize_candidates(self._dedupe_candidates(heuristic + llm_facts))
 
     def _llm_extract_turn_facts(
         self,
         *,
         user_content: str,
         assistant_content: str,
-        heuristic: List[Dict[str, Any]],
         created_at: float | None = None,
     ) -> List[Dict[str, Any]]:
         if not self._llm or not self._llm.enabled:
             return []
         max_chars = self._cfg()["llm_max_input_chars"]
         user_text = normalize_whitespace(user_content)[:max_chars]
-        assistant_text = normalize_whitespace(assistant_content)[:max_chars]
-        seed_facts = [
-            {
-                "content": item["content"],
-                "category": item["category"],
-                "topic": item["topic"],
-                "subject_key": dict(item.get("metadata") or {}).get("subject_key", ""),
-                "value_key": dict(item.get("metadata") or {}).get("value_key", ""),
-                "exclusive": bool(dict(item.get("metadata") or {}).get("exclusive")),
-                "polarity": dict(item.get("metadata") or {}).get("polarity", 1),
-            }
-            for item in heuristic[:10]
-        ]
+        assistant_text = normalize_whitespace(assistant_content)[: max(0, max_chars - len(user_text))]
         system_prompt = (
             "You extract durable long-term memory facts for a personal AI assistant. "
             "Return JSON only, no markdown. "
             "Output schema: "
-            "{\"facts\":[{\"content\":string,\"category\":\"user_pref|project|environment|workflow|general\","
-            "\"topic\":string,\"importance\":1-10,\"confidence\":0-1,\"subject_key\":string,"
-            "\"value_key\":string,\"exclusive\":boolean,\"polarity\":-1|1}]}. "
+            '{"facts":[{"content":string,"category":"user_pref|project|environment|workflow|general",'
+            '"topic":string,"importance":1-10,"confidence":0-1,"subject_key":string,'
+            '"value_key":string,"exclusive":boolean,"polarity":-1|1,'
+            '"source_role":"user|assistant"}]}. '
             "Keep facts atomic, durable, and useful across sessions. "
             "ALWAYS assign a subject_key and value_key — never leave them empty. "
             "Canonical subject keys: "
@@ -2680,32 +4151,38 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "Use exclusive=true when a newer fact should replace older values for the same subject. "
             "Extract ALL personal details: family members by name, pets, hobbies, physical traits, "
             "daily routines, food preferences, personality, beliefs, finances. "
+            "Never treat an assistant guess or suggestion as a user fact; assistant-supported facts require explicit confirmation. "
             "Drop ephemeral task chatter (current activity, greetings, session meta). "
             "Convert relative dates to absolute dates when possible. "
-            "Return at most 10 facts."
+            "Set source_role to the message that supports each fact. Return at most 10 facts."
         )
         user_prompt = json.dumps(
             {
                 "reference_unix_time": created_at or time.time(),
                 "user_message": user_text,
                 "assistant_message": assistant_text,
-                "heuristic_seed_facts": seed_facts,
             },
-            ensure_ascii=True,
+            ensure_ascii=False,
         )
         data = self._llm.chat_json(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             temperature=0.1,
-            max_tokens=16384,
+            max_tokens=2000,
         )
+        if data is None and self._llm.last_request_succeeded is False:
+            state = self._llm.circuit_state
+            raise RuntimeError(f"automatic memory extraction failed: {state.get('last_error') or 'model unavailable'}")
         if not data or not isinstance(data.get("facts"), list):
+            raise RuntimeError("automatic memory extractor returned an invalid facts payload")
             return []
         facts: List[Dict[str, Any]] = []
         for raw in data.get("facts", [])[:10]:
             if not isinstance(raw, dict):
                 continue
-            normalized = normalize_candidate_fact(raw, source_role="assistant")
+            raw_role = str(raw.get("source_role") or "").strip().casefold()
+            source_role = raw_role if raw_role in {"user", "assistant"} else ("user" if user_text else "assistant")
+            normalized = normalize_candidate_fact(raw, source_role=source_role)
             if normalized:
                 facts.append(normalized)
         return self._canonicalize_candidates(self._dedupe_candidates(facts))
@@ -2730,172 +4207,24 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def _canonicalize_candidates(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
         for candidate in candidates:
-            item = dict(candidate)
-            metadata = dict(item.get("metadata") or {})
-            content = normalize_whitespace(str(item.get("content") or ""))
-            subject_key = str(metadata.get("subject_key") or "")
-            value_key = str(metadata.get("value_key") or "")
-            lowered = content.lower()
-
-            if subject_key == "project:deploy_method":
-                if "docker compose" in lowered:
-                    metadata["value_key"] = "docker-compose"
-                    item["content"] = "Project deploys with Docker Compose."
-                elif "nomad" in lowered:
-                    metadata["value_key"] = "nomad"
-                    item["content"] = "Project deploys with Nomad."
-                elif "kubernetes" in lowered or "k8s" in lowered:
-                    metadata["value_key"] = "kubernetes"
-                    item["content"] = "Project deploys with Kubernetes."
-                elif "docker" in lowered:
-                    metadata["value_key"] = "docker"
-                    item["content"] = "Project deploys with Docker."
-            elif subject_key == "project:test_command":
-                command_label = str(metadata.get("command_label") or "")
-                if "uv run pytest -q" in lowered:
-                    metadata["value_key"] = "uv-run-pytest-q"
-                    metadata["command_label"] = "uv run pytest -q"
-                    item["content"] = "Project tests run with uv run pytest -q."
-                elif "python -m unittest -q" in lowered:
-                    metadata["value_key"] = "python-m-unittest-q"
-                    metadata["command_label"] = "python -m unittest -q"
-                    item["content"] = "Project tests run with python -m unittest -q."
-                elif "pytest -q" in lowered:
-                    metadata["value_key"] = "pytest-q"
-                    metadata["command_label"] = "pytest -q"
-                    item["content"] = "Project tests run with pytest -q."
-                elif command_label:
-                    metadata["value_key"] = slugify(command_label)
-                    item["content"] = f"Project tests run with {command_label}."
-            elif subject_key == "project:database":
-                if "postgres" in lowered:
-                    metadata["value_key"] = "postgresql"
-                    item["content"] = "Primary project database is PostgreSQL."
-                elif "mysql" in lowered:
-                    metadata["value_key"] = "mysql"
-                    item["content"] = "Primary project database is MySQL."
-                elif "sqlite" in lowered:
-                    metadata["value_key"] = "sqlite"
-                    item["content"] = "Primary project database is SQLite."
-                elif "redis" in lowered:
-                    metadata["value_key"] = "redis"
-                    item["content"] = "Primary project database is Redis."
-            elif subject_key == "user:response_style":
-                if "detailed" in lowered or "verbose" in lowered:
-                    metadata["value_key"] = "detailed"
-                    item["content"] = "User prefers detailed responses."
-                elif "concise" in lowered or "brief" in lowered or "short" in lowered or "terse" in lowered:
-                    metadata["value_key"] = "concise"
-                    item["content"] = "User prefers concise responses."
-            elif subject_key.startswith("user:favorite:"):
-                trait = str(metadata.get("trait_label") or subject_key.split(":", 2)[-1].replace("-", " "))
-                value = str(metadata.get("value_label") or value_key.replace("-", " "))
-                trait = normalize_whitespace(trait)
-                value = normalize_whitespace(value)
-                if trait and value:
-                    metadata["value_key"] = value_key or value.lower().replace(" ", "-")
-                    item["content"] = f"User's favorite {trait} is {value}."
-            elif subject_key.startswith("user:preference:"):
-                item_label = str(metadata.get("item_label") or "")
-                if not item_label:
-                    # Fallback to slug, but reject if it looks like a DB key
-                    fallback = subject_key.split(":", 2)[-1].replace("-", " ")
-                    # Skip canonicalization if the fallback is a single generic word
-                    if fallback and " " not in fallback and fallback.lower() in (
-                        "food", "hobby", "enjoyment", "status", "location",
-                        "things", "stuff", "setting", "preference",
-                    ):
-                        continue
-                    item_label = normalize_whitespace(fallback)
-                item_label = normalize_whitespace(item_label)
-                if item_label:
-                    if int(metadata.get("polarity", 1) or 1) < 0 or value_key == "dislike":
-                        metadata["value_key"] = "dislike"
-                        item["content"] = f"User dislikes {item_label}."
-                    else:
-                        metadata["value_key"] = "like"
-                        item["content"] = f"User likes {item_label}."
-            elif subject_key == "user:diet":
-                diet = str(metadata.get("diet_label") or value_key.replace("-", " "))
-                diet = normalize_whitespace(diet)
-                if diet:
-                    metadata["value_key"] = value_key or diet.lower().replace(" ", "-")
-                    item["content"] = f"User is {diet}."
-            elif subject_key == "user:origin":
-                origin = str(metadata.get("origin_label") or value_key.replace("-", " "))
-                origin = normalize_whitespace(origin)
-                if origin:
-                    metadata["value_key"] = value_key or origin.lower().replace(" ", "-")
-                    item["content"] = f"User is from {origin}."
-            elif subject_key == "user:hometown":
-                hometown = str(metadata.get("hometown_label") or value_key.replace("-", " "))
-                hometown = normalize_whitespace(hometown)
-                if hometown:
-                    metadata["value_key"] = value_key or hometown.lower().replace(" ", "-")
-                    item["content"] = f"User grew up in {hometown}."
-            elif subject_key == "user:location:current":
-                location = str(metadata.get("location_label") or value_key.replace("-", " "))
-                location = normalize_whitespace(location)
-                if location:
-                    metadata["value_key"] = value_key or location.lower().replace(" ", "-")
-                    item["content"] = f"User lives in {location}."
-            elif subject_key == "user:pronouns":
-                pronouns = str(metadata.get("pronouns_label") or value_key.replace("-", "/"))
-                pronouns = normalize_whitespace(pronouns)
-                if pronouns:
-                    metadata["value_key"] = value_key or pronouns.lower().replace(" ", "-")
-                    item["content"] = f"User pronouns are {pronouns}."
-            elif subject_key == "user:relationship_status":
-                status = str(metadata.get("relationship_label") or value_key.replace("-", " "))
-                status = normalize_whitespace(status)
-                if status:
-                    metadata["value_key"] = value_key or status.lower().replace(" ", "-")
-                    item["content"] = f"User is {status}."
-            elif subject_key == "user:timezone":
-                timezone = str(metadata.get("timezone_label") or value_key.replace("-", " "))
-                timezone = normalize_whitespace(timezone)
-                if timezone:
-                    label = timezone if "/" in timezone else timezone.upper()
-                    metadata["timezone_label"] = label
-                    metadata["value_key"] = slugify(label)
-                    item["content"] = f"User's timezone is {label}."
-            elif subject_key.startswith("user:allergy:"):
-                item_label = str(metadata.get("item_label") or subject_key.split(":", 2)[-1].replace("-", " "))
-                item_label = normalize_whitespace(item_label)
-                if item_label:
-                    if int(metadata.get("polarity", 1) or 1) < 0 or value_key == "not-allergic":
-                        metadata["value_key"] = "not-allergic"
-                        item["content"] = f"User is not allergic to {item_label}."
-                    else:
-                        metadata["value_key"] = "allergic"
-                        item["content"] = f"User is allergic to {item_label}."
-            elif subject_key == "environment:shell":
-                for shell in ("bash", "zsh", "fish", "powershell"):
-                    if shell in lowered:
-                        metadata["value_key"] = shell
-                        item["content"] = f"Environment shell is {shell}."
-                        break
-            elif subject_key == "workflow:docker_sudo":
-                if "do not use sudo" in lowered or "don't use sudo" in lowered or "no sudo" in lowered:
-                    metadata["value_key"] = "no-sudo"
-                    item["content"] = "Do not use sudo for Docker commands."
-                elif "use sudo" in lowered:
-                    metadata["value_key"] = "sudo-required"
-                    item["content"] = "Use sudo for Docker commands."
-            elif subject_key == "workflow:manual_edits":
-                metadata["value_key"] = "apply-patch"
-                item["content"] = "Use apply_patch for manual file edits."
-            elif subject_key == "workflow:git_safety":
-                metadata["value_key"] = "avoid-git-reset-hard"
-                item["content"] = "Never use git reset --hard."
-
-            if subject_key and not metadata.get("value_key"):
-                metadata["value_key"] = value_key
-            item["metadata"] = metadata
-            normalized.append(item)
+            metadata = dict(candidate.get("metadata") or {})
+            source_role = str(metadata.get("source_role") or candidate.get("source_role") or "assistant")
+            raw = {
+                **dict(candidate),
+                "subject_key": candidate.get("subject_key", metadata.get("subject_key", "")),
+                "value_key": candidate.get("value_key", metadata.get("value_key", "")),
+                "exclusive": candidate.get("exclusive", metadata.get("exclusive", False)),
+                "polarity": candidate.get("polarity", metadata.get("polarity", 1)),
+                "metadata": metadata,
+            }
+            item = normalize_candidate_fact(raw, source_role=source_role)
+            if item:
+                normalized.append(item)
         return self._dedupe_candidates(normalized)
 
-    def _render_prefetch(self, query: str, results: Dict[str, List[Dict[str, Any]]], *, cues: Dict[str, Any] | None = None) -> str:
+    def _render_prefetch(
+        self, query: str, results: Dict[str, List[Dict[str, Any]]], *, cues: Dict[str, Any] | None = None
+    ) -> str:
         cue_map = dict(cues or {})
         mode = str(cue_map.get("mode") or "current_state")
         snapshot_lines: List[str] = []
@@ -2937,6 +4266,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         journal_lines = []
         for item in results.get("journals", [])[:2]:
             journal_lines.append(f"- {item.get('label')}: {item.get('content')}")
+        working_lines = [f"- {item.get('content')}" for item in results.get("working", [])[:4]]
+        intention_lines = [f"- {item.get('intention')}" for item in results.get("intentions", [])[:4]]
+        procedure_lines = [
+            f"- {item.get('label')}: " + " -> ".join(str(step) for step in item.get("steps", [])[:6])
+            for item in results.get("procedures", [])[:3]
+        ]
+        timeline_lines = [f"- {item.get('content')}" for item in results.get("timeline", [])[:3]]
 
         contradiction_subjects = set()
         if cue_map.get("subject_key"):
@@ -2953,6 +4289,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 max_age_days=14,
                 subject_keys=sorted(contradiction_subjects) if contradiction_subjects else None,
             )
+            rows = self._visible_sensitive_rows(rows, query)
             for row in rows:
                 winner = normalize_whitespace(str(row.get("winner_content") or ""))
                 loser = normalize_whitespace(str(row.get("loser_content") or ""))
@@ -2970,6 +4307,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     subject_key=subject_key,
                     facts=list(results.get("facts", [])),
                     limit=3,
+                    query=query,
                 ):
                     label = str(entry.get("source_label") or "")
                     session_text = str(entry.get("source_session_id") or "")
@@ -2989,20 +4327,54 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 deduped.append(line)
             provenance_lines = deduped[:6]
 
-        if not topic_lines and not summary_lines and not preference_lines and not workflow_lines and not fact_lines and not journal_lines and not contradiction_lines and not provenance_lines and not snapshot_lines:
+        if (
+            not topic_lines
+            and not summary_lines
+            and not preference_lines
+            and not workflow_lines
+            and not fact_lines
+            and not journal_lines
+            and not contradiction_lines
+            and not provenance_lines
+            and not snapshot_lines
+            and not working_lines
+            and not intention_lines
+            and not procedure_lines
+            and not timeline_lines
+        ):
             return ""
 
         lines = [f"## Consolidating Memory Recall for: {query}"]
         if mode in {"current_state", "summary", "workflow"}:
-            lines.append("Current-state guidance: prefer active current memory and avoid mentioning older conflicting values unless the user explicitly asks for history or provenance.")
+            lines.append(
+                "Current-state guidance: prefer active current memory and avoid mentioning older conflicting values unless the user explicitly asks for history or provenance."
+            )
         if mode == "summary":
             lines.append("Do not mention obsolete or superseded values, even as exclusions, contrasts, or examples.")
-            lines.append("When you answer, list only the current winner facts and stop. Do not append an exclusions note.")
-            lines.append("Use the winner snapshot as the source of truth. Do not add replacement history, caveats, or extra workflow items that are not in the snapshot.")
+            lines.append(
+                "When you answer, list only the current winner facts and stop. Do not append an exclusions note."
+            )
+            lines.append(
+                "Use the winner snapshot as the source of truth. Do not add replacement history, caveats, or extra workflow items that are not in the snapshot."
+            )
         if mode == "workflow":
-            lines.append("Use only the current workflow winners below for shell, test command, deploy method, and Docker sudo behavior.")
+            lines.append(
+                "Use only the current workflow winners below for shell, test command, deploy method, and Docker sudo behavior."
+            )
             lines.append("Do not append an obsolete-values note, contrast list, or superseded examples.")
         if mode == "current_state":
+            if working_lines:
+                lines.append("Active working memory:")
+                lines.extend(working_lines)
+            if intention_lines:
+                lines.append("Due intentions:")
+                lines.extend(intention_lines)
+            if procedure_lines:
+                lines.append("Relevant learned procedures:")
+                lines.extend(procedure_lines)
+            if timeline_lines:
+                lines.append("Relevant timeline events:")
+                lines.extend(timeline_lines)
             if preference_lines or workflow_lines:
                 lines.append("Active preferences and workflow rules:")
                 lines.extend(preference_lines + workflow_lines)
@@ -3034,6 +4406,18 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if provenance_lines:
             lines.append("Provenance trail:")
             lines.extend(provenance_lines)
+        if working_lines:
+            lines.append("Active working memory:")
+            lines.extend(working_lines)
+        if intention_lines:
+            lines.append("Due intentions:")
+            lines.extend(intention_lines)
+        if procedure_lines:
+            lines.append("Relevant learned procedures:")
+            lines.extend(procedure_lines)
+        if timeline_lines:
+            lines.append("Relevant timeline events:")
+            lines.extend(timeline_lines)
         if summary_lines:
             lines.append("Relevant summaries:")
             lines.extend(summary_lines)

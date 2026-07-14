@@ -1,267 +1,88 @@
-# consolidating_local
+# consolidating_local 3.0
 
-`consolidating_local` is a Hermes memory provider built around a layered local-memory model.
+This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
-It is meant to complement Hermes, not replace it.
+## Hermes integration
 
-Hermes keeps:
+The provider implements the current lifecycle:
 
-- bounded built-in prompt memory
-- full session history
+- `prefetch` returns fast FTS recall and consumes a bounded, expiring per-session cache.
+- `queue_prefetch` optionally performs embedding reranking off the request path.
+- `sync_turn(..., messages=...)` queues the completed turn, captures its episode, and optionally runs configured LLM extraction.
+- `on_session_switch` rotates session state for new, resumed, branched, rewound, and compressed sessions.
+- `on_memory_write(..., metadata=...)` mirrors committed built-in-memory writes with provenance and replacement information.
+- `on_session_end` and `on_pre_compress` distill summaries before context disappears.
+- `shutdown` stops accepting work, drains accepted FIFO tasks, and only then closes SQLite.
+- `backup_paths` declares configured storage outside `HERMES_HOME`.
 
-This provider keeps:
+Hermes cron, flush, and subagent contexts may recall data but cannot mutate the store.
 
-- short-lived raw turn buffers for consolidation
-- durable distilled memory
-- contradiction-aware state updates
-- provenance and history
-- an optional compiled markdown wiki mirror
+Shutdown waits up to `shutdown_timeout_seconds` (10 seconds by default). If an optional model call is still in flight, queued writes are moved to the durable SQLite spool and replayed when the worker recovers; Hermes is not held for the model timeout. The worker closes its database connection itself after the in-flight call returns.
 
-## Mental Model
+## Data layers
 
-The system has three layers:
+1. Raw capture: `episodes`, `memory_traces`, bounded `working_memory`
+2. Durable memory: evidence-backed facts, topics, summaries, preferences, policies, and journals
+3. Brain-inspired systems: procedures, prospective intentions, autobiographical events, and weighted associations
+4. Audit and consent: evidence observations, history, links, contradictions, sessions, and approvals
+5. Operations: durable pending work, maintenance leases, migrations, backups, repair, and redacted exports
 
-1. Raw capture
-
-- `episodes`
-- `traces`
-
-2. Distilled memory
-
-- `facts`
-- `summaries`
-- `preferences`
-- `policies`
-- `topics`
-- `contradictions`
-
-3. Derived output
-
-- compiled markdown wiki pages exported from SQLite
-
-The important rule is:
-
-- SQLite is the source of truth
-- markdown is generated output
-
-## What It Does
-
-Hook behavior:
-
-- `prefetch(query)`
-  Recalls relevant memory before a turn
-
-- `sync_turn(user, assistant)`
-  Stores a bounded episode buffer and a trace row
-
-- `on_turn_start(...)`
-  Checks the consolidation gate
-
-- `on_session_end(...)`
-  Extracts durable memory, refreshes session summaries, and requests consolidation
-
-- `on_pre_compress(...)`
-  Salvages durable signal and writes a handoff summary
-
-- `on_memory_write(...)`
-  Mirrors Hermes memory writes into the provider
-
-- `on_delegation(...)`
-  Stores delegation outcomes as workflow memory
-
-## Stored Objects
-
-- `episodes`
-  Short-lived raw turn buffers
-
-- `facts`
-  Durable extracted memories
-
-- `topics`
-  Topic summaries rebuilt from active facts
-
-- `memory_sessions`
-  Session metadata
-
-- `memory_traces`
-  Lightweight turn traces
-
-- `memory_journals`
-  Narrative notes
-
-- `memory_summaries`
-  Session, handoff, and derived summaries
-
-- `memory_preferences`
-  Stable user preferences
-
-- `memory_policies`
-  Workflow rules and operating constraints
-
-- `memory_history`
-  Append-only change log
-
-- `memory_links`
-  Typed provenance links
-
-- `contradictions`
-  Resolved assumption changes
+SQLite is canonical. Exported files are rebuildable.
 
 ## Tool
 
-The provider exposes one tool:
+The `consolidating_memory` tool supports:
 
-```text
-consolidating_memory
-```
+Alongside the original actions, v2 adds `explain`, `working`, `procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`, `maintain`, `backup`, and `export_json`.
 
-Actions:
+## Extraction and retrieval
 
-- `search`
-- `remember`
-- `forget`
-- `recent`
-- `contradictions`
-- `status`
-- `consolidate`
-- `journal`
-- `distill`
-- `history`
-- `policy`
-- `decay`
-- `export`
+- Automatic extraction is disabled unless both `llm_model` and `llm_base_url` are configured.
+- Automatic extraction is LLM-only. There is no rule-based extractor, hybrid extractor, or fallback.
+- Explicit Hermes memory-tool writes remain immediate and do not require an extraction model.
+- `retrieval_backend: fts` is the default.
+- `retrieval_backend: hybrid` reranks FTS candidates using an explicitly configured embedding endpoint.
 
-Search scopes:
+Both a model and base URL are required to enable either remote-capable client. Hermes' normal chat endpoint is never reused implicitly.
 
-- `all`
-- `facts`
-- `topics`
-- `episodes`
-- `summaries`
-- `journals`
-- `preferences`
-- `policies`
-
-## Compiled Wiki Export
-
-When enabled, the provider can export a markdown mirror of the current store.
-
-Generated files include:
-
-- `index.md`
-- `topics/*.md`
-- `sessions/*.md`
-- `preferences/index.md`
-- `policies/index.md`
-- `contradictions/index.md`
-
-This export is:
-
-- deterministic
-- safe to rerun
-- suitable for Obsidian-style browsing
-- cleaned up on rerun when old generated pages no longer belong
-
-## Companion Desktop App
-
-This provider also has a companion desktop control panel:
-
-- [Hermes Memory Control](https://github.com/b7216309-jpg/hermes-memory-control)
-
-The app is useful when you want to:
-
-- inspect facts, topics, preferences, and contradictions without querying SQLite by hand
-- edit the plugin config from a UI instead of editing YAML manually
-- browse the compiled wiki export in-app
-- visualize the memory graph and spot bad clusters or noisy facts
-
-Integration boundary:
-
-- this provider writes and reads the canonical SQLite store
-- the desktop app reads that same store and edits related operator-facing files
-- the app does not replace consolidation logic or become a second source of truth
-
-See [../../../docs/HERMES_MEMORY_CONTROL.md](../../../docs/HERMES_MEMORY_CONTROL.md) for the end-to-end workflow.
-
-## Install Into Hermes
-
-Copy this folder into your Hermes checkout:
-
-```text
-plugins/memory/consolidating_local/
-```
-
-Then configure Hermes:
+## Important defaults
 
 ```yaml
-memory:
-  provider: consolidating_local
-
 plugins:
   consolidating-local-memory:
     db_path: $HERMES_HOME/consolidating_memory.db
-    min_hours: 24
-    min_sessions: 5
-    scan_cooldown_seconds: 600
-    prefetch_limit: 8
-    max_topic_facts: 5
-    topic_summary_chars: 650
-    session_summary_chars: 900
-    prune_after_days: 90
-    episode_body_retention_hours: 24
-    decay_half_life_days: 90
-    decay_min_salience: 0.15
-    wiki_export_enabled: false
-    wiki_export_dir: $HERMES_HOME/consolidating_memory_wiki
-    wiki_export_on_consolidate: true
-    wiki_export_session_limit: 50
-    wiki_export_topic_limit: 100
-    extractor_backend: hybrid
+    memory_scope: user
+    sensitive_memory: ask
+    allow_sensitive_model_processing: false
+    conflict_policy: evidence
+    queue_max_size: 256
+    queue_max_attempts: 5
+    shutdown_timeout_seconds: 10
+    max_database_mb: 512
     retrieval_backend: fts
-    llm_model: ""
-    llm_base_url: ""
-    llm_timeout_seconds: 45
-    llm_max_input_chars: 4000
-    embedding_model: ""
-    embedding_base_url: ""
-    embedding_timeout_seconds: 20
-    embedding_candidate_limit: 16
+    builtin_snapshot_sync_enabled: false
+    wiki_export_enabled: false
 ```
 
-## Backends
+`memory_scope: user` creates a different hashed database and wiki subdirectory for every gateway user. A local CLI invocation without a user identity retains the configured legacy database. Shared Hermes `USER.md`/`MEMORY.md` snapshot writes are refused for user- and agent-scoped stores. Set `database_encryption: true` only after installing the `encryption` extra and exporting `CONSOLIDATING_MEMORY_DB_KEY`; startup fails rather than silently opening an unencrypted database when either requirement is missing.
 
-Extraction:
+Credentials are rejected even when other sensitive memories use the approval inbox. Only set `allow_credential_memory: true` for an intentional exception; the credential then follows `sensitive_memory`, and database encryption is strongly recommended.
 
-- `heuristic`
-- `hybrid`
-- `llm`
+Configured LLM and embedding endpoints never receive text classified as sensitive by default. `allow_sensitive_model_processing: true` is a separate explicit opt-in; credentials still require `allow_credential_memory: true` as well. When model processing is blocked, the provider still captures the redacted episode, accepts explicit memory-tool writes, and uses local FTS recall.
 
-Retrieval:
+For offline operations, stop Hermes and run:
 
-- `fts`
-- `hybrid`
-
-If a local LLM or embedding endpoint is unavailable, the provider falls back safely to heuristic extraction or plain FTS.
-
-## Current Strengths
-
-- Local-first operation
-- Exclusive-state contradiction handling
-- Session-aware summaries and handoff notes
-- Stable preference and policy memory
-- Append-only history and typed provenance
-- Optional compiled wiki mirror
-
-## Development
-
-Syntax check:
-
-```bash
-python -m compileall plugins/memory/consolidating_local
+```console
+hermes consolidating_local doctor
+hermes consolidating_local backup /path/to/backup.db
+hermes consolidating_local export /path/to/memory.json
+hermes consolidating_local retry-failed --confirm
 ```
 
-Run tests:
+Durable work uses exponential backoff and moves to a visible dead-letter queue after `queue_max_attempts`. `doctor` reports this as degraded; inspect its error details before using the explicit retry command because a failed task may already have completed part of its work. Portable JSON imports reconstruct durable memory state and relationships. SQLite backups remain complete and unredacted.
 
-```bash
-python -m unittest discover -s tests -v
-```
+Pass `--db /path/to/scoped.db` before the subcommand when operating on a per-user or per-agent database. For an encrypted database, set `CONSOLIDATING_MEMORY_DB_KEY` before every admin command. Restore is integrity-checked into a temporary database and atomically replaces the destination only after verification. Stop Hermes before repair, restore, import, or maintenance. From a source checkout, the equivalent entry point is `python -m plugins.memory.consolidating_local.admin --db PATH ...`.
+
+SQLite backups are consistent but intentionally unredacted. Agent tool calls default them under `HERMES_HOME`; writing one elsewhere requires `confirm=true`. Portable JSON and wiki exports remain the sharing-oriented, redacted formats.
+
+See the [root README](../../../README.md) for installation and the [deep dive](../../../docs/PLUGIN_DEEP_DIVE.md) for schema and operational details.

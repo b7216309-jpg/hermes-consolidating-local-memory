@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import json
 import os
+import re
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Set
+from typing import Any, Dict, List, Set
 
-from .store import MemoryStore, normalize_whitespace, pretty_topic, slugify
+from .store import MemoryStore, _looks_sensitive_for_export, normalize_whitespace, pretty_topic, slugify
 
 MANAGED_SUBDIRS = ("topics", "sessions", "preferences", "policies", "contradictions")
+MANIFEST_NAME = ".consolidating-memory-manifest.json"
 
 # ── Category display names & ordering ──
 _CATEGORY_ORDER = ["user_pref", "general", "project", "environment", "workflow"]
@@ -22,14 +27,34 @@ _CATEGORY_LABELS = {
 
 def _safe_page_name(value: str, *, fallback: str) -> str:
     clean = normalize_whitespace(value)
-    slug = slugify(clean) if clean else fallback
+    slug = (slugify(clean) if clean else fallback)[:80].rstrip("-_.") or fallback
     digest = hashlib.sha1(clean.encode("utf-8")).hexdigest()[:8] if clean else "00000000"
     return f"{slug}-{digest}.md"
+
+
+def _topic_page_path(slug: str) -> str:
+    return f"topics/{_safe_page_name(slug, fallback='topic')}"
 
 
 def _normalize_markdown(text: str) -> str:
     clean = str(text or "").replace("\r\n", "\n").strip()
     return clean + "\n"
+
+
+def _md(value: Any, *, limit: int | None = None) -> str:
+    text = str(value or "")
+    if limit is not None:
+        text = text[:limit]
+    text = html.escape(text, quote=False).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"([\\`*_{}\[\]|])", r"\\\1", text)
+
+
+def _is_sensitive_item(item: Dict[str, Any]) -> bool:
+    return _looks_sensitive_for_export(item)
+
+
+def _redact_rows(rows: List[Dict[str, Any]], enabled: bool) -> List[Dict[str, Any]]:
+    return [row for row in rows if not _is_sensitive_item(row)] if enabled else rows
 
 
 def _write_if_changed(path: Path, content: str) -> bool:
@@ -39,8 +64,41 @@ def _write_if_changed(path: Path, content: str) -> bool:
         if current == normalized:
             return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(normalized, encoding="utf-8")
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(normalized)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    finally:
+        if temp_path and temp_path.exists():
+            temp_path.unlink()
     return True
+
+
+def _safe_output_path(root: Path, relative: str) -> Path:
+    rel = Path(relative)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise ValueError(f"Unsafe wiki output path: {relative}")
+    candidate = root / rel
+    resolved_parent = candidate.parent.resolve()
+    if resolved_parent != root and root not in resolved_parent.parents:
+        raise ValueError(f"Wiki output escapes the export root: {relative}")
+    return candidate
 
 
 def _relative_link(from_rel: str, to_rel: str) -> str:
@@ -48,7 +106,7 @@ def _relative_link(from_rel: str, to_rel: str) -> str:
 
 
 def _bullet_link(label: str, target_rel: str, *, from_rel: str) -> str:
-    return f"[{label}]({_relative_link(from_rel, target_rel)})"
+    return f"[{_md(label)}]({_relative_link(from_rel, target_rel)})"
 
 
 def _fmt_ts(value: Any) -> str:
@@ -98,6 +156,7 @@ def _salience_tag(salience: float) -> str:
 #  INDEX PAGE
 # ────────────────────────────────────────────────
 
+
 def _render_index(
     *,
     counts: Dict[str, int],
@@ -137,7 +196,8 @@ def _render_index(
     # ── Facts grouped by category ──
     lines.append("## 🗂️ Facts by Category")
     lines.append("")
-    for cat in _CATEGORY_ORDER:
+    categories = _CATEGORY_ORDER + sorted(set(facts_by_category) - set(_CATEGORY_ORDER))
+    for cat in categories:
         cat_facts = facts_by_category.get(cat, [])
         if not cat_facts:
             continue
@@ -151,13 +211,13 @@ def _render_index(
             # Strip common prefixes for readability
             for pfx in ("user:", "environment:", "project:", "workflow:", "general:"):
                 if sk.startswith(pfx):
-                    sk = sk[len(pfx):]
+                    sk = sk[len(pfx) :]
                     break
             vk = str(f.get("value_key") or "—")
             content = str(f.get("content") or "")[:80]
             imp = int(f.get("importance") or 0)
             sal = float(f.get("salience") or 0)
-            lines.append(f"| `{sk}` | `{vk}` | {content} | {imp} | {_salience_tag(sal)} |")
+            lines.append(f"| `{_md(sk)}` | `{_md(vk)}` | {_md(content)} | {imp} | {_salience_tag(sal)} |")
         lines.append("")
 
     lines.append("---")
@@ -172,11 +232,11 @@ def _render_index(
         for topic in topics[:20]:
             target = topic_paths.get(str(topic.get("slug") or ""))
             title = str(topic.get("title") or pretty_topic(str(topic.get("slug") or "topic")))
-            link = _bullet_link(title, target, from_rel=rel) if target else title
+            link = _bullet_link(title, target, from_rel=rel) if target else _md(title)
             cat = str(topic.get("category") or "general")
             sal = float(topic.get("salience") or 0)
             updated = _fmt_ts_short(topic.get("updated_at")) or "—"
-            lines.append(f"| {link} | `{cat}` | {_salience_tag(sal)} | {updated} |")
+            lines.append(f"| {link} | `{_md(cat)}` | {_salience_tag(sal)} | {updated} |")
     else:
         lines.append("*No topics exported yet.*")
     lines.append("")
@@ -192,8 +252,8 @@ def _render_index(
             target = session_paths.get(session_id)
             summary = normalize_whitespace(str(session.get("summary") or "")) or "*No summary yet.*"
             started = _fmt_ts_short(session.get("started_at")) or ""
-            link = _bullet_link(f"**{session_id[:12]}…**", target, from_rel=rel) if target else f"**{session_id[:12]}**"
-            lines.append(f"- {link} ({started}): {summary[:120]}")
+            link = _bullet_link(f"{session_id[:12]}…", target, from_rel=rel) if target else _md(session_id[:12])
+            lines.append(f"- **{link}** ({started}): {_md(summary, limit=120)}")
     else:
         lines.append("*No session pages exported yet.*")
     lines.append("")
@@ -210,7 +270,7 @@ def _render_index(
             pk = str(item.get("preference_key") or item.get("label") or "")
             val = str(item.get("value") or item.get("content") or "")[:60]
             imp = int(item.get("importance") or 0)
-            lines.append(f"| `{pk}` | {val} | {imp} |")
+            lines.append(f"| `{_md(pk)}` | {_md(val)} | {imp} |")
     else:
         lines.append("*No active preferences.*")
     lines.append("")
@@ -222,7 +282,9 @@ def _render_index(
     lines.append("")
     if policies:
         for item in policies[:10]:
-            lines.append(f"- **{str(item.get('label') or item.get('policy_key') or 'Policy')}**: {str(item.get('content') or '')}")
+            lines.append(
+                f"- **{_md(item.get('label') or item.get('policy_key') or 'Policy')}**: {_md(item.get('content'))}"
+            )
     else:
         lines.append("*No active policies.*")
     lines.append("")
@@ -240,7 +302,7 @@ def _render_index(
             winner = normalize_whitespace(str(row.get("winner_content") or ""))[:50]
             loser = normalize_whitespace(str(row.get("loser_content") or ""))[:50]
             created = _fmt_ts_short(row.get("created_at")) or "—"
-            lines.append(f"| `{sk}` | ~~{loser}~~ | {winner} | {created} |")
+            lines.append(f"| `{_md(sk)}` | ~~{_md(loser)}~~ | {_md(winner)} | {created} |")
     else:
         lines.append("*No contradictions logged.*")
 
@@ -251,6 +313,7 @@ def _render_index(
 #  TOPIC PAGE
 # ────────────────────────────────────────────────
 
+
 def _render_topic_page(
     topic: Dict[str, Any],
     *,
@@ -258,16 +321,16 @@ def _render_topic_page(
     contradictions: List[Dict[str, Any]],
     session_paths: Dict[str, str],
 ) -> str:
-    rel = f"topics/{topic['slug']}.md"
+    rel = _topic_page_path(str(topic.get("slug") or "topic"))
     title = str(topic.get("title") or pretty_topic(str(topic.get("slug") or "topic")))
     sal = float(topic.get("salience") or 0)
     lines = [
-        f"# {title}",
+        f"# {_md(title)}",
         "",
         "| Property | Value |",
         "| --- | --- |",
-        f"| Slug | `{str(topic.get('slug') or '')}` |",
-        f"| Category | `{str(topic.get('category') or 'general')}` |",
+        f"| Slug | `{_md(topic.get('slug'))}` |",
+        f"| Category | `{_md(topic.get('category') or 'general')}` |",
         f"| Salience | {_salience_tag(sal)} ({sal:.2f}) |",
         f"| Updated | {_fmt_ts(topic.get('updated_at')) or 'unknown'} |",
         "",
@@ -275,7 +338,7 @@ def _render_topic_page(
         "",
         "## Summary",
         "",
-        str(topic.get("summary") or "*No summary available.*"),
+        _md(topic.get("summary")) if topic.get("summary") else "*No summary available.*",
         "",
         "---",
         "",
@@ -289,7 +352,7 @@ def _render_topic_page(
             content = str(fact.get("content") or "")[:100]
             imp = int(fact.get("importance") or 0)
             conf = float(fact.get("confidence") or 0)
-            lines.append(f"| {content} | {imp} | {conf:.0%} |")
+            lines.append(f"| {_md(content)} | {imp} | {conf:.0%} |")
     else:
         lines.append("*No supporting facts linked.*")
 
@@ -310,7 +373,8 @@ def _render_topic_page(
 
     lines.extend(["", "---", "", "## Contradictions", ""])
     topic_contradictions = [
-        row for row in contradictions
+        row
+        for row in contradictions
         if str(row.get("winner_topic") or "") == str(topic.get("slug") or "")
         or str(row.get("loser_topic") or "") == str(topic.get("slug") or "")
     ]
@@ -320,22 +384,28 @@ def _render_topic_page(
         for row in topic_contradictions[:10]:
             winner = normalize_whitespace(str(row.get("winner_content") or ""))[:50]
             loser = normalize_whitespace(str(row.get("loser_content") or ""))[:50]
-            lines.append(f"| `{str(row.get('subject_key') or 'unknown')}` | ~~{loser}~~ | {winner} |")
+            lines.append(f"| `{_md(row.get('subject_key') or 'unknown')}` | ~~{_md(loser)}~~ | {_md(winner)} |")
     else:
         lines.append("*No contradictions for this topic.*")
 
-    lines.extend([
-        "", "---", "",
-        "## Navigation", "",
-        f"- [← Back to Wiki]({_relative_link(rel, 'index.md')})",
-        f"- [Contradictions]({_relative_link(rel, 'contradictions/index.md')})",
-    ])
+    lines.extend(
+        [
+            "",
+            "---",
+            "",
+            "## Navigation",
+            "",
+            f"- [← Back to Wiki]({_relative_link(rel, 'index.md')})",
+            f"- [Contradictions]({_relative_link(rel, 'contradictions/index.md')})",
+        ]
+    )
     return "\n".join(lines)
 
 
 # ────────────────────────────────────────────────
 #  SESSION PAGE
 # ────────────────────────────────────────────────
+
 
 def _render_session_page(
     session: Dict[str, Any],
@@ -348,11 +418,11 @@ def _render_session_page(
     started = _fmt_ts(session.get("started_at")) or "unknown"
     ended = _fmt_ts(session.get("ended_at")) or "ongoing"
     lines = [
-        f"# Session `{session_id[:16]}…`",
+        f"# Session `{_md(session_id[:16])}…`",
         "",
         "| Property | Value |",
         "| --- | --- |",
-        f"| Status | `{str(session.get('status') or 'unknown')}` |",
+        f"| Status | `{_md(session.get('status') or 'unknown')}` |",
         f"| Started | {started} |",
         f"| Ended | {ended} |",
         f"| Last activity | {_fmt_ts(session.get('last_activity_at')) or 'unknown'} |",
@@ -361,7 +431,7 @@ def _render_session_page(
         "",
         "## Summary",
         "",
-        str(session.get("summary") or "*No session summary available.*"),
+        _md(session.get("summary")) if session.get("summary") else "*No session summary available.*",
         "",
         "---",
         "",
@@ -378,8 +448,12 @@ def _render_session_page(
             content = str(fact.get("content") or "")[:90]
             topic_slug = str(fact.get("topic") or "")
             topic_target = topic_paths.get(topic_slug)
-            topic_link = _bullet_link(pretty_topic(topic_slug), topic_target, from_rel=rel) if topic_target else pretty_topic(topic_slug)
-            lines.append(f"| {content} | {topic_link} |")
+            topic_link = (
+                _bullet_link(pretty_topic(topic_slug), topic_target, from_rel=rel)
+                if topic_target
+                else pretty_topic(topic_slug)
+            )
+            lines.append(f"| {_md(content)} | {topic_link} |")
     else:
         lines.append("*No extracted facts linked to this session.*")
 
@@ -388,7 +462,7 @@ def _render_session_page(
     lines.extend(["", "---", "", "## Preferences", ""])
     if preferences:
         for item in preferences:
-            lines.append(f"- {str(item.get('content') or item.get('label') or '')}")
+            lines.append(f"- {_md(item.get('content') or item.get('label'))}")
     else:
         lines.append("*No session-specific preferences.*")
 
@@ -397,7 +471,7 @@ def _render_session_page(
     lines.extend(["", "## Policies", ""])
     if policies:
         for item in policies:
-            lines.append(f"- {str(item.get('content') or item.get('label') or '')}")
+            lines.append(f"- {_md(item.get('content') or item.get('label'))}")
     else:
         lines.append("*No session-specific policies.*")
 
@@ -406,7 +480,7 @@ def _render_session_page(
     lines.extend(["", "## Journals", ""])
     if journals:
         for item in journals:
-            lines.append(f"- **{str(item.get('label') or 'Journal')}**: {str(item.get('content') or '')}")
+            lines.append(f"- **{_md(item.get('label') or 'Journal')}**: {_md(item.get('content'))}")
     else:
         lines.append("*No journals for this session.*")
 
@@ -415,7 +489,7 @@ def _render_session_page(
     lines.extend(["", "## Traces", ""])
     if traces:
         for item in traces[:10]:
-            lines.append(f"- {str(item.get('content') or '')}")
+            lines.append(f"- {_md(item.get('content'))}")
     else:
         lines.append("*No traces for this session.*")
 
@@ -438,6 +512,7 @@ def _render_session_page(
 # ────────────────────────────────────────────────
 #  PREFERENCES INDEX
 # ────────────────────────────────────────────────
+
 
 def _render_preferences_index(
     preferences: List[Dict[str, Any]],
@@ -462,8 +537,7 @@ def _render_preferences_index(
             val = str(item.get("value") or "")[:40]
             imp = int(item.get("importance") or 0)
             sal = float(item.get("salience") or 0)
-            session_id = str(item.get("source_session_id") or dict(item.get("metadata") or {}).get("session_id") or "")
-            lines.append(f"| `{pk}` | {label} | {val} | {imp} | {_salience_tag(sal)} |")
+            lines.append(f"| `{_md(pk)}` | {_md(label)} | {_md(val)} | {imp} | {_salience_tag(sal)} |")
     else:
         lines.append("*No active preferences.*")
     lines.extend(["", "---", "", f"[← Back to Wiki]({_relative_link(rel, 'index.md')})"])
@@ -473,6 +547,7 @@ def _render_preferences_index(
 # ────────────────────────────────────────────────
 #  POLICIES INDEX
 # ────────────────────────────────────────────────
+
 
 def _render_policies_index(
     policies: List[Dict[str, Any]],
@@ -495,7 +570,7 @@ def _render_policies_index(
             label = str(item.get("label") or item.get("policy_key") or "Policy")
             content = str(item.get("content") or "")[:80]
             imp = int(item.get("importance") or 0)
-            lines.append(f"| **{label}** | {content} | {imp} |")
+            lines.append(f"| **{_md(label)}** | {_md(content)} | {imp} |")
     else:
         lines.append("*No active policies.*")
     lines.extend(["", "---", "", f"[← Back to Wiki]({_relative_link(rel, 'index.md')})"])
@@ -505,6 +580,7 @@ def _render_policies_index(
 # ────────────────────────────────────────────────
 #  CONTRADICTIONS INDEX
 # ────────────────────────────────────────────────
+
 
 def _render_contradictions_index(contradictions: List[Dict[str, Any]]) -> str:
     rel = "contradictions/index.md"
@@ -524,7 +600,7 @@ def _render_contradictions_index(contradictions: List[Dict[str, Any]]) -> str:
             winner = normalize_whitespace(str(row.get("winner_content") or ""))[:60]
             loser = normalize_whitespace(str(row.get("loser_content") or ""))[:60]
             created = _fmt_ts_short(row.get("created_at")) or "—"
-            lines.append(f"| `{sk}` | ~~{loser}~~ | {winner} | {created} |")
+            lines.append(f"| `{_md(sk)}` | ~~{_md(loser)}~~ | {_md(winner)} | {created} |")
     else:
         lines.append("*No contradictions logged.*")
     lines.extend(["", "---", "", f"[← Back to Wiki]({_relative_link(rel, 'index.md')})"])
@@ -535,27 +611,53 @@ def _render_contradictions_index(contradictions: List[Dict[str, Any]]) -> str:
 #  MAIN EXPORT
 # ────────────────────────────────────────────────
 
+
 def export_compiled_wiki(
     store: MemoryStore,
     *,
     export_dir: str | Path,
     session_limit: int = 50,
     topic_limit: int = 100,
+    redact_sensitive: bool = True,
 ) -> Dict[str, Any]:
-    root = Path(export_dir).expanduser()
+    root = Path(export_dir).expanduser().resolve()
+    if root == Path(root.anchor):
+        raise ValueError("Refusing to export the memory wiki to a filesystem root")
     root.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(root, 0o700)
+    except OSError:
+        pass
+    manifest_path = root / MANIFEST_NAME
+    previously_owned: Set[str] = set()
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            candidates = manifest.get("generated_files", []) if isinstance(manifest, dict) else []
+            previously_owned = {
+                str(rel)
+                for rel in candidates
+                if isinstance(rel, str)
+                and rel.endswith(".md")
+                and not Path(rel).is_absolute()
+                and ".." not in Path(rel).parts
+            }
+        except (OSError, ValueError, TypeError):
+            previously_owned = set()
 
-    topics = store.list_topics(limit=topic_limit)
+    topics = _redact_rows(store.list_topics(limit=topic_limit), redact_sensitive)
     sessions = store.list_sessions(limit=session_limit)
-    preferences = store.list_preferences(limit=200)
-    policies = store.list_policies(limit=200)
-    contradictions = store.recent_contradictions(limit=200)
+    if redact_sensitive:
+        sessions = [{**session, "summary": ""} if _is_sensitive_item(session) else session for session in sessions]
+    preferences = _redact_rows(store.list_preferences(limit=200), redact_sensitive)
+    policies = _redact_rows(store.list_policies(limit=200), redact_sensitive)
+    contradictions = _redact_rows(store.recent_contradictions(limit=200), redact_sensitive)
     counts = store.counts()
 
     # Gather all active facts grouped by category for the index page
     facts_by_category: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        all_facts = store.list_active_facts(limit=500)
+        all_facts = _redact_rows(store.list_active_facts(limit=500), redact_sensitive)
     except AttributeError:
         # Fallback: query directly if list_active_facts doesn't exist
         all_facts = []
@@ -563,9 +665,15 @@ def export_compiled_wiki(
         cat = str(f.get("category") or "general")
         facts_by_category.setdefault(cat, []).append(f)
 
-    topic_paths = {str(topic.get("slug") or ""): f"topics/{str(topic.get('slug') or '')}.md" for topic in topics if topic.get("slug")}
+    topic_paths = {
+        str(topic.get("slug") or ""): _topic_page_path(str(topic.get("slug") or ""))
+        for topic in topics
+        if topic.get("slug")
+    }
     session_paths = {
-        str(session.get("session_id") or ""): f"sessions/{_safe_page_name(str(session.get('session_id') or ''), fallback='session')}"
+        str(
+            session.get("session_id") or ""
+        ): f"sessions/{_safe_page_name(str(session.get('session_id') or ''), fallback='session')}"
         for session in sessions
         if session.get("session_id")
     }
@@ -593,9 +701,9 @@ def export_compiled_wiki(
         topic_id = topic.get("id")
         if topic_id is None:
             continue
-        expected[f"topics/{slug}.md"] = _render_topic_page(
+        expected[topic_paths[slug]] = _render_topic_page(
             topic,
-            facts=store.topic_supporting_facts(int(topic_id), limit=20),
+            facts=_redact_rows(store.topic_supporting_facts(int(topic_id), limit=20), redact_sensitive),
             contradictions=contradictions,
             session_paths=session_paths,
         )
@@ -607,42 +715,47 @@ def export_compiled_wiki(
         rel = session_paths.get(session_id)
         if not rel:
             continue
+        artifacts = store.get_session_artifacts(session_id, limit=20)
+        for section in ("facts", "preferences", "journals", "summaries", "traces"):
+            artifacts[section] = _redact_rows(list(artifacts.get(section, [])), redact_sensitive)
         expected[rel] = _render_session_page(
             session,
-            artifacts=store.get_session_artifacts(session_id, limit=20),
+            artifacts=artifacts,
             topic_paths=topic_paths,
         )
 
     written = 0
     for rel, content in sorted(expected.items()):
-        if _write_if_changed(root / rel, content):
+        if _write_if_changed(_safe_output_path(root, rel), content):
             written += 1
 
     for subdir in MANAGED_SUBDIRS:
-        (root / subdir).mkdir(parents=True, exist_ok=True)
-
-    existing_files: Set[str] = set()
-    if (root / "index.md").exists():
-        existing_files.add("index.md")
-    for subdir in MANAGED_SUBDIRS:
-        base = root / subdir
-        if not base.exists():
-            continue
-        for file_path in sorted(base.rglob("*.md")):
-            existing_files.add(file_path.relative_to(root).as_posix())
+        managed_dir = _safe_output_path(root, f"{subdir}/.directory-safety-check").parent
+        managed_dir.mkdir(parents=True, exist_ok=True)
 
     expected_paths = set(expected.keys())
-    stale_paths = sorted(existing_files - expected_paths)
+    stale_paths = sorted(previously_owned - expected_paths)
+    pruned = 0
     for rel in stale_paths:
-        stale_file = root / rel
-        if stale_file.exists():
+        stale_file = (root / rel).resolve()
+        if root in stale_file.parents and stale_file.is_file():
             stale_file.unlink()
+            pruned += 1
+
+    _write_if_changed(
+        manifest_path,
+        json.dumps(
+            {"version": 1, "generated_files": sorted(expected_paths)},
+            ensure_ascii=False,
+            indent=2,
+        ),
+    )
 
     return {
         "root": str(root),
         "generated_files": len(expected_paths),
         "written_files": int(written),
-        "pruned_files": len(stale_paths),
+        "pruned_files": pruned,
         "topic_pages": len(topics),
         "session_pages": len(sessions),
         "index_files": 4,

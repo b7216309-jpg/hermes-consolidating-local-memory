@@ -26,6 +26,8 @@ The repos meet at three concrete files or directories inside a Hermes home:
 2. `consolidating_memory.db`
    The provider writes the SQLite database and the app inspects or edits its tables.
 
+   With v2 `memory_scope: user` or `agent`, gateway identities use hashed database files under `consolidating_memory_scopes/`. The control panel must select the intended scoped file; the legacy root database may no longer receive those users' writes.
+
 3. `consolidating_memory_wiki/`
    The provider generates the compiled wiki mirror and the app renders it for browsing.
 
@@ -34,12 +36,13 @@ Important boundary:
 - SQLite is the source of truth
 - the wiki export is derived output
 - the app should be treated as an operator tool, not as a second consolidation engine
+- direct edits must preserve v2 evidence, revision, temporal, sensitivity, and history invariants; prefer the provider tool or offline admin CLI for mutation until the app supports schema version 2
 
 ## Practical Workflow
 
 Typical setup:
 
-1. Install the plugin from this repo into your Hermes checkout.
+1. Run `python install.py` to install the provider into `$HERMES_HOME/plugins/consolidating_local`.
 2. Enable `consolidating_local` in Hermes `config.yaml`.
 3. Run Hermes until the provider creates `consolidating_memory.db`.
 4. Install and launch Hermes Memory Control on Windows.
@@ -57,10 +60,10 @@ Typical operating loop:
 
 Provider-side responsibilities in this repo:
 
-- lifecycle hooks such as `on_turn_start`, `on_session_end`, `on_pre_compress`, `on_memory_write`, and `on_delegation`
+- lifecycle hooks such as `on_turn_start`, `on_session_end`, `on_session_switch`, `on_pre_compress`, `on_memory_write`, and `on_delegation`
 - extraction, deduplication, contradiction handling, salience decay, and spaced review
 - topic rebuilding, summaries, provenance, and history
-- snapshot sync into `USER.md` and `MEMORY.md`
+- optional snapshot sync into `USER.md` and `MEMORY.md` (disabled by default)
 - compiled wiki export
 Desktop app responsibilities:
 
