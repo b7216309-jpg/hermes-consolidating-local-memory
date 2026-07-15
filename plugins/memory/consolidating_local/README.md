@@ -37,6 +37,12 @@ The `consolidating_memory` tool supports:
 
 Alongside the original actions, v2 adds `explain`, `working`, `procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`, `maintain`, `backup`, and `export_json`.
 
+Version 3.3.1 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
+or a direct human CLI turn. Synthetic gateway work and background review harnesses are excluded
+from recall warming, episodes, traces, working memory, fact extraction, and session summaries.
+Hermes 0.18.2 discovers the provider and general hooks separately, so `install.py` also enables the
+same package as a lifecycle observer; both module namespaces share one bounded origin ledger.
+
 ## Extraction and retrieval
 
 - Automatic extraction is disabled unless both `llm_model` and `llm_base_url` are configured.

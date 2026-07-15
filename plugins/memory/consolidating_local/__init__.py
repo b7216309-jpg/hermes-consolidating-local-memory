@@ -33,6 +33,14 @@ from .consolidation import (
     run_consolidation,
 )
 from .llm_client import OpenAICompatibleEmbeddings, OpenAICompatibleLLM, env_or_blank
+from .origin import (
+    gateway_user_dispatch_active,
+    is_gateway_platform,
+    mark_gateway_user_dispatch,
+    message_was_internal,
+    note_llm_turn,
+    should_capture_memory,
+)
 from .store import (
     MemoryStore,
     _as_bool,
@@ -47,7 +55,7 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.3.0"
+__version__ = "3.3.1"
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -254,6 +262,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._write_enabled = True
         self._last_scan_at = 0.0
         self._scope_id = "legacy"
+        self._platform = "cli"
         self._owner_id = f"{os.getpid()}-{uuid.uuid4().hex}"
         self._queue_metrics = {"enqueued": 0, "dropped_prefetch": 0, "spooled": 0, "failed": 0}
 
@@ -596,6 +605,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._hermes_home = hermes_home
         agent_context = str(kwargs.get("agent_context") or "primary").strip().lower()
         platform = str(kwargs.get("platform") or "cli").strip().lower()
+        self._platform = platform
         self._write_enabled = agent_context == "primary" and platform != "cron"
         db_path = str(self._config.get("db_path", "$HERMES_HOME/consolidating_memory.db"))
         db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
@@ -723,6 +733,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         clean = normalize_whitespace(query)
         if not clean:
             return ""
+        if not should_capture_memory(
+            session_id=key,
+            user_message=clean,
+            platform=self._platform,
+        ):
+            return ""
         with self._prefetch_lock:
             cached = self._prefetch_cache.get(key)
             cache_age = time.time() - float(cached.get("created_at") or 0.0) if cached else float("inf")
@@ -755,7 +771,14 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         clean = normalize_whitespace(query)
         if not clean or not self._store:
             return
-        self._enqueue("prefetch", query=clean, session_id=session_id or self._session_id)
+        key = session_id or self._session_id
+        if not should_capture_memory(
+            session_id=key,
+            user_message=clean,
+            platform=self._platform,
+        ):
+            return
+        self._enqueue("prefetch", query=clean, session_id=key, turn_origin="user")
 
     def sync_turn(
         self,
@@ -767,12 +790,20 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     ) -> None:
         if not self._write_enabled:
             return
+        key = session_id or self._session_id
+        if not should_capture_memory(
+            session_id=key,
+            user_message=user_content,
+            platform=self._platform,
+        ):
+            return
         self._enqueue(
             "sync_turn",
-            session_id=session_id or self._session_id,
+            session_id=key,
             user_content=user_content or "",
             assistant_content=assistant_content or "",
             messages=list(messages or []),
+            turn_origin="user",
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -803,7 +834,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         if not self._store or not self._write_enabled:
             return ""
-        candidates = self._extract_messages_facts(messages or [])
+        if is_gateway_platform(self._platform) and not gateway_user_dispatch_active():
+            return ""
+        candidates = self._extract_messages_facts(messages or [], session_id=self._session_id)
         inserted = 0
         preserved_candidates: List[Dict[str, Any]] = []
         source_refs: List[Dict[str, Any]] = []
@@ -4062,7 +4095,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 self._prefetch_cache.pop(oldest, None)
 
     def _handle_sync_turn(self, payload: Dict[str, Any]) -> None:
-        if not self._store:
+        if not self._store or payload.get("turn_origin") != "user":
             return
         self._invalidate_prefetch_cache()
         session_id = str(payload.get("session_id") or self._session_id)
@@ -4151,7 +4184,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             )
 
     def _handle_prefetch(self, payload: Dict[str, Any]) -> None:
-        if not self._store:
+        if not self._store or payload.get("turn_origin") != "user":
             return
         query = normalize_whitespace(str(payload.get("query") or ""))
         session_id = str(payload.get("session_id") or self._session_id)
@@ -4274,10 +4307,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return
         self._invalidate_prefetch_cache()
         session_id = str(payload.get("session_id") or self._session_id)
-        messages = list(payload.get("messages") or [])
+        messages = self._filter_internal_message_pairs(
+            list(payload.get("messages") or []),
+            session_id=session_id,
+        )
         source = str(payload.get("source") or "messages")
         inserted_ids: List[int] = []
-        for candidate in self._extract_messages_facts(messages):
+        for candidate in self._extract_messages_facts(messages, session_id=session_id):
             result = self._store_candidate(candidate, source=source, session_id=session_id)
             fact_id = dict(result.get("fact") or {}).get("id")
             if fact_id is not None:
@@ -4381,10 +4417,31 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 self._store.release_lease("consolidation", self._owner_id)
             self._consolidation_lock.release()
 
-    def _extract_messages_facts(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _filter_internal_message_pairs(
+        self, messages: List[Dict[str, Any]], *, session_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        skipping_internal_turn = False
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or message.get("type") or "").strip().casefold()
+            text = message_content_text(message.get("content", ""))
+            if role in {"user", "human"}:
+                skipping_internal_turn = bool(text and message_was_internal(session_id=session_id, user_message=text))
+                if skipping_internal_turn:
+                    continue
+            elif skipping_internal_turn:
+                if role in {"assistant", "ai"}:
+                    skipping_internal_turn = False
+                continue
+            filtered.append(message)
+        return filtered
+
+    def _extract_messages_facts(self, messages: List[Dict[str, Any]], *, session_id: str = "") -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
         pending_user = ""
-        for message in messages:
+        for message in self._filter_internal_message_pairs(messages, session_id=session_id):
             role = str(message.get("role") or message.get("type") or "").strip().casefold()
             text = message_content_text(message.get("content", ""))
             if not text:
@@ -4794,7 +4851,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
 
 def register(ctx) -> None:
-    ctx.register_memory_provider(ConsolidatingLocalMemoryProvider())
+    if hasattr(ctx, "register_memory_provider"):
+        ctx.register_memory_provider(ConsolidatingLocalMemoryProvider())
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_gateway_dispatch", mark_gateway_user_dispatch)
+        ctx.register_hook("pre_llm_call", note_llm_turn)
 
 
 ConsolidatingLocalProvider = ConsolidatingLocalMemoryProvider

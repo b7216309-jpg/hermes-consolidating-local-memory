@@ -7,6 +7,7 @@ import time
 from argparse import ArgumentParser
 from pathlib import Path
 from queue import Queue
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from consolidating_local import ConsolidatingLocalMemoryProvider
 from consolidating_local.admin import _restore
 from consolidating_local.cli import register_cli
 from consolidating_local.llm_client import OpenAICompatibleLLM
+from consolidating_local.origin import mark_gateway_user_dispatch, note_llm_turn
 from consolidating_local.store import MemoryStore
 
 
@@ -622,6 +624,12 @@ def test_provider_user_isolation_sensitive_consent_and_brain_tools(tmp_path):
         )
         assert visible_journal["results"]["journals"]
 
+        mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+        note_llm_turn(
+            session_id="s1",
+            user_message="My bank IBAN is FR00 PRIVATE",
+            platform="gateway",
+        )
         first.sync_turn("My bank IBAN is FR00 PRIVATE", "I understand", session_id="s1")
         first._task_queue.join()
         raw_episode = first._store._fetchone(

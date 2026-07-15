@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.3.1 — 2026-07-15
+
+- Added deterministic human-turn provenance using Hermes' user-only `pre_gateway_dispatch` hook
+  and a bounded thread-safe handoff to asynchronous memory-provider work.
+- Added explicit dual-path Hermes 0.18.2 registration: provider discovery supplies storage, general
+  plugin discovery supplies hooks, and both namespaces share one in-process origin ledger.
+- Updated the installer to enable the lifecycle observer without granting tool overrides and fail
+  visibly when Hermes cannot activate it.
+- Failed closed for unclassified gateway turns while preserving direct human CLI capture.
+- Excluded background process, delegation, recall, compression, kanban, background-review, and
+  other synthetic turns from prefetch, episodes, traces, working memory, extraction, and summaries.
+- Added regression coverage for genuine Telegram capture, internal Telegram exclusion, background
+  review pairing, plugin hook registration, and scoped gateway privacy behavior.
+
 ## 3.3.0 — 2026-07-15
 
 - Added structured fact time with explicit temporal kind, event time, validity interval, precision,

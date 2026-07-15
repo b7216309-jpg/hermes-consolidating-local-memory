@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.3.0](https://img.shields.io/badge/version-3.3.0-14b8a6)](CHANGELOG.md)
+[![Version 3.3.1](https://img.shields.io/badge/version-3.3.1-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -58,13 +58,19 @@ $HERMES_HOME/plugins/consolidating_local/
 python install.py --hermes-home /path/to/hermes-home
 ```
 
+The installer also enables `consolidating_local` in Hermes' general plugin allow-list. Hermes
+0.18.2 loads memory providers and lifecycle hooks through separate discovery paths: provider
+selection supplies storage, while the enabled lifecycle observer supplies authoritative human-turn
+provenance. Both are required for automatic gateway capture and share one bounded in-process origin
+ledger. No model tool override is granted.
+
 Preview the destination without changing files:
 
 ```console
 python install.py --dry-run
 ```
 
-> Installing the Python wheel alone does not place a standalone plugin where Hermes discovers it. Use `install.py` for a Hermes installation. The wheel exists for packaging and library environments.
+> Installing the Python wheel alone does not place a standalone plugin where Hermes discovers it. Use `install.py` for a Hermes installation. If you copy files manually, also run `hermes plugins enable consolidating_local --no-allow-tool-override`. The wheel exists for packaging and library environments.
 
 ### 2. Select the provider
 
@@ -115,7 +121,19 @@ There are two independent write paths:
 1. **Explicit memory writes:** a user or the primary Hermes agent calls the memory tool. The privacy gate checks the value, then writes the requested fact, preference, policy, procedure, intention, journal entry, or relationship exactly. No model is required.
 2. **Completed turns:** Hermes sends the completed conversation turn to the provider. It stores a bounded, redacted episode and trace. When both `llm_model` and `llm_base_url` are configured, the approved text is also sent to that endpoint for structured fact extraction.
 
-System, developer, and tool messages are excluded from conversational fact extraction. Cron, flush, and subagent contexts can recall memories but cannot mutate the primary store.
+System, developer, and tool messages are excluded from conversational fact extraction. The plugin
+also uses Hermes' `pre_gateway_dispatch` boundary to distinguish a genuine inbound gateway message
+from background-process notifications, delegation completions, recalled-message handoffs,
+background memory reviews, compression, kanban wakes, and other synthetic turns. Internal turns do
+not prefetch, create episodes or traces, update working memory, extract facts, or enter session
+summaries. Direct human CLI turns remain supported. Unknown gateway turns fail closed instead of
+being assumed human.
+
+This boundary is deterministic transport provenance, not a replacement text extractor. A small
+bounded in-process ledger carries the origin across Hermes' asynchronous memory worker; no message
+content or user identifier is persisted by that ledger.
+
+Cron, flush, and subagent contexts can recall memories but cannot mutate the primary store.
 
 ### Store and reconcile
 
@@ -588,6 +606,8 @@ The provider should be selected and available; every `doctor` result should have
 | Symptom | What to check |
 | --- | --- |
 | `consolidating_local` is not listed | Run `python install.py`; confirm `$HERMES_HOME/plugins/consolidating_local/plugin.yaml` exists; restart Hermes. |
+| Provider is selected but gateway turns are never captured | Confirm `consolidating_local` is also enabled in `hermes plugins list`. Hermes loads the provider and its lifecycle observer separately. Re-run `python install.py` or enable it explicitly without tool override. |
+| An internal process notification appears as a memory | Upgrade to 3.3.1 or later and restart every Hermes process so the `pre_gateway_dispatch` and `pre_llm_call` hooks are active. Existing polluted rows must be removed from a verified backup or through an audited database cleanup; upgrading prevents new contamination but does not guess which old rows were invalid. |
 | Provider reports unavailable | If encryption is enabled, install `sqlcipher3` and set `CONSOLIDATING_MEMORY_DB_KEY` in the Hermes process environment. |
 | Explicit writes work but no automatic facts appear | Configure both `llm_model` and `llm_base_url`. This is intentional—there is no heuristic fallback. |
 | Extraction retries with `model response did not contain visible content` | A reasoning endpoint returned no final answer. If it supports Qwen chat-template arguments, set `llm_disable_thinking: true`; otherwise disable that option and inspect the endpoint's reasoning configuration. |

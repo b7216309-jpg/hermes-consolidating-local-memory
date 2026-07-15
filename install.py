@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,10 +13,23 @@ def _hermes_home(value: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _hermes_executable() -> str | None:
+    executable = shutil.which("hermes")
+    if executable:
+        return executable
+    user_executable = Path.home() / ".local" / "bin" / "hermes"
+    return str(user_executable) if user_executable.is_file() else None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install or update the consolidating_local Hermes memory provider.")
     parser.add_argument("--hermes-home", default="", help="Hermes home (defaults to HERMES_HOME or ~/.hermes)")
     parser.add_argument("--dry-run", action="store_true", help="Show the destination without changing files")
+    parser.add_argument(
+        "--no-enable",
+        action="store_true",
+        help="Do not enable the lifecycle observer; automatic gateway capture will remain unavailable",
+    )
     args = parser.parse_args()
 
     source = Path(__file__).resolve().parent / "plugins" / "memory" / "consolidating_local"
@@ -57,6 +71,24 @@ def main() -> int:
             shutil.rmtree(backup)
 
     print(f"Installed consolidating_local to {destination}")
+    if not args.no_enable:
+        hermes = _hermes_executable()
+        if not hermes:
+            print(
+                "Plugin copied, but Hermes was not found. Run `hermes plugins enable consolidating_local --no-allow-tool-override` before use.",
+                file=sys.stderr,
+            )
+            return 1
+        completed = subprocess.run(
+            [hermes, "plugins", "enable", "consolidating_local", "--no-allow-tool-override"],
+            check=False,
+        )
+        if completed.returncode:
+            print(
+                "Plugin copied, but its lifecycle observer could not be enabled. Automatic gateway capture is fail-closed until it is enabled.",
+                file=sys.stderr,
+            )
+            return completed.returncode
     print("Next: run `hermes memory setup` and select `consolidating_local`, or set memory.provider in config.yaml.")
     return 0
 

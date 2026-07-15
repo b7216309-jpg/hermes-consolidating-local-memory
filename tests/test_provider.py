@@ -1,9 +1,20 @@
 from __future__ import annotations
 
+import importlib.util
 import inspect
 import json
+import sys
+from contextvars import copy_context
+from pathlib import Path
+from types import SimpleNamespace
 
-from consolidating_local import ConsolidatingLocalMemoryProvider
+from consolidating_local import ConsolidatingLocalMemoryProvider, register
+from consolidating_local.origin import (
+    classify_turn,
+    mark_gateway_user_dispatch,
+    note_llm_turn,
+    reset_origin_state,
+)
 from consolidating_local.store import MemoryStore
 
 
@@ -21,6 +32,188 @@ def test_current_hermes_hook_signatures_are_supported():
     assert "messages" in sync.parameters
     assert "metadata" in memory_write.parameters
     assert hasattr(ConsolidatingLocalMemoryProvider, "on_session_switch")
+
+
+def test_plugin_registers_authoritative_gateway_origin_hooks():
+    class FakeContext:
+        def __init__(self):
+            self.providers = []
+            self.hooks = {}
+
+        def register_memory_provider(self, provider):
+            self.providers.append(provider)
+
+        def register_hook(self, name, handler):
+            self.hooks[name] = handler
+
+    context = FakeContext()
+    register(context)
+    assert len(context.providers) == 1
+    assert set(context.hooks) == {"pre_gateway_dispatch", "pre_llm_call"}
+
+
+def test_register_supports_hermes_separate_provider_and_hook_contexts():
+    class ProviderContext:
+        def __init__(self):
+            self.providers = []
+
+        def register_memory_provider(self, provider):
+            self.providers.append(provider)
+
+    class HookContext:
+        def __init__(self):
+            self.hooks = {}
+
+        def register_hook(self, name, handler):
+            self.hooks[name] = handler
+
+    provider_context = ProviderContext()
+    hook_context = HookContext()
+    register(provider_context)
+    register(hook_context)
+    assert len(provider_context.providers) == 1
+    assert set(hook_context.hooks) == {"pre_gateway_dispatch", "pre_llm_call"}
+
+
+def test_origin_state_is_shared_across_hermes_module_namespaces():
+    origin_path = Path(__file__).resolve().parents[1] / "plugins" / "memory" / "consolidating_local" / "origin.py"
+
+    def load_copy(name):
+        spec = importlib.util.spec_from_file_location(name, origin_path)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    first = load_copy("_test_memory_origin_general")
+    second = load_copy("_test_memory_origin_provider")
+    try:
+        first.reset_origin_state()
+        first.mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+        assert (
+            second.classify_turn(
+                session_id="shared-session",
+                user_message="real inbound",
+                platform="telegram",
+            )
+            == "user"
+        )
+        second.note_llm_turn(
+            session_id="shared-session",
+            user_message="remember this turn",
+            platform="cli",
+        )
+        assert first.recorded_origin("shared-session", "remember this turn") == "user"
+    finally:
+        first.reset_origin_state()
+        sys.modules.pop("_test_memory_origin_general", None)
+        sys.modules.pop("_test_memory_origin_provider", None)
+
+
+def test_gateway_marker_is_single_use_across_copied_contexts():
+    reset_origin_state()
+    mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+    copied = copy_context()
+    assert (
+        copied.run(
+            classify_turn,
+            session_id="gateway-session",
+            user_message="real inbound",
+            platform="mattermost",
+        )
+        == "user"
+    )
+    assert (
+        classify_turn(
+            session_id="gateway-session",
+            user_message="nested synthetic turn",
+            platform="mattermost",
+        )
+        == "internal"
+    )
+    reset_origin_state()
+
+
+def test_gateway_internal_turns_never_enter_memory(tmp_path):
+    reset_origin_state()
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
+    provider.initialize(
+        "telegram-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+    )
+    try:
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message="internal process result",
+            platform="telegram",
+        )
+        provider.sync_turn(
+            "internal process result",
+            "internal acknowledgement",
+            session_id="telegram-session",
+        )
+        provider.queue_prefetch("internal process result", session_id="telegram-session")
+        assert provider.prefetch("internal process result", session_id="telegram-session") == ""
+        provider._task_queue.join()
+        assert provider._store.counts()["episodes"] == 0
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
+def test_real_gateway_turn_is_captured_once(tmp_path):
+    reset_origin_state()
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
+    provider.initialize(
+        "telegram-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+    )
+    try:
+        mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message="a genuine human turn",
+            platform="telegram",
+        )
+        provider.sync_turn(
+            "a genuine human turn",
+            "one answer",
+            session_id="telegram-session",
+        )
+        provider._task_queue.join()
+        assert provider._store.counts()["episodes"] == 1
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
+def test_background_review_and_its_assistant_pair_are_excluded_from_history_extraction(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "_extract_turn_facts",
+        lambda **kwargs: calls.append(kwargs) or [],
+    )
+    review_prompt = "Review the conversation above and consider saving to memory if appropriate."
+    try:
+        provider._extract_messages_facts(
+            [
+                {"role": "user", "content": "a genuine human turn"},
+                {"role": "assistant", "content": "a genuine answer"},
+                {"role": "user", "content": review_prompt},
+                {"role": "assistant", "content": "hidden review result"},
+            ],
+            session_id="session-old",
+        )
+        assert calls == [{"user_content": "a genuine human turn", "assistant_content": "a genuine answer"}]
+    finally:
+        provider.shutdown()
 
 
 def test_defaults_are_local_and_do_not_rewrite_builtin_memory():
