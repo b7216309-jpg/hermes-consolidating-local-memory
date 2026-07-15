@@ -2,14 +2,14 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.2.0](https://img.shields.io/badge/version-3.2.0-14b8a6)](CHANGELOG.md)
+[![Version 3.3.0](https://img.shields.io/badge/version-3.3.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
 
 Version 3 removes the old heuristic extractor. Automatic fact extraction is now model-backed and opt-in. With no model configured, the provider still records redacted episodes, mirrors explicit Hermes memory writes exactly, and performs local full-text recall; it never guesses facts with rules.
 
-Version 3.2 adds strict non-thinking extraction for compatible Qwen and OpenAI-style endpoints. Version 3.1 added review-first profile onboarding, which can seed facts, preferences, policies, procedures, and intentions into the exact local, user, or agent scope used by Hermes. Onboarding memories are `local_only`: they remain available to Hermes through local FTS5 but are withheld from remote embedding endpoints.
+Version 3.3 adds structured temporal memory. The extractor receives Hermes' local date, time, and timezone; facts distinguish when something happened, when a state is valid, and when it was merely recorded; recall renders absolute and relative time without treating a past plan as a confirmed event. Version 3.2 added strict non-thinking extraction for compatible Qwen and OpenAI-style endpoints. Version 3.1 added review-first profile onboarding.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -18,6 +18,7 @@ Version 3.2 adds strict non-thinking extraction for compatible Qwen and OpenAI-s
 - **Local by default:** SQLite and FTS5 are the canonical store. No service is required.
 - **Private by design:** sensitive-memory admission, credential blocking, scope isolation, redacted exports, and optional SQLCipher encryption.
 - **Evidence-aware:** each durable fact retains provenance, observations, confidence, revisions, and contradiction history.
+- **Time-aware:** event time, state validity, recording time, precision, timezone, and temporal confidence remain distinct and auditable.
 - **Brain-inspired memory systems:** working, episodic, semantic, procedural, prospective, autobiographical, and associative memory work together.
 - **Crash-resistant:** WAL storage, a durable work spool, bounded retries, dead-letter inspection, integrity checks, atomic restore, and consistent backup.
 - **Fast recall:** synchronous local FTS5 retrieval, with optional asynchronous embedding reranking.
@@ -120,9 +121,19 @@ System, developer, and tool messages are excluded from conversational fact extra
 
 SQLite holds the canonical state. Durable facts are linked to evidence observations, sessions, source roles, timestamps, confidence, correction markers, and history. Exclusive facts are resolved by evidence strength by default; losing claims remain available as inactive history instead of disappearing. `conflict_policy: newest` is available when last-write-wins behavior is preferred.
 
+Every fact also has a temporal class: `atemporal`, `current`, `event`, `scheduled`, or `temporary`. The store keeps `event_at`, `valid_from`, `valid_until`, precision, source timezone, and temporal confidence separately from `created_at`, `updated_at`, and evidence-observation time. This avoids the common mistake of treating “Hermes learned this today” as “this happened today.”
+
 ### Recall
 
-At turn start, Hermes asks the provider for relevant context. Local FTS5 recall returns a small bounded set immediately. In `hybrid` mode, a configured embedding endpoint reranks FTS candidates off the request path and caches the result for the next turn. Sensitive text is never sent to a model endpoint unless separately allowed.
+At turn start, Hermes asks the provider for relevant context. Local FTS5 recall returns a small bounded set immediately. The injected block begins with the current localized time, explains the timestamp contract, and labels recalled objects with useful absolute and relative times such as `event: 2026-07-14 18:30 CEST (yesterday)` or `recorded 3 days ago`. Expired current-state facts are excluded, while their history and linked autobiographical timeline entries remain auditable. A passed scheduled time is explicitly a past plan, not proof that the event occurred.
+
+In `hybrid` mode, a configured embedding endpoint reranks FTS candidates off the request path and caches the result for the next turn. Sensitive text is never sent to a model endpoint unless separately allowed.
+
+### Temporal extraction
+
+For completed turns, the configured extractor receives `reference_unix_time`, `reference_local_time`, and `reference_timezone`. It resolves relative expressions such as “yesterday,” “tomorrow morning,” and “next Friday” against that reference. It must preserve uncertainty: a date without an hour stays day-precision, and missing details are not invented.
+
+One-time scheduled facts receive a bounded validity window. Once that window passes they stop appearing as current state, but the original plan remains in the autobiographical timeline. Recurrent or conditional reminders remain prospective memories and should be resolved explicitly. All numeric timestamps are stored as Unix UTC seconds; timezone and precision are retained for correct local rendering.
 
 ### Consolidate
 
@@ -153,6 +164,9 @@ Provider selection uses the underscore name `consolidating_local`. Advanced opti
 memory:
   provider: consolidating_local
 
+# Used by Hermes message timestamps and by temporal extraction/recall.
+timezone: Europe/Paris
+
 plugins:
   consolidating-local-memory:
     db_path: $HERMES_HOME/consolidating_memory.db
@@ -163,6 +177,8 @@ plugins:
 ```
 
 All advanced options are optional.
+
+Set Hermes' top-level `timezone` to a valid IANA name. The provider uses the same native Hermes timezone when available, with the host timezone as a fallback. Native gateway message timestamps and structured memory time complement one another: message timestamps orient the current transcript, while this plugin preserves temporal meaning after consolidation.
 
 ### Hardened hybrid example
 
@@ -412,6 +428,8 @@ The provider exposes the `consolidating_memory` tool with 28 actions:
 
 Mutating or sensitive actions are rejected outside the primary agent context. The tool schema describes the required fields for each action directly to Hermes.
 
+`remember` and `timeline` accept optional Unix temporal fields: `event_at`, `valid_from`, `valid_until`, `temporal_kind`, `temporal_precision`, `temporal_timezone`, and `temporal_confidence`. Use `event_at` for when an event happened or is planned, validity fields for how long a state applies, and leave unknown precision unknown rather than supplying a guessed hour. An explicit `event` or `scheduled` fact requires `event_at`; the provider will not substitute the time it learned the fact. Dated `remember` facts are linked into the same persistent timeline as extracted facts.
+
 ## Guided onboarding
 
 `onboard` builds an initial user profile without creating a separate profile silo. Answers become normal memory objects:
@@ -525,7 +543,9 @@ python -m plugins.memory.consolidating_local.admin --db /path/to/database.db doc
 
 Version 3 removes `consolidator.py` and every rule-based extraction path. The obsolete `extractor_backend` setting is safely ignored if it remains in an old configuration. Existing durable facts are preserved; startup applies recorded additive migrations and rebuilds supporting indexes when necessary.
 
-Version 3.2 adds the optional `llm_disable_thinking` extraction setting without changing the database schema. Reinstall the plugin bundle, then enable the option only if the configured OpenAI-compatible endpoint supports Qwen chat-template arguments. Version 3.1 added the onboarding module and scope-aware native CLI; running onboarding against an existing profile remains safe because unchanged entries do not create duplicate evidence/history.
+Version 3.3 adds the recorded `structured_temporal_context` migration. Existing facts are classified conservatively from durable metadata without inventing event dates: exclusive state facts become `current`, dated validity becomes `temporary`, autobiographical facts become `event`, and other facts remain `atemporal`. Reinstalling is sufficient; startup adds the columns and index atomically. Run `doctor` after the first start.
+
+Version 3.2 added the optional `llm_disable_thinking` extraction setting without changing the database schema. Reinstall the plugin bundle, then enable the option only if the configured OpenAI-compatible endpoint supports Qwen chat-template arguments. Version 3.1 added the onboarding module and scope-aware native CLI; running onboarding against an existing profile remains safe because unchanged entries do not create duplicate evidence/history.
 
 ## Data locations
 
@@ -571,6 +591,8 @@ The provider should be selected and available; every `doctor` result should have
 | Provider reports unavailable | If encryption is enabled, install `sqlcipher3` and set `CONSOLIDATING_MEMORY_DB_KEY` in the Hermes process environment. |
 | Explicit writes work but no automatic facts appear | Configure both `llm_model` and `llm_base_url`. This is intentional—there is no heuristic fallback. |
 | Extraction retries with `model response did not contain visible content` | A reasoning endpoint returned no final answer. If it supports Qwen chat-template arguments, set `llm_disable_thinking: true`; otherwise disable that option and inspect the endpoint's reasoning configuration. |
+| A remembered plan is shown as completed | A schedule records intent, not outcome. Store a later event or explicit correction when it actually happens; passed schedules are labeled as unconfirmed and remain only in timeline/history after expiry. |
+| A relative date resolves in the wrong zone | Set Hermes' top-level `timezone` to the correct IANA name, restart the gateway, and inspect the fact's `temporal_timezone` and precision in the Control Center or JSON export. |
 | Semantically similar wording is missed | Default FTS is lexical. Configure `retrieval_backend: hybrid` plus both embedding settings. |
 | CLI shows an empty database | Local CLI and gateway users are isolated by default. Use `--scope-platform` plus `--scope-user-id`, or pass the exact scoped database with `--db`. |
 | Onboarded profile appears in CLI but not Telegram | Apply the same reviewed answer file to the Telegram scope; onboarding does not copy personal profiles across users automatically. |

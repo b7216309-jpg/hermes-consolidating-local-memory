@@ -133,6 +133,16 @@ def _fmt_ts_short(value: Any) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts))
 
 
+def _fact_temporal_label(row: Dict[str, Any]) -> str:
+    kind = str(row.get("temporal_kind") or "atemporal")
+    if kind in {"event", "scheduled"} and float(row.get("event_at") or 0) > 0:
+        return f"{kind}: {_fmt_ts_short(row.get('event_at'))}"
+    if float(row.get("valid_until") or 0) > 0:
+        return f"{kind}: until {_fmt_ts_short(row.get('valid_until'))}"
+    anchor = row.get("valid_from") or row.get("updated_at") or row.get("created_at")
+    return f"{kind}: {_fmt_ts_short(anchor) or 'unknown'}"
+
+
 def _imp_bar(importance: int) -> str:
     """Render importance 1-10 as a compact visual bar."""
     filled = min(max(int(importance), 0), 10)
@@ -204,8 +214,8 @@ def _render_index(
         label = _CATEGORY_LABELS.get(cat, cat.title())
         lines.append(f"### {label} ({len(cat_facts)})")
         lines.append("")
-        lines.append("| Subject | Value | Content | Imp | Salience |")
-        lines.append("| --- | --- | --- | ---: | --- |")
+        lines.append("| Subject | Value | Content | Time | Imp | Salience |")
+        lines.append("| --- | --- | --- | --- | ---: | --- |")
         for f in sorted(cat_facts, key=lambda x: (-int(x.get("importance") or 0), str(x.get("subject_key") or ""))):
             sk = str(f.get("subject_key") or "—")
             # Strip common prefixes for readability
@@ -217,7 +227,10 @@ def _render_index(
             content = str(f.get("content") or "")[:80]
             imp = int(f.get("importance") or 0)
             sal = float(f.get("salience") or 0)
-            lines.append(f"| `{_md(sk)}` | `{_md(vk)}` | {_md(content)} | {imp} | {_salience_tag(sal)} |")
+            lines.append(
+                f"| `{_md(sk)}` | `{_md(vk)}` | {_md(content)} | {_md(_fact_temporal_label(f))} | "
+                f"{imp} | {_salience_tag(sal)} |"
+            )
         lines.append("")
 
     lines.append("---")
@@ -346,13 +359,13 @@ def _render_topic_page(
         "",
     ]
     if facts:
-        lines.append("| Content | Importance | Confidence |")
-        lines.append("| --- | ---: | ---: |")
+        lines.append("| Content | Time | Importance | Confidence |")
+        lines.append("| --- | --- | ---: | ---: |")
         for fact in facts:
             content = str(fact.get("content") or "")[:100]
             imp = int(fact.get("importance") or 0)
             conf = float(fact.get("confidence") or 0)
-            lines.append(f"| {_md(content)} | {imp} | {conf:.0%} |")
+            lines.append(f"| {_md(content)} | {_md(_fact_temporal_label(fact))} | {imp} | {conf:.0%} |")
     else:
         lines.append("*No supporting facts linked.*")
 
@@ -442,8 +455,8 @@ def _render_session_page(
     lines.append("## Facts Extracted")
     lines.append("")
     if facts:
-        lines.append("| Content | Topic |")
-        lines.append("| --- | --- |")
+        lines.append("| Content | Time | Topic |")
+        lines.append("| --- | --- | --- |")
         for fact in facts:
             content = str(fact.get("content") or "")[:90]
             topic_slug = str(fact.get("topic") or "")
@@ -453,7 +466,7 @@ def _render_session_page(
                 if topic_target
                 else pretty_topic(topic_slug)
             )
-            lines.append(f"| {_md(content)} | {topic_link} |")
+            lines.append(f"| {_md(content)} | {_md(_fact_temporal_label(fact))} | {topic_link} |")
     else:
         lines.append("*No extracted facts linked to this session.*")
 

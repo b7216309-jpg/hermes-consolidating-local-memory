@@ -11,8 +11,10 @@ import tempfile
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -45,7 +47,7 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.2.0"
+__version__ = "3.3.0"
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -159,6 +161,23 @@ TOOL_SCHEMA = {
             "pinned": {"type": "boolean", "description": "Protect a fact from decay and budget pruning."},
             "status": {"type": "string", "description": "Status filter or target status."},
             "due_at": {"type": "number", "description": "Unix timestamp for a prospective memory."},
+            "event_at": {"type": "number", "description": "Unix timestamp when an event happened or is scheduled."},
+            "valid_from": {"type": "number", "description": "Unix timestamp when a fact starts being valid."},
+            "valid_until": {
+                "type": "number",
+                "description": "Exclusive Unix timestamp after which a fact is no longer current.",
+            },
+            "temporal_kind": {
+                "type": "string",
+                "enum": ["atemporal", "current", "event", "scheduled", "temporary"],
+                "description": "Temporal meaning of a fact or timeline entry.",
+            },
+            "temporal_precision": {
+                "type": "string",
+                "enum": ["unknown", "year", "month", "day", "hour", "minute", "second"],
+            },
+            "temporal_timezone": {"type": "string", "description": "IANA timezone for the temporal value."},
+            "temporal_confidence": {"type": "number", "description": "Confidence in the interpreted time from 0 to 1."},
             "ttl_seconds": {"type": "number", "description": "Working-memory lifetime."},
             "steps": {"type": "array", "items": {"type": "string"}},
             "prerequisites": {"type": "array", "items": {"type": "string"}},
@@ -1525,8 +1544,17 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                             args.get("key") or args.get("label") or fingerprint_text(str(args["content"]))[:16]
                         ),
                         content=str(args["content"]),
-                        event_at=float(args.get("due_at") or time.time()),
+                        event_at=float(args.get("event_at") or args.get("due_at") or time.time()),
+                        valid_from=float(args.get("valid_from") or 0),
+                        valid_until=float(args.get("valid_until") or 0),
                         importance=int(args.get("importance") or 6),
+                        metadata={
+                            "temporal_kind": str(args.get("temporal_kind") or "event"),
+                            "temporal_precision": str(args.get("temporal_precision") or "unknown"),
+                            "temporal_timezone": str(args.get("temporal_timezone") or ""),
+                            "temporal_confidence": float(args.get("temporal_confidence") or 1.0),
+                            "session_id": session_id,
+                        },
                         sensitivity=str(admission.get("sensitivity") or "normal"),
                     )
                     return json.dumps({"success": True, "action": action, "result": result})
@@ -1588,8 +1616,17 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                                 or fingerprint_text(timeline_content)[:16]
                             ),
                             content=timeline_content,
-                            event_at=float(tool_args.get("due_at") or time.time()),
+                            event_at=float(tool_args.get("event_at") or tool_args.get("due_at") or time.time()),
+                            valid_from=float(tool_args.get("valid_from") or 0),
+                            valid_until=float(tool_args.get("valid_until") or 0),
                             importance=int(tool_args.get("importance") or 6),
+                            metadata={
+                                "temporal_kind": str(tool_args.get("temporal_kind") or "event"),
+                                "temporal_precision": str(tool_args.get("temporal_precision") or "unknown"),
+                                "temporal_timezone": str(tool_args.get("temporal_timezone") or ""),
+                                "temporal_confidence": float(tool_args.get("temporal_confidence") or 1.0),
+                                "session_id": source_session,
+                            },
                             sensitivity=str(approval.get("sensitivity") or "normal"),
                         )
                     elif special_type == "distill" and isinstance(tool_args, dict):
@@ -2197,6 +2234,160 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if metadata:
             return metadata
         return self._json_dict(row.get("metadata_json"))
+
+    def _temporal_zone(self, preferred: str = "") -> tuple[Any, str]:
+        for candidate in (preferred, str(self._config.get("timezone") or "")):
+            clean = normalize_whitespace(candidate)
+            if not clean:
+                continue
+            try:
+                return ZoneInfo(clean), clean
+            except (ZoneInfoNotFoundError, ValueError):
+                continue
+        try:
+            from hermes_time import get_timezone
+
+            zone = get_timezone()
+            if zone is not None:
+                return zone, str(getattr(zone, "key", "") or zone)
+        except (ImportError, RuntimeError):
+            pass
+        local = datetime.now().astimezone().tzinfo
+        return local, str(local or "local")
+
+    def _temporal_now(self) -> datetime:
+        try:
+            from hermes_time import now as hermes_now
+
+            return hermes_now()
+        except (ImportError, RuntimeError):
+            zone, _ = self._temporal_zone()
+            return datetime.now(zone)
+
+    def _format_temporal_time(self, value: Any, *, precision: str = "unknown", timezone_name: str = "") -> str:
+        try:
+            timestamp = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return ""
+        if timestamp <= 0 or timestamp != timestamp:
+            return ""
+        zone, _ = self._temporal_zone(timezone_name)
+        try:
+            value_dt = datetime.fromtimestamp(timestamp, zone)
+        except (OSError, OverflowError, ValueError):
+            return ""
+        clean_precision = normalize_text(precision)
+        if clean_precision == "year":
+            return value_dt.strftime("%Y")
+        if clean_precision == "month":
+            return value_dt.strftime("%Y-%m")
+        if clean_precision == "day":
+            return value_dt.strftime("%Y-%m-%d")
+        if clean_precision == "hour":
+            return value_dt.strftime("%Y-%m-%d %H:00 %Z").strip()
+        if clean_precision == "second":
+            return value_dt.strftime("%Y-%m-%d %H:%M:%S %Z").strip()
+        return value_dt.strftime("%Y-%m-%d %H:%M %Z").strip()
+
+    @staticmethod
+    def _relative_temporal_time(value: Any, *, now_timestamp: float) -> str:
+        try:
+            timestamp = float(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return ""
+        if timestamp <= 0 or timestamp != timestamp:
+            return ""
+        delta = timestamp - now_timestamp
+        future = delta > 0
+        seconds = abs(delta)
+        if seconds < 45:
+            return "now"
+        units = (
+            (31557600.0, "year"),
+            (2629800.0, "month"),
+            (604800.0, "week"),
+            (86400.0, "day"),
+            (3600.0, "hour"),
+            (60.0, "minute"),
+        )
+        amount, label = 1, "minute"
+        for unit_seconds, unit_label in units:
+            if seconds >= unit_seconds:
+                amount = max(1, int(round(seconds / unit_seconds)))
+                label = unit_label
+                break
+        quantity = f"{amount} {label}{'' if amount == 1 else 's'}"
+        return f"in {quantity}" if future else f"{quantity} ago"
+
+    def _temporal_annotation(
+        self,
+        section: str,
+        row: Dict[str, Any],
+        *,
+        now_timestamp: float | None = None,
+    ) -> str:
+        metadata = self._result_metadata(row)
+        now_value = float(now_timestamp if now_timestamp is not None else self._temporal_now().timestamp())
+        timezone_name = str(row.get("temporal_timezone") or metadata.get("temporal_timezone") or "")
+        precision = str(row.get("temporal_precision") or metadata.get("temporal_precision") or "unknown")
+
+        def stamp(label: str, raw_value: Any, *, stamp_precision: str = precision) -> str:
+            absolute = self._format_temporal_time(
+                raw_value,
+                precision=stamp_precision,
+                timezone_name=timezone_name,
+            )
+            if not absolute:
+                return ""
+            relative = self._relative_temporal_time(raw_value, now_timestamp=now_value)
+            return f"{label} {absolute}{f' ({relative})' if relative else ''}"
+
+        parts: List[str] = []
+        if section == "facts":
+            kind = normalize_text(str(row.get("temporal_kind") or metadata.get("temporal_kind") or "atemporal"))
+            event_at = row.get("event_at") or metadata.get("event_at") or 0
+            observed_at = row.get("last_seen_at") or row.get("updated_at") or row.get("created_at") or 0
+            valid_from = row.get("valid_from") or metadata.get("valid_from") or 0
+            valid_until = row.get("valid_until") or metadata.get("valid_until") or 0
+            if kind == "event":
+                parts.append(stamp("event", event_at) or stamp("recorded", observed_at, stamp_precision="minute"))
+            elif kind == "scheduled":
+                parts.append(
+                    stamp("scheduled", event_at) or stamp("recorded plan", observed_at, stamp_precision="minute")
+                )
+            elif kind == "temporary":
+                parts.append(stamp("temporary since", valid_from or observed_at, stamp_precision="minute"))
+            elif kind == "current":
+                parts.append(stamp("current since", valid_from or observed_at, stamp_precision="minute"))
+            else:
+                parts.append(stamp("recorded", observed_at, stamp_precision="minute"))
+            if valid_until:
+                parts.append(stamp("valid until", valid_until, stamp_precision="minute"))
+            confidence = float(row.get("temporal_confidence") or metadata.get("temporal_confidence") or 0)
+            if event_at and 0 < confidence < 0.6:
+                parts.append("time uncertain")
+        elif section == "timeline":
+            kind = normalize_text(str(metadata.get("temporal_kind") or "event"))
+            parts.append(stamp("scheduled" if kind == "scheduled" else "event", row.get("event_at") or 0))
+        elif section == "intentions":
+            parts.append(stamp("due", row.get("due_at"), stamp_precision="minute"))
+        elif section == "working":
+            parts.append(stamp("expires", row.get("expires_at"), stamp_precision="minute"))
+        elif section == "journals":
+            parts.append(stamp("recorded", row.get("created_at") or row.get("updated_at"), stamp_precision="minute"))
+        elif section in {"summaries", "preferences", "policies", "procedures", "topics", "snapshot"}:
+            parts.append(stamp("updated", row.get("updated_at") or row.get("created_at"), stamp_precision="minute"))
+        return "[" + "; ".join(part for part in parts if part) + "] " if any(parts) else ""
+
+    def _temporal_orientation(self) -> str:
+        current = self._temporal_now()
+        _, zone_name = self._temporal_zone()
+        return (
+            "Temporal orientation: now is "
+            + current.strftime("%Y-%m-%d %H:%M:%S %Z")
+            + f" ({zone_name}). Event/scheduled time is when something happened or should happen; "
+            "recorded/updated time is when the memory was learned. A passed schedule is not proof the event occurred."
+        )
 
     @staticmethod
     def _query_allows_sensitive(query: str, sensitivity: str) -> bool:
@@ -3196,6 +3387,60 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
         return {"decision": "pending", "reason": reason, "sensitivity": sensitivity, "approval": approval}
 
+    def _sync_temporal_fact_timeline(
+        self,
+        fact: Dict[str, Any],
+        *,
+        content: str,
+        metadata: Dict[str, Any],
+        importance: int,
+        session_id: str,
+        observed_at: float | None,
+        sensitivity: str,
+    ) -> Dict[str, Any] | None:
+        """Keep a dated fact's timeline representation aligned without inventing event time."""
+        if not self._store or fact.get("id") is None:
+            return None
+        fact_id = int(fact["id"])
+        event_key = f"fact-{fact_id}"
+        temporal_kind = normalize_text(str(fact.get("temporal_kind") or metadata.get("temporal_kind") or "atemporal"))
+        event_at = float(fact.get("event_at") or metadata.get("event_at") or 0)
+        if temporal_kind not in {"event", "scheduled"} or event_at <= 0:
+            existing = self._store._fetchone(
+                "SELECT id FROM autobiographical_events WHERE event_key=?",
+                (event_key,),
+            )
+            if existing:
+                self._store._execute(
+                    "UPDATE autobiographical_events SET active=0, updated_at=? WHERE id=?",
+                    (time.time(), int(existing["id"])),
+                )
+            return None
+        event = self._store.upsert_autobiographical_event(
+            event_key=event_key,
+            content=content,
+            event_at=event_at,
+            importance=importance,
+            metadata={
+                "fact_id": fact_id,
+                "session_id": session_id,
+                "temporal_kind": temporal_kind,
+                "temporal_precision": str(
+                    fact.get("temporal_precision") or metadata.get("temporal_precision") or "unknown"
+                ),
+                "temporal_timezone": str(fact.get("temporal_timezone") or metadata.get("temporal_timezone") or ""),
+                "temporal_confidence": float(
+                    fact.get("temporal_confidence") or metadata.get("temporal_confidence") or 0
+                ),
+                "fact_valid_from": float(fact.get("valid_from") or 0),
+                "fact_valid_until": float(fact.get("valid_until") or 0),
+                "observed_at": float(observed_at or fact.get("last_seen_at") or time.time()),
+            },
+            sensitivity=sensitivity,
+        )
+        self._store.add_link("fact", fact_id, "autobiographical_event", event["id"], "represented_by")
+        return event
+
     def _store_candidate(
         self,
         candidate: Dict[str, Any],
@@ -3213,6 +3458,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return {"action": admission["decision"], "fact": {}, **admission}
         metadata = dict(candidate.get("metadata") or {})
         source_role = str(metadata.get("source_role") or candidate.get("source_role") or "unknown")
+        temporal_kind = normalize_text(str(metadata.get("temporal_kind") or "atemporal")) or "atemporal"
         result = self._store.upsert_fact(
             content=str(candidate["content"]),
             category=str(candidate["category"]),
@@ -3226,22 +3472,32 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             history_reason=source,
             source_role=source_role,
             explicit_correction=bool(metadata.get("explicit_correction")),
+            valid_from=float(metadata.get("valid_from") or 0) or None,
+            valid_until=float(metadata.get("valid_until") or 0) or None,
+            temporal_kind=temporal_kind,
+            event_at=float(metadata.get("event_at") or 0) or None,
+            temporal_precision=str(metadata.get("temporal_precision") or "unknown"),
+            temporal_timezone=str(metadata.get("temporal_timezone") or ""),
+            temporal_confidence=float(metadata.get("temporal_confidence") or 0),
             sensitivity=str(admission.get("sensitivity") or "normal"),
-            memory_class="autobiographical" if str(metadata.get("kind") or "") == "life_event" else "semantic",
+            memory_class=(
+                "autobiographical"
+                if str(metadata.get("kind") or "") == "life_event" or temporal_kind in {"event", "scheduled"}
+                else "semantic"
+            ),
             pinned=bool(candidate.get("pinned") or metadata.get("pinned")),
         )
         self._candidate_to_preference(candidate, dict(result.get("fact") or {}))
         fact = dict(result.get("fact") or {})
-        if str(metadata.get("kind") or "") == "life_event" and fact.get("id") is not None:
-            event = self._store.upsert_autobiographical_event(
-                event_key=f"fact-{fact['id']}",
-                content=str(candidate.get("content") or ""),
-                event_at=float(observed_at or time.time()),
-                importance=int(candidate.get("importance") or 6),
-                metadata={"fact_id": fact["id"], "session_id": session_id},
-                sensitivity=str(admission.get("sensitivity") or "normal"),
-            )
-            self._store.add_link("fact", fact["id"], "autobiographical_event", event["id"], "represented_by")
+        self._sync_temporal_fact_timeline(
+            fact,
+            content=str(candidate.get("content") or ""),
+            metadata=metadata,
+            importance=int(candidate.get("importance") or 6),
+            session_id=session_id,
+            observed_at=observed_at,
+            sensitivity=str(admission.get("sensitivity") or "normal"),
+        )
         return result
 
     def _remember_from_tool(self, args: Dict[str, Any], *, session_id: str) -> Dict[str, Any]:
@@ -3286,7 +3542,16 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return {"memory_type": "preference", "entry": result}
         if not content:
             raise ValueError("content is required for remember")
-        metadata = {"via_tool": True}
+        metadata = {
+            "via_tool": True,
+            "temporal_kind": str(args.get("temporal_kind") or ""),
+            "temporal_precision": str(args.get("temporal_precision") or "unknown"),
+            "temporal_timezone": str(args.get("temporal_timezone") or ""),
+            "temporal_confidence": float(args.get("temporal_confidence") or 0),
+        }
+        for temporal_key in ("event_at", "valid_from", "valid_until"):
+            if args.get(temporal_key) is not None:
+                metadata[temporal_key] = args[temporal_key]
         subject_key = str(args.get("subject_key") or "").strip()
         if subject_key:
             metadata["subject_key"] = subject_key
@@ -3308,6 +3573,22 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "explicit_correction": _flag(args.get("explicit_correction")) or "correction" in content.lower(),
             },
         }
+        _, reference_timezone = self._temporal_zone()
+        normalized_candidate = normalize_candidate_fact(
+            {
+                **candidate,
+                "reference_unix_time": time.time(),
+                "reference_timezone": reference_timezone,
+            },
+            source_role="user",
+        )
+        if normalized_candidate:
+            normalized_candidate["pinned"] = candidate.get("pinned", False)
+            candidate = normalized_candidate
+        metadata = dict(candidate.get("metadata") or metadata)
+        temporal_kind = str(metadata.get("temporal_kind") or "atemporal")
+        if temporal_kind in {"event", "scheduled"} and float(metadata.get("event_at") or 0) <= 0:
+            raise ValueError(f"temporal_kind={temporal_kind} requires event_at")
         admission = self._admit_candidate(
             candidate, source="tool", session_id=session_id, approved=_flag(args.get("approved"))
         )
@@ -3321,6 +3602,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             importance=importance,
             confidence=0.9,
             metadata=metadata,
+            valid_from=float(metadata.get("valid_from") or 0) or None,
+            valid_until=float(metadata.get("valid_until") or 0) or None,
+            temporal_kind=temporal_kind,
+            event_at=float(metadata.get("event_at") or 0) or None,
+            temporal_precision=str(metadata.get("temporal_precision") or "unknown"),
+            temporal_timezone=str(metadata.get("temporal_timezone") or ""),
+            temporal_confidence=float(metadata.get("temporal_confidence") or 0),
             source_session_id=session_id,
             history_reason="tool_remember",
             source_role="user",
@@ -3338,6 +3626,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "metadata": metadata,
             },
             dict(result.get("fact") or {}),
+        )
+        self._sync_temporal_fact_timeline(
+            dict(result.get("fact") or {}),
+            content=content,
+            metadata=metadata,
+            importance=importance,
+            session_id=session_id,
+            observed_at=None,
+            sensitivity=str(admission.get("sensitivity") or "normal"),
         )
         self._store.rebuild_topics(
             max_facts=self._cfg()["max_topic_facts"],
@@ -4130,6 +4427,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     ) -> List[Dict[str, Any]]:
         if not self._llm or not self._llm.enabled:
             return []
+        reference_timestamp = float(created_at if created_at is not None else time.time())
+        reference_zone, reference_timezone = self._temporal_zone()
+        reference_local = datetime.fromtimestamp(reference_timestamp, reference_zone).isoformat()
         max_chars = self._cfg()["llm_max_input_chars"]
         user_text = normalize_whitespace(user_content)[:max_chars]
         assistant_text = normalize_whitespace(assistant_content)[: max(0, max_chars - len(user_text))]
@@ -4140,6 +4440,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             '{"facts":[{"content":string,"category":"user_pref|project|environment|workflow|general",'
             '"topic":string,"importance":1-10,"confidence":0-1,"subject_key":string,'
             '"value_key":string,"exclusive":boolean,"polarity":-1|1,'
+            '"temporal_kind":"atemporal|current|event|scheduled|temporary",'
+            '"event_at":"ISO-8601 or empty","valid_from":"ISO-8601 or empty",'
+            '"valid_until":"ISO-8601 or empty",'
+            '"temporal_precision":"unknown|year|month|day|hour|minute|second",'
+            '"temporal_timezone":"IANA timezone or empty","temporal_confidence":0-1,'
             '"source_role":"user|assistant"}]}. '
             "Keep facts atomic, durable, and useful across sessions. "
             "ALWAYS assign a subject_key and value_key — never leave them empty. "
@@ -4161,16 +4466,25 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "Category rules: personal details, preferences, traits, identity -> user_pref. "
             "Family, social, philosophical -> general. Technical setup -> environment. "
             "Use exclusive=true when a newer fact should replace older values for the same subject. "
+            "Temporal rules: atemporal means a durable fact with no meaningful date; current means a state true until "
+            "contradicted; event means a past occurrence; scheduled means a future plan; temporary means a current state "
+            "with a known or reasonably implied expiry. Resolve relative phrases such as today, tomorrow, yesterday, and "
+            "next week against reference_local_time and reference_timezone. Use ISO-8601 with an explicit UTC offset for "
+            "date-times. Preserve the stated precision and never invent an hour when only a date is known. event_at is when "
+            "the event happened or is scheduled, not when it was mentioned. valid_until is exclusive. One-time scheduled "
+            "facts should expire after their scheduled date while their timeline event remains historical. "
             "Extract ALL personal details: family members by name, pets, hobbies, physical traits, "
             "daily routines, food preferences, personality, beliefs, finances. "
             "Never treat an assistant guess or suggestion as a user fact; assistant-supported facts require explicit confirmation. "
-            "Drop ephemeral task chatter (current activity, greetings, session meta). "
-            "Convert relative dates to absolute dates when possible. "
+            "Drop greetings, session meta, and trivial chatter, but retain meaningful experiences, schedules, commitments, "
+            "and temporary states with their temporal fields. Convert relative dates to absolute dates when possible. "
             "Set source_role to the message that supports each fact. Return at most 10 facts."
         )
         user_prompt = json.dumps(
             {
-                "reference_unix_time": created_at or time.time(),
+                "reference_unix_time": reference_timestamp,
+                "reference_local_time": reference_local,
+                "reference_timezone": reference_timezone,
                 "user_message": user_text,
                 "assistant_message": assistant_text,
             },
@@ -4192,6 +4506,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         for raw in data.get("facts", [])[:10]:
             if not isinstance(raw, dict):
                 continue
+            raw = {
+                **raw,
+                "reference_unix_time": reference_timestamp,
+                "reference_timezone": reference_timezone,
+            }
             raw_role = str(raw.get("source_role") or "").strip().casefold()
             source_role = raw_role if raw_role in {"user", "assistant"} else ("user" if user_text else "assistant")
             normalized = normalize_candidate_fact(raw, source_role=source_role)
@@ -4241,13 +4560,20 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         mode = str(cue_map.get("mode") or "current_state")
         snapshot_lines: List[str] = []
         if mode in {"summary", "workflow"}:
-            snapshot_lines = [f"- {entry.get('text')}" for entry in self._mode_snapshot_entries(mode, max_items=6)]
+            snapshot_lines = [
+                f"- {self._temporal_annotation('snapshot', entry)}{entry.get('text')}"
+                for entry in self._mode_snapshot_entries(mode, max_items=6)
+            ]
         topic_lines = []
         for item in results.get("topics", [])[:2]:
-            topic_lines.append(f"- {item.get('title')}: {item.get('summary')}")
+            topic_lines.append(
+                f"- {self._temporal_annotation('topics', item)}{item.get('title')}: {item.get('summary')}"
+            )
         summary_lines = []
         for item in results.get("summaries", [])[:3]:
-            summary_lines.append(f"- {item.get('label')}: {item.get('summary')}")
+            summary_lines.append(
+                f"- {self._temporal_annotation('summaries', item)}{item.get('label')}: {item.get('summary')}"
+            )
 
         # ── Collect preference content for dedup against facts ──
         preference_lines = []
@@ -4255,13 +4581,15 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         for item in results.get("preferences", [])[:3]:
             pref_text = str(item.get("content") or "").strip().lower()
             _pref_content_seen.add(pref_text)
-            preference_lines.append(f"- {item.get('content')}")
+            preference_lines.append(f"- {self._temporal_annotation('preferences', item)}{item.get('content')}")
         workflow_lines = []
         for item in results.get("policies", [])[:3]:
-            workflow_lines.append(f"- {item.get('content')}")
+            workflow_lines.append(f"- {self._temporal_annotation('policies', item)}{item.get('content')}")
         for fact in results.get("facts", []):
             if str(fact.get("category") or "") == "workflow":
-                workflow_lines.append(f"- [{fact['topic']}] {fact['content']}")
+                workflow_lines.append(
+                    f"- {self._temporal_annotation('facts', fact)}[{fact['topic']}] {fact['content']}"
+                )
             if len(workflow_lines) >= 3:
                 break
 
@@ -4273,18 +4601,32 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             fact_text = str(fact.get("content") or "").strip().lower()
             if fact_text in _pref_content_seen:
                 continue
-            fact_lines.append(f"- [{fact['category']}/{fact['topic']}] {fact['content']}")
+            fact_lines.append(
+                f"- {self._temporal_annotation('facts', fact)}[{fact['category']}/{fact['topic']}] {fact['content']}"
+            )
 
         journal_lines = []
         for item in results.get("journals", [])[:2]:
-            journal_lines.append(f"- {item.get('label')}: {item.get('content')}")
-        working_lines = [f"- {item.get('content')}" for item in results.get("working", [])[:4]]
-        intention_lines = [f"- {item.get('intention')}" for item in results.get("intentions", [])[:4]]
+            journal_lines.append(
+                f"- {self._temporal_annotation('journals', item)}{item.get('label')}: {item.get('content')}"
+            )
+        working_lines = [
+            f"- {self._temporal_annotation('working', item)}{item.get('content')}"
+            for item in results.get("working", [])[:4]
+        ]
+        intention_lines = [
+            f"- {self._temporal_annotation('intentions', item)}{item.get('intention')}"
+            for item in results.get("intentions", [])[:4]
+        ]
         procedure_lines = [
-            f"- {item.get('label')}: " + " -> ".join(str(step) for step in item.get("steps", [])[:6])
+            f"- {self._temporal_annotation('procedures', item)}{item.get('label')}: "
+            + " -> ".join(str(step) for step in item.get("steps", [])[:6])
             for item in results.get("procedures", [])[:3]
         ]
-        timeline_lines = [f"- {item.get('content')}" for item in results.get("timeline", [])[:3]]
+        timeline_lines = [
+            f"- {self._temporal_annotation('timeline', item)}{item.get('content')}"
+            for item in results.get("timeline", [])[:3]
+        ]
 
         contradiction_subjects = set()
         if cue_map.get("subject_key"):
@@ -4305,7 +4647,9 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             for row in rows:
                 winner = normalize_whitespace(str(row.get("winner_content") or ""))
                 loser = normalize_whitespace(str(row.get("loser_content") or ""))
-                contradiction_lines.append(f"- {row.get('subject_key')}: {loser} -> {winner}")
+                contradiction_lines.append(
+                    f"- {self._temporal_annotation('snapshot', row)}{row.get('subject_key')}: {loser} -> {winner}"
+                )
         if mode == "provenance":
             subject_keys: List[str] = []
             if cue_map.get("subject_key"):
@@ -4326,7 +4670,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     turn_text = str(entry.get("turn_id") or "")
                     content = str(entry.get("content") or "")
                     origin = label or session_text or turn_text or "unknown source"
-                    detail = f"{subject_key} -> {origin}"
+                    learned_at = self._format_temporal_time(entry.get("created_at"), precision="minute")
+                    detail = f"{subject_key} -> {origin}{f' @ {learned_at}' if learned_at else ''}"
                     if content:
                         detail += f" ({content})"
                     provenance_lines.append(f"- {detail}")
@@ -4356,7 +4701,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         ):
             return ""
 
-        lines = [f"## Consolidating Memory Recall for: {query}"]
+        lines = [f"## Consolidating Memory Recall for: {query}", self._temporal_orientation()]
         if mode in {"current_state", "summary", "workflow"}:
             lines.append(
                 "Current-state guidance: prefer active current memory and avoid mentioning older conflicting values unless the user explicitly asks for history or provenance."

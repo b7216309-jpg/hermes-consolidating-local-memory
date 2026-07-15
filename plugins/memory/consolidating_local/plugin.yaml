@@ -1,5 +1,5 @@
 name: consolidating_local
-version: 3.2.0
+version: 3.3.0
 description: "Isolated, evidence-backed local memory with temporal, working, procedural, prospective, and autobiographical systems."
 hooks:
   - on_turn_start

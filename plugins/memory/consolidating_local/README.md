@@ -1,4 +1,4 @@
-# consolidating_local 3.2
+# consolidating_local 3.3
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -29,6 +29,8 @@ Shutdown waits up to `shutdown_timeout_seconds` (10 seconds by default). If an o
 
 SQLite is canonical. Exported files are rebuildable.
 
+Facts distinguish semantic state from time: `temporal_kind` identifies atemporal/current/event/scheduled/temporary meaning; `event_at` records when an event occurred or is planned; `valid_from` and `valid_until` bound state validity; precision, source timezone, and confidence preserve what was actually known. Creation/update/observation timestamps remain separate. Scheduled facts can age out of current-state search without deleting their linked timeline record.
+
 ## Tool
 
 The `consolidating_memory` tool supports:
@@ -40,11 +42,14 @@ Alongside the original actions, v2 adds `explain`, `working`, `procedure`, `inte
 - Automatic extraction is disabled unless both `llm_model` and `llm_base_url` are configured.
 - Automatic extraction is LLM-only. There is no rule-based extractor, hybrid extractor, or fallback.
 - `llm_disable_thinking: true` sends `chat_template_kwargs.enable_thinking=false` to compatible OpenAI-style chat endpoints and rejects reasoning-only responses.
+- Extraction receives the current local ISO time, Unix time, and Hermes IANA timezone. Relative dates are resolved against that reference and missing time precision must not be invented.
 - Explicit Hermes memory-tool writes remain immediate and do not require an extraction model.
 - `retrieval_backend: fts` is the default.
 - `retrieval_backend: hybrid` reranks FTS candidates using an explicitly configured embedding endpoint.
 
 Both a model and base URL are required to enable either remote-capable client. Hermes' normal chat endpoint is never reused implicitly.
+
+Recall begins with the localized current time and a timestamp contract. Memory lines distinguish event/validity time from recorded/updated age, and passed schedules are labeled as unconfirmed rather than completed.
 
 ## Important defaults
 

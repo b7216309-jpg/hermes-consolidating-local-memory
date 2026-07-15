@@ -36,6 +36,9 @@ class _ExtractionEndpoint:
                                     "value_key": "alice",
                                     "exclusive": True,
                                     "polarity": 1,
+                                    "temporal_kind": "current",
+                                    "temporal_timezone": "Europe/Paris",
+                                    "temporal_confidence": 0.95,
                                     "source_role": "user",
                                 }
                             ]
@@ -90,6 +93,7 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
                 "llm_disable_thinking": True,
                 "llm_failure_cooldown_seconds": 1,
                 "queue_max_attempts": 5,
+                "timezone": "Europe/Paris",
             }
         )
         try:
@@ -107,8 +111,13 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
             assert provider._store.counts()["episodes"] == 1
             facts = provider._store.search("Alice", scope="facts")["facts"]
             assert len(facts) == 1
+            assert facts[0]["temporal_kind"] == "current"
+            assert facts[0]["temporal_timezone"] == "Europe/Paris"
             prompt = endpoint.requests[-1]["messages"][-1]["content"]
             assert "seed_facts" not in prompt
+            prompt_payload = json.loads(prompt)
+            assert prompt_payload["reference_timezone"] == "Europe/Paris"
+            assert "+" in prompt_payload["reference_local_time"]
             assert endpoint.requests[-1]["chat_template_kwargs"] == {"enable_thinking": False}
             status = json.loads(provider.handle_tool_call("consolidating_memory", {"action": "status"}))
             assert status["automatic_extraction"] == {"enabled": True, "backend": "llm"}

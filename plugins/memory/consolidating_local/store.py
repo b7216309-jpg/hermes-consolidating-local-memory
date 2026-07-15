@@ -150,6 +150,17 @@ def _clamp_float(value: Any, low: float, high: float, default: float) -> float:
     return max(low, min(high, parsed))
 
 
+def _timestamp(value: Any, default: float = 0.0) -> float:
+    """Return a finite, non-negative Unix timestamp at the storage boundary."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = float(default)
+    if not math.isfinite(parsed) or parsed < 0:
+        parsed = float(default)
+    return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
+
+
 _CREDENTIAL_PATTERNS = (
     r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}\b",
     r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
@@ -481,6 +492,11 @@ class MemoryStore:
                 observation_count INTEGER NOT NULL DEFAULT 1,
                 valid_from REAL NOT NULL DEFAULT 0,
                 valid_until REAL NOT NULL DEFAULT 0,
+                temporal_kind TEXT NOT NULL DEFAULT 'atemporal',
+                event_at REAL NOT NULL DEFAULT 0,
+                temporal_precision TEXT NOT NULL DEFAULT 'unknown',
+                temporal_timezone TEXT NOT NULL DEFAULT '',
+                temporal_confidence REAL NOT NULL DEFAULT 0,
                 sensitivity TEXT NOT NULL DEFAULT 'normal',
                 memory_class TEXT NOT NULL DEFAULT 'semantic',
                 pinned INTEGER NOT NULL DEFAULT 0,
@@ -879,6 +895,11 @@ class MemoryStore:
         self._ensure_column("facts", "observation_count", "INTEGER NOT NULL DEFAULT 1")
         self._ensure_column("facts", "valid_from", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("facts", "valid_until", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("facts", "temporal_kind", "TEXT NOT NULL DEFAULT 'atemporal'")
+        self._ensure_column("facts", "event_at", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("facts", "temporal_precision", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column("facts", "temporal_timezone", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("facts", "temporal_confidence", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("facts", "sensitivity", "TEXT NOT NULL DEFAULT 'normal'")
         self._ensure_column("facts", "memory_class", "TEXT NOT NULL DEFAULT 'semantic'")
         self._ensure_column("facts", "pinned", "INTEGER NOT NULL DEFAULT 0")
@@ -925,6 +946,7 @@ class MemoryStore:
         self._execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_operation_key ON episodes(operation_key) WHERE operation_key != ''"
         )
+        self._execute("CREATE INDEX IF NOT EXISTS idx_facts_temporal ON facts(temporal_kind, event_at DESC, active)")
         evidence_backfilled = self._backfill_belief_evidence()
         self._execute(
             "INSERT OR IGNORE INTO schema_migrations(version, name, applied_at, details_json) VALUES(2, ?, ?, ?)",
@@ -938,6 +960,20 @@ class MemoryStore:
         self._backfill_source_sessions("memory_policies")
         self._backfill_memory_sessions()
         self._backfill_review_schedule()
+        temporal_migration = self._fetchone("SELECT version FROM schema_migrations WHERE version = 3")
+        if not temporal_migration:
+            temporal_backfilled = self._backfill_temporal_facts()
+            self._execute(
+                "INSERT INTO schema_migrations(version, name, applied_at, details_json) VALUES(3, ?, ?, ?)",
+                (
+                    "structured_temporal_context",
+                    now_ts(),
+                    json.dumps(
+                        {"rollback": "restore a pre-v3 backup", "facts_backfilled": temporal_backfilled},
+                        sort_keys=True,
+                    ),
+                ),
+            )
         self._init_fts()
 
     def _init_fts(self) -> None:
@@ -1091,6 +1127,70 @@ class MemoryStore:
                     f"UPDATE {table} SET next_review_at = ? WHERE id = ?",
                     (anchor + default_offset, int(row["id"])),
                 )
+
+    def _backfill_temporal_facts(self) -> int:
+        """Classify pre-v3 facts without inventing event dates or expiry times."""
+        rows = self._fetchall("SELECT * FROM facts")
+        updated = 0
+        allowed_kinds = {"atemporal", "current", "event", "scheduled", "temporary"}
+        allowed_precision = {"unknown", "year", "month", "day", "hour", "minute", "second"}
+        for row in rows:
+            metadata = dict(row.get("metadata") or {})
+            kind = normalize_text(str(metadata.get("temporal_kind") or row.get("temporal_kind") or ""))
+            try:
+                event_at = float(metadata.get("event_at", row.get("event_at")) or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                event_at = 0.0
+            try:
+                valid_until = float(row.get("valid_until") or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                valid_until = 0.0
+            if event_at != event_at or event_at < 0:
+                event_at = 0.0
+            if valid_until != valid_until or valid_until < 0:
+                valid_until = 0.0
+            if kind not in allowed_kinds or kind == "atemporal":
+                if str(row.get("memory_class") or "") == "autobiographical":
+                    kind = "event"
+                elif valid_until > 0:
+                    kind = "temporary"
+                elif int(row.get("exclusive") or 0) == 1:
+                    kind = "current"
+                else:
+                    kind = "atemporal"
+            precision = normalize_text(
+                str(metadata.get("temporal_precision") or row.get("temporal_precision") or "unknown")
+            )
+            if precision not in allowed_precision:
+                precision = "unknown"
+            timezone_name = normalize_whitespace(
+                str(metadata.get("temporal_timezone") or row.get("temporal_timezone") or "")
+            )[:80]
+            temporal_confidence = _clamp_float(
+                metadata.get("temporal_confidence", row.get("temporal_confidence")), 0.0, 1.0, 0.0
+            )
+            metadata["temporal_kind"] = kind
+            metadata["temporal_precision"] = precision
+            metadata["temporal_confidence"] = temporal_confidence
+            if event_at > 0:
+                metadata["event_at"] = event_at
+            self._execute(
+                """UPDATE facts
+                   SET temporal_kind=?, event_at=?, temporal_precision=?, temporal_timezone=?,
+                       temporal_confidence=?, metadata_json=?
+                   WHERE id=?""",
+                (
+                    kind,
+                    event_at,
+                    precision,
+                    timezone_name,
+                    temporal_confidence,
+                    json.dumps(metadata, sort_keys=True),
+                    int(row["id"]),
+                ),
+            )
+            updated += 1
+        return updated
 
     def _backfill_belief_evidence(self) -> int:
         """Give pre-v2 facts one provenance observation without duplicating it."""
@@ -1500,7 +1600,9 @@ class MemoryStore:
             "facts": self._fetchall(
                 """
                 SELECT id, content, category, topic, importance, salience, belief_score, sensitivity,
-                       memory_class, valid_from, valid_until, updated_at, subject_key, value_key, source_session_id
+                       memory_class, valid_from, valid_until, temporal_kind, event_at,
+                       temporal_precision, temporal_timezone, temporal_confidence,
+                       created_at, updated_at, subject_key, value_key, source_session_id
                 FROM facts
                 WHERE source_session_id = ? AND active = 1
                   AND sensitivity = 'normal'
@@ -1557,8 +1659,9 @@ class MemoryStore:
         return self._fetchall(
             """
             SELECT id, content, category, topic, subject_key, value_key, importance, confidence, salience,
-                   belief_score, observation_count, valid_from, valid_until, sensitivity, memory_class, pinned,
-                   updated_at, source_session_id
+                   belief_score, observation_count, valid_from, valid_until, temporal_kind, event_at,
+                   temporal_precision, temporal_timezone, temporal_confidence, sensitivity, memory_class, pinned,
+                   created_at, updated_at, source_session_id
             FROM facts
             WHERE active = 1
               AND (valid_from=0 OR valid_from <= memory_now())
@@ -1586,7 +1689,9 @@ class MemoryStore:
             """
             SELECT f.id, f.content, f.category, f.topic, f.importance, f.confidence, f.salience,
                    f.belief_score, f.sensitivity, f.memory_class, f.valid_from, f.valid_until,
-                   f.updated_at, f.subject_key, f.value_key, f.source_session_id
+                   f.temporal_kind, f.event_at, f.temporal_precision, f.temporal_timezone,
+                   f.temporal_confidence, f.created_at, f.updated_at, f.subject_key, f.value_key,
+                   f.source_session_id
             FROM topic_membership tm
             JOIN facts f ON f.id = tm.fact_id
             WHERE tm.topic_id = ? AND f.active = 1
@@ -2405,6 +2510,11 @@ class MemoryStore:
         explicit_correction: bool = False,
         valid_from: float | None = None,
         valid_until: float | None = None,
+        temporal_kind: str = "",
+        event_at: float | None = None,
+        temporal_precision: str = "",
+        temporal_timezone: str = "",
+        temporal_confidence: float | None = None,
         sensitivity: str = "normal",
         memory_class: str = "semantic",
         pinned: bool = False,
@@ -2412,7 +2522,7 @@ class MemoryStore:
         clean = normalize_whitespace(content)
         if not clean:
             raise ValueError("Fact content cannot be empty.")
-        observed_at = float(observed_at or now_ts())
+        observed_at = _timestamp(observed_at, now_ts()) or now_ts()
         fingerprint = fingerprint_text(clean)
         signature = text_signature(clean)
         topic_slug = slugify(topic)
@@ -2433,10 +2543,54 @@ class MemoryStore:
             reliability if reliability is not None else self._source_reliability(role, source), 0.0, 1.0, 0.5
         )
         is_correction = bool(explicit_correction or _as_bool(meta.get("explicit_correction")))
-        valid_from_value = float(valid_from if valid_from is not None else meta.get("valid_from") or observed_at)
-        valid_until_value = max(0.0, float(valid_until if valid_until is not None else meta.get("valid_until") or 0.0))
+        valid_from_value = _timestamp(valid_from if valid_from is not None else meta.get("valid_from"), observed_at)
+        valid_until_value = _timestamp(valid_until if valid_until is not None else meta.get("valid_until"), 0.0)
+        allowed_temporal_kinds = {"atemporal", "current", "event", "scheduled", "temporary"}
+        temporal_kind_value = normalize_text(temporal_kind or str(meta.get("temporal_kind") or ""))
+        if temporal_kind_value not in allowed_temporal_kinds:
+            if valid_until_value > 0:
+                temporal_kind_value = "temporary"
+            elif subject_key and exclusive:
+                temporal_kind_value = "current"
+            else:
+                temporal_kind_value = "atemporal"
+        event_at_value = _timestamp(event_at if event_at is not None else meta.get("event_at"), 0.0)
+        allowed_temporal_precision = {"unknown", "year", "month", "day", "hour", "minute", "second"}
+        temporal_precision_value = normalize_text(
+            temporal_precision or str(meta.get("temporal_precision") or "unknown")
+        )
+        if temporal_precision_value not in allowed_temporal_precision:
+            temporal_precision_value = "unknown"
+        temporal_timezone_value = normalize_whitespace(temporal_timezone or str(meta.get("temporal_timezone") or ""))[
+            :80
+        ]
+        temporal_confidence_value = _clamp_float(
+            temporal_confidence if temporal_confidence is not None else meta.get("temporal_confidence"),
+            0.0,
+            1.0,
+            0.0,
+        )
+        meta["temporal_kind"] = temporal_kind_value
+        meta["temporal_precision"] = temporal_precision_value
+        meta["temporal_confidence"] = temporal_confidence_value
+        if event_at_value > 0:
+            meta["event_at"] = event_at_value
+        else:
+            meta.pop("event_at", None)
+        if valid_from_value > 0:
+            meta["valid_from"] = valid_from_value
+        if valid_until_value > 0:
+            meta["valid_until"] = valid_until_value
+        else:
+            meta.pop("valid_until", None)
+        if temporal_timezone_value:
+            meta["temporal_timezone"] = temporal_timezone_value
+        else:
+            meta.pop("temporal_timezone", None)
         sensitivity_value = normalize_text(sensitivity or str(meta.get("sensitivity") or "normal")) or "normal"
         memory_class_value = normalize_text(memory_class or str(meta.get("memory_class") or "semantic")) or "semantic"
+        if temporal_kind_value in {"event", "scheduled"} and memory_class_value == "semantic":
+            memory_class_value = "autobiographical"
         salience_value = _clamp_float(
             salience if salience is not None else self._default_fact_salience(category, meta),
             0.0,
@@ -2505,6 +2659,11 @@ class MemoryStore:
                     observation_count = ?,
                     valid_from = CASE WHEN valid_from = 0 THEN ? ELSE MIN(valid_from, ?) END,
                     valid_until = ?,
+                    temporal_kind = ?,
+                    event_at = ?,
+                    temporal_precision = ?,
+                    temporal_timezone = ?,
+                    temporal_confidence = ?,
                     sensitivity = ?,
                     memory_class = ?,
                     pinned = MAX(pinned, ?),
@@ -2530,6 +2689,11 @@ class MemoryStore:
                     valid_from_value,
                     valid_from_value,
                     valid_until_value,
+                    temporal_kind_value,
+                    event_at_value,
+                    temporal_precision_value,
+                    temporal_timezone_value,
+                    temporal_confidence_value,
                     sensitivity_value,
                     memory_class_value,
                     int(pinned),
@@ -2599,6 +2763,11 @@ class MemoryStore:
                 observation_count,
                 valid_from,
                 valid_until,
+                temporal_kind,
+                event_at,
+                temporal_precision,
+                temporal_timezone,
+                temporal_confidence,
                 sensitivity,
                 memory_class,
                 pinned,
@@ -2607,7 +2776,7 @@ class MemoryStore:
                 updated_at,
                 last_seen_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?, 1, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
                 clean,
@@ -2636,6 +2805,11 @@ class MemoryStore:
                 ),
                 valid_from_value,
                 valid_until_value,
+                temporal_kind_value,
+                event_at_value,
+                temporal_precision_value,
+                temporal_timezone_value,
+                temporal_confidence_value,
                 sensitivity_value,
                 memory_class_value,
                 int(pinned),
@@ -3532,7 +3706,7 @@ class MemoryStore:
             try:
                 return self._fetchall(
                     f"""
-                    SELECT f.id, f.content, f.category, f.topic, f.source, f.metadata_json, f.importance, f.confidence, f.salience, f.belief_score, f.observation_count, f.valid_from, f.valid_until, f.sensitivity, f.memory_class, f.pinned, f.revision, f.created_at, f.updated_at, f.subject_key, f.value_key, f.polarity, f.exclusive, f.source_session_id
+                    SELECT f.*
                     FROM facts_fts idx
                     JOIN facts f ON f.id = idx.fact_id
                     WHERE facts_fts MATCH ?
@@ -3554,7 +3728,7 @@ class MemoryStore:
         )
         return self._fetchall(
             f"""
-            SELECT id, content, category, topic, source, metadata_json, importance, confidence, salience, belief_score, observation_count, valid_from, valid_until, sensitivity, memory_class, pinned, revision, created_at, updated_at, subject_key, value_key, polarity, exclusive, source_session_id
+            SELECT *
             FROM facts
             WHERE (content LIKE ? OR topic LIKE ? OR category LIKE ? OR subject_key LIKE ?)
               {active_sql}
@@ -4606,9 +4780,9 @@ class MemoryStore:
             (
                 key,
                 clean,
-                max(0.0, float(event_at)),
-                max(0.0, float(valid_from)),
-                max(0.0, float(valid_until)),
+                _timestamp(event_at),
+                _timestamp(valid_from),
+                _timestamp(valid_until),
                 json.dumps(list(people or [])),
                 json.dumps(list(places or [])),
                 json.dumps(metadata or {}, sort_keys=True),
@@ -4818,6 +4992,13 @@ class MemoryStore:
                 confidence=float(original.get("confidence") or 0.7),
                 metadata=split_metadata,
                 source_session_id=str(original.get("source_session_id") or ""),
+                valid_from=float(original.get("valid_from") or 0),
+                valid_until=float(original.get("valid_until") or 0),
+                temporal_kind=str(original.get("temporal_kind") or "atemporal"),
+                event_at=float(original.get("event_at") or 0),
+                temporal_precision=str(original.get("temporal_precision") or "unknown"),
+                temporal_timezone=str(original.get("temporal_timezone") or ""),
+                temporal_confidence=float(original.get("temporal_confidence") or 0),
                 sensitivity=str(original.get("sensitivity") or "normal"),
                 memory_class=str(original.get("memory_class") or "semantic"),
                 pinned=bool(original.get("pinned")),
@@ -5718,6 +5899,11 @@ class MemoryStore:
                 source_session_id=str(row.get("source_session_id") or ""),
                 valid_from=float(row.get("valid_from") or 0),
                 valid_until=float(row.get("valid_until") or 0),
+                temporal_kind=str(row.get("temporal_kind") or "atemporal"),
+                event_at=float(row.get("event_at") or 0),
+                temporal_precision=str(row.get("temporal_precision") or "unknown"),
+                temporal_timezone=str(row.get("temporal_timezone") or ""),
+                temporal_confidence=float(row.get("temporal_confidence") or 0),
                 sensitivity=str(row.get("sensitivity") or "normal"),
                 memory_class=str(row.get("memory_class") or "semantic"),
                 pinned=bool(row.get("pinned")),

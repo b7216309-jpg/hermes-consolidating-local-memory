@@ -4,7 +4,7 @@
 
 Hermes calls `sync_turn` after a completed turn. The provider adds a bounded task containing the user and assistant text plus the current structured message roles/tool names. Critical overflow is spooled to SQLite and replayed; optional prefetch work may be dropped under pressure. Companion-memory writes are always durably spooled before execution. If an extraction model and endpoint are configured, the completed turn is sent to that model after privacy admission; otherwise automatic extraction is disabled. With `llm_disable_thinking: true`, OpenAI-compatible chat requests carry `chat_template_kwargs.enable_thinking=false`. This mirrors Hermes compression while keeping the plugin's endpoint opt-in and independent.
 
-Recall stays responsive: synchronous `prefetch` uses local FTS only. Hermes can call `queue_prefetch` after a turn to precompute an embedding-reranked result for the next turn. Cache entries expire and every mutation invalidates them.
+Recall stays responsive: synchronous `prefetch` uses local FTS only. Hermes can call `queue_prefetch` after a turn to precompute an embedding-reranked result for the next turn. Cache entries expire and every mutation invalidates them. The recall header supplies localized current time and labels every recalled memory with its relevant absolute/relative time.
 
 Session IDs can rotate without process restart. `on_session_switch` changes the provider target immediately and records continuation lineage. Already queued writes retain their original explicit session ID.
 
@@ -12,7 +12,18 @@ Shutdown is drain-first. New tasks are rejected, a FIFO sentinel is appended, an
 
 ## Fact state model
 
-Facts have normalized content, a fingerprint, topic, category, confidence, importance, salience, provenance, review scheduling, temporal validity, sensitivity, pin state, revision number, observation count, and belief score. Every observation retains its source role, reliability, session, timestamp, confidence, correction flag, and metadata.
+Facts have normalized content, a fingerprint, topic, category, confidence, importance, salience, provenance, review scheduling, structured temporal state, sensitivity, pin state, revision number, observation count, and belief score. Every observation retains its source role, reliability, session, timestamp, confidence, correction flag, and metadata.
+
+Temporal state is deliberately decomposed:
+
+- `temporal_kind`: `atemporal`, `current`, `event`, `scheduled`, or `temporary`;
+- `event_at`: when something happened or is planned, not when it was learned;
+- `valid_from` / `valid_until`: the interval during which a state applies;
+- `temporal_precision`: the finest supported unit actually known;
+- `temporal_timezone`: the IANA interpretation used for local input;
+- `temporal_confidence`: confidence in the temporal interpretation.
+
+Creation, update, observation, and event timestamps are never collapsed. The extractor receives the current Unix reference, localized ISO timestamp, and Hermes timezone, resolves relative expressions, and cannot invent an hour when only a date is known. An undated event remains an undated fact rather than being placed on the timeline at observation time. Dated extracted and explicit `remember` facts share the same deterministic fact-to-timeline link. One-time scheduled facts expire from current-state recall after their precision window, while an autobiographical timeline link survives as an unconfirmed plan.
 
 - `subject_key` identifies the property, such as `project:database`.
 - `value_key` identifies a normalized value or facet.
@@ -31,7 +42,7 @@ A pass performs duplicate reconciliation, decay, stale-fact pruning, topic rebui
 
 ## Storage and migration
 
-The default database is `$HERMES_HOME/consolidating_memory.db`. Gateway identities default to a separately hashed database per user; agent and global scopes are configurable. Wiki output is likewise separated by scope. Writes to shared Hermes `USER.md`/`MEMORY.md` files are refused from user- or agent-scoped stores. Startup migrations are additive and recorded in `schema_migrations`. FTS tables are versioned and count-checked against their sources.
+The default database is `$HERMES_HOME/consolidating_memory.db`. Gateway identities default to a separately hashed database per user; agent and global scopes are configurable. Wiki output is likewise separated by scope. Writes to shared Hermes `USER.md`/`MEMORY.md` files are refused from user- or agent-scoped stores. Startup migrations are additive and recorded in `schema_migrations`. The version-3 temporal migration adds the structured columns/index and conservatively classifies legacy facts without fabricating event dates. FTS tables are versioned and count-checked against their sources.
 
 Episode retention removes FTS rows and episode links and clears trace source references, preventing dangling provenance.
 

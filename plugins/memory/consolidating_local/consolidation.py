@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import calendar
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Dict, Iterable, List
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .store import MemoryStore, normalize_whitespace, slugify
 
 ALLOWED_CATEGORIES = {"user_pref", "project", "environment", "workflow", "general"}
+TEMPORAL_KINDS = {"atemporal", "current", "event", "scheduled", "temporary"}
+TEMPORAL_PRECISIONS = {"unknown", "year", "month", "day", "hour", "minute", "second"}
 
 
 def message_content_text(content: Any) -> str:
@@ -52,6 +57,116 @@ def _is_true(value: Any) -> bool:
     return value is True or str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
+def _clean_timezone(value: Any) -> str:
+    name = normalize_whitespace(str(value or ""))[:80]
+    if not name:
+        return ""
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ""
+    return name
+
+
+def _infer_temporal_precision(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return "second"
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    date_part, _, time_part = text.replace("Z", "+00:00").partition("T")
+    if len(date_part) == 4 and date_part.isdigit():
+        return "year"
+    if len(date_part) == 7 and date_part[4] == "-":
+        return "month"
+    if not time_part:
+        return "day"
+    clock = time_part.split("+", 1)[0].rsplit("-", 1)[0]
+    fields = clock.split(":")
+    if len(fields) <= 1:
+        return "hour"
+    if len(fields) == 2:
+        return "minute"
+    return "second"
+
+
+def _parse_temporal_value(
+    value: Any,
+    *,
+    timezone_name: str = "",
+    boundary: str = "event",
+) -> float:
+    if value is None or value == "":
+        return 0.0
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        return parsed if parsed == parsed and 0 < parsed < 253402300800 else 0.0
+
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    try:
+        numeric = float(text)
+    except ValueError:
+        numeric = 0.0
+    if numeric:
+        return numeric if numeric == numeric and 0 < numeric < 253402300800 else 0.0
+
+    zone = ZoneInfo(timezone_name) if timezone_name else UTC
+    precision = _infer_temporal_precision(text)
+    try:
+        if precision == "year":
+            year = int(text)
+            if boundary == "end":
+                parsed_dt = datetime(year + 1, 1, 1, tzinfo=zone)
+            elif boundary == "event":
+                parsed_dt = datetime(year, 1, 1, 12, tzinfo=zone)
+            else:
+                parsed_dt = datetime(year, 1, 1, tzinfo=zone)
+        elif precision == "month":
+            year, month = (int(part) for part in text.split("-", 1))
+            if boundary == "end":
+                next_year, next_month = (year + 1, 1) if month == 12 else (year, month + 1)
+                parsed_dt = datetime(next_year, next_month, 1, tzinfo=zone)
+            elif boundary == "event":
+                parsed_dt = datetime(year, month, 1, 12, tzinfo=zone)
+            else:
+                parsed_dt = datetime(year, month, 1, tzinfo=zone)
+        elif precision == "day":
+            parsed_date = datetime.fromisoformat(text).date()
+            if boundary == "end":
+                parsed_dt = datetime.combine(parsed_date + timedelta(days=1), datetime.min.time(), tzinfo=zone)
+            elif boundary == "event":
+                parsed_dt = datetime.combine(parsed_date, datetime.min.time(), tzinfo=zone) + timedelta(hours=12)
+            else:
+                parsed_dt = datetime.combine(parsed_date, datetime.min.time(), tzinfo=zone)
+        else:
+            parsed_dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=zone)
+        timestamp = parsed_dt.timestamp()
+    except (OverflowError, TypeError, ValueError):
+        return 0.0
+    return timestamp if 0 < timestamp < 253402300800 else 0.0
+
+
+def _scheduled_expiry(event_at: float, precision: str, timezone_name: str) -> float:
+    if event_at <= 0:
+        return 0.0
+    zone = ZoneInfo(timezone_name) if timezone_name else UTC
+    event = datetime.fromtimestamp(event_at, zone)
+    if precision == "year":
+        return datetime(event.year + 1, 1, 1, tzinfo=zone).timestamp()
+    if precision == "month":
+        _, last_day = calendar.monthrange(event.year, event.month)
+        return datetime(event.year, event.month, last_day, 23, 59, 59, tzinfo=zone).timestamp() + 1
+    if precision == "day":
+        return datetime.combine(event.date() + timedelta(days=1), datetime.min.time(), tzinfo=zone).timestamp()
+    return event_at + 86400.0
+
+
 def normalize_candidate_fact(raw: Dict[str, Any], *, source_role: str = "assistant") -> Dict[str, Any] | None:
     """Validate and normalize a model-produced fact without guessing its meaning."""
 
@@ -83,6 +198,67 @@ def normalize_candidate_fact(raw: Dict[str, Any], *, source_role: str = "assista
         metadata.pop("exclusive", None)
     polarity_raw = raw.get("polarity", metadata.get("polarity", 1))
     metadata["polarity"] = -1 if str(polarity_raw).strip().casefold() in {"-1", "false", "neg", "negative", "no"} else 1
+
+    reference_time = _parse_temporal_value(raw.get("reference_unix_time") or metadata.get("reference_unix_time"))
+    timezone_name = _clean_timezone(
+        raw.get("temporal_timezone")
+        or metadata.get("temporal_timezone")
+        or raw.get("reference_timezone")
+        or metadata.get("reference_timezone")
+    )
+    event_raw = raw.get("event_at", metadata.get("event_at"))
+    precision = normalize_whitespace(
+        str(raw.get("temporal_precision") or metadata.get("temporal_precision") or "")
+    ).casefold()
+    if precision not in TEMPORAL_PRECISIONS:
+        precision = _infer_temporal_precision(event_raw)
+    event_at = _parse_temporal_value(event_raw, timezone_name=timezone_name, boundary="event")
+    valid_from = _parse_temporal_value(
+        raw.get("valid_from", metadata.get("valid_from")),
+        timezone_name=timezone_name,
+        boundary="start",
+    )
+    valid_until = _parse_temporal_value(
+        raw.get("valid_until", metadata.get("valid_until")),
+        timezone_name=timezone_name,
+        boundary="end",
+    )
+    temporal_kind = normalize_whitespace(
+        str(raw.get("temporal_kind") or metadata.get("temporal_kind") or "")
+    ).casefold()
+    explicit_temporal_kind = temporal_kind in TEMPORAL_KINDS
+    if not explicit_temporal_kind:
+        if valid_until:
+            temporal_kind = "temporary"
+        elif event_at:
+            temporal_kind = "scheduled" if reference_time and event_at > reference_time else "event"
+        elif subject_key and _is_true(raw.get("exclusive", metadata.get("exclusive"))):
+            temporal_kind = "current"
+        else:
+            temporal_kind = "atemporal"
+    if temporal_kind == "scheduled" and event_at and not valid_until:
+        valid_until = _scheduled_expiry(event_at, precision, timezone_name)
+    if valid_from and valid_until and valid_until <= valid_from:
+        valid_until = 0.0
+    default_temporal_confidence = 0.9 if explicit_temporal_kind else (0.7 if event_at or valid_until else 0.5)
+    temporal_confidence = _bounded_float(
+        raw.get("temporal_confidence", metadata.get("temporal_confidence")),
+        0.0,
+        1.0,
+        default_temporal_confidence,
+    )
+    metadata["temporal_kind"] = temporal_kind
+    metadata["temporal_precision"] = precision
+    metadata["temporal_confidence"] = temporal_confidence
+    if timezone_name:
+        metadata["temporal_timezone"] = timezone_name
+    else:
+        metadata.pop("temporal_timezone", None)
+    for key, value in (("event_at", event_at), ("valid_from", valid_from), ("valid_until", valid_until)):
+        if value > 0:
+            metadata[key] = value
+        else:
+            metadata.pop(key, None)
     clean_role = str(source_role or "assistant").strip().casefold()
     metadata["source_role"] = clean_role if clean_role in {"user", "assistant", "tool"} else "assistant"
     return {

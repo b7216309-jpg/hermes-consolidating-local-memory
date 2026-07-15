@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.3.0 — 2026-07-15
+
+- Added structured fact time with explicit temporal kind, event time, validity interval, precision,
+  source timezone, and confidence.
+- Supplied model extraction with the local ISO reference time and IANA timezone so relative dates
+  are resolved without inventing missing hours.
+- Distinguished event time from observation, creation, and update time throughout recall, timeline,
+  wiki, import/export, split, and direct tool writes.
+- Linked dated explicit `remember` facts into the autobiographical timeline and refused to fabricate
+  an unknown event date from observation time.
+- Added current-time and relative-age labels to every recalled memory system, including working,
+  prospective, autobiographical, provenance, and contradiction views.
+- Expired one-time schedules from current-state recall while retaining their linked timeline record;
+  past plans are explicitly not represented as confirmed outcomes.
+- Added the additive `structured_temporal_context` migration and conservative legacy backfill.
+- Hardened all temporal storage values against nonnumeric, infinite, negative, and NaN input.
+- Added migration, extraction, expiry, timeline, rendering, and malformed-input regression tests.
+
 ## 3.2.0 — 2026-07-14
 
 - Added opt-in strict non-thinking extraction through `llm_disable_thinking` for compatible OpenAI-style Qwen endpoints.
