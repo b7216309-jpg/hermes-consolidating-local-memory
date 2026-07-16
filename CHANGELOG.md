@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.4.0 — 2026-07-16
+
+- Reduced the injected system contract to a two-line capability marker and removed operational
+  diagnostics from normal model context.
+- Limited the model-facing schema to 19 conversational actions while retaining operator and
+  compatibility handlers for maintenance, diagnostics, and export.
+- Bounded recall to 4,500 total characters, 500 characters per line, and 20 requested results.
+- Made automatic prefetch strictly relevant: no unrelated global fallback and at least two useful
+  lexical overlaps for automatic recall. Explicit context/search requests remain available.
+- Made snapshot disable cleanup remove only plugin-owned marked blocks, preserving manual Hermes
+  memory files.
+- Added regression coverage for prompt size, relevance, fallback behavior, line boundaries,
+  operator action visibility, and snapshot ownership.
+
 ## 3.3.2 — 2026-07-16
 
 - Removed an unused wiki importance renderer and the unreachable fallback for a store API that is

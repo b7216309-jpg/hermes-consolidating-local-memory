@@ -42,6 +42,7 @@ from .origin import (
     should_capture_memory,
 )
 from .store import (
+    STOPWORDS,
     MemoryStore,
     _as_bool,
     _looks_like_credential,
@@ -55,7 +56,9 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.3.1"
+__version__ = "3.4.0"
+RECALL_CONTEXT_CHAR_LIMIT = 4500
+RECALL_LINE_CHAR_LIMIT = 500
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -71,28 +74,8 @@ def _flag(value: Any, default: bool = False) -> bool:
 TOOL_SCHEMA = {
     "name": "consolidating_memory",
     "description": (
-        "Layered local memory with session summaries, durable facts, "
-        "preferences, policies, provenance, and background consolidation.\n\n"
-        "Actions:\n"
-        "- search: lookup across facts, topics, summaries, journals, preferences, policies, and episode buffers.\n"
-        "- remember: store a durable fact or preference.\n"
-        "- forget: deactivate a fact or other memory entry by id or matching text.\n"
-        "- recent: inspect the latest memory objects.\n"
-        "- contradictions: inspect recently resolved assumption changes.\n"
-        "- status: show memory counts, retrieval backend, and consolidation state.\n"
-        "- consolidate: force a consolidation pass now.\n"
-        "- journal: write a narrative note.\n"
-        "- distill: create or refresh a summary.\n"
-        "- history: inspect append-only memory history.\n"
-        "- policy: set or get a memory policy.\n"
-        "- review: inspect and advance due spaced-review items.\n"
-        "- decay: apply salience decay now.\n"
-        "- export: write the compiled markdown wiki mirror."
-        "\n- explain: show a fact's evidence, provenance, and revision history."
-        "\n- working/procedure/intention/timeline: manage working, procedural, prospective, and autobiographical memory."
-        "\n- approval: inspect or resolve sensitive-memory consent requests."
-        "\n- associate/merge/split/pin: curate links and fact structure."
-        "\n- doctor/maintain/backup/export_json: operate and repair the store."
+        "Search or update local long-term memory. Use it for explicit memory work or when recalled "
+        "context is insufficient; routine conversation needs no call."
     ),
     "parameters": {
         "type": "object",
@@ -105,15 +88,10 @@ TOOL_SCHEMA = {
                     "forget",
                     "recent",
                     "contradictions",
-                    "status",
-                    "consolidate",
                     "journal",
                     "distill",
                     "history",
                     "policy",
-                    "review",
-                    "decay",
-                    "export",
                     "explain",
                     "working",
                     "procedure",
@@ -124,10 +102,6 @@ TOOL_SCHEMA = {
                     "merge",
                     "split",
                     "pin",
-                    "doctor",
-                    "maintain",
-                    "backup",
-                    "export_json",
                 ],
             },
             "query": {"type": "string", "description": "Search or forget query."},
@@ -136,7 +110,7 @@ TOOL_SCHEMA = {
                 "enum": ["all", "facts", "topics", "episodes", "summaries", "journals", "preferences", "policies"],
                 "description": "Search scope for action=search.",
             },
-            "limit": {"type": "integer", "description": "Maximum number of results."},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20},
             "content": {"type": "string", "description": "Content to store or update."},
             "category": {
                 "type": "string",
@@ -196,7 +170,6 @@ TOOL_SCHEMA = {
             "right_kind": {"type": "string"},
             "right_id": {"type": "string"},
             "relation": {"type": "string"},
-            "destination": {"type": "string", "description": "Backup or JSON export destination."},
         },
         "required": ["action"],
     },
@@ -698,35 +671,32 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._store:
             return ""
-        counts = self._store.counts()
-        cfg = self._cfg()
-        last = self._store.last_consolidation()
-        last_text = "never"
-        if last:
-            last_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(last["finished_at"])))
-        backend_desc = (
-            f"LLM via {self._llm.model}" if self._llm and self._llm.enabled else "disabled (tool writes only)"
-        )
-        retrieval_desc = self._retrieval_backend
-        if self._retrieval_backend == "hybrid" and (not self._embedder or not self._embedder.supports_embeddings):
-            retrieval_desc += " (embeddings unavailable, using FTS fallback)"
-        wiki_desc = "disabled"
-        if self._cfg()["wiki_export_enabled"]:
-            wiki_desc = f"enabled at {self._wiki_export_dir()}"
-        return (
-            "# Consolidating Memory\n"
-            f"Active. {counts['facts']} facts, {counts['topics']} topics, {counts['summaries']} summaries, "
-            f"{counts['journals']} journals, {counts['preferences']} preferences, {counts['policies']} policies, "
-            f"{counts['episodes']} episode buffers, and {counts['contradictions']} contradiction resolutions logged.\n"
-            f"Background consolidation gate: {cfg['min_hours']}h + {cfg['min_sessions']} sessions.\n"
-            f"Extractor backend: {backend_desc}.\n"
-            f"Retrieval backend: {retrieval_desc}.\n"
-            f"Compiled wiki export: {wiki_desc}.\n"
-            f"Last consolidation: {last_text}.\n"
-            "Use consolidating_memory to search, remember, journal, distill, inspect history/policies, export the wiki mirror, or force consolidation."
-        )
+        return "# Consolidating Memory\nDurable recall is active; consolidating_memory manages it."
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    @staticmethod
+    def _bounded_recall(lines: List[str]) -> str:
+        rendered: List[str] = []
+        used = 0
+        for raw in lines:
+            line = str(raw or "").strip()
+            if not line:
+                continue
+            if len(line) > RECALL_LINE_CHAR_LIMIT:
+                line = line[: RECALL_LINE_CHAR_LIMIT - 1].rstrip() + "…"
+            cost = len(line) + (1 if rendered else 0)
+            if used + cost > RECALL_CONTEXT_CHAR_LIMIT:
+                continue
+            rendered.append(line)
+            used += cost
+        return "\n".join(rendered)
+
+    def prefetch(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        allow_global_fallback: bool = False,
+    ) -> str:
         if not self._store:
             return ""
         key = session_id or self._session_id
@@ -742,7 +712,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             cached = self._prefetch_cache.get(key)
             cache_age = time.time() - float(cached.get("created_at") or 0.0) if cached else float("inf")
-            if cached and cached.get("query") == clean and cache_age <= self._cfg()["prefetch_cache_ttl_seconds"]:
+            if (
+                cached
+                and cached.get("query") == clean
+                and cached.get("allow_global_fallback") is allow_global_fallback
+                and cache_age <= self._cfg()["prefetch_cache_ttl_seconds"]
+            ):
                 return str(cached.get("rendered") or "")
         cues = self._build_retrieval_cues(query=clean, args={}, session_id=key)
         results = self._search_memory(
@@ -753,9 +728,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             cues=cues,
             touch_recall=self._write_enabled,
             allow_embeddings=False,
+            allow_global_fallback=allow_global_fallback,
+            minimum_lexical_overlap=0 if allow_global_fallback else 2,
         )
-        rendered = self._render_prefetch(clean, results, cues=cues)
-        self._cache_prefetch(key, clean, rendered)
+        rendered = self._render_prefetch(clean, results, cues=cues) if any(results.values()) else ""
+        self._cache_prefetch(key, clean, rendered, allow_global_fallback=allow_global_fallback)
         return rendered
 
     def get_context(self, *, session_id: str = "", query: str = "") -> str:
@@ -765,7 +742,11 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "Give me a provenance summary of every fact, preference, policy, "
                 "journal note, and changed assumption you know about me."
             )
-        return self.prefetch(effective_query, session_id=session_id or self._session_id)
+        return self.prefetch(
+            effective_query,
+            session_id=session_id or self._session_id,
+            allow_global_fallback=True,
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         clean = normalize_whitespace(query)
@@ -981,7 +962,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
         action = str(args.get("action") or "").strip()
         try:
-            limit = max(1, min(int(args.get("limit") or 8), 50))
+            limit = max(1, min(int(args.get("limit") or 8), 20))
         except (TypeError, ValueError, OverflowError):
             limit = 8
         session_id = str(args.get("session_id") or self._session_id).strip()
@@ -2182,13 +2163,30 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         }
 
     def _sync_builtin_snapshot(self, *, reason: str) -> Dict[str, Any]:
-        if not self._store or not self._cfg()["builtin_snapshot_sync_enabled"]:
+        if not self._store:
             return {"success": False, "reason": "disabled"}
         if self._scope_id.startswith(("user:", "agent:")):
             result = {
                 "success": False,
                 "reason": "scoped memory cannot safely write shared Hermes USER.md or MEMORY.md files",
             }
+            self._store.set_state("last_builtin_snapshot_sync", json.dumps(result, sort_keys=True))
+            return result
+        if not self._cfg()["builtin_snapshot_sync_enabled"]:
+            try:
+                result = {
+                    "success": True,
+                    "reason": "disabled_cleanup",
+                    "user": self._write_builtin_snapshot_file("user", [], limit_chars=100_000_000),
+                    "memory": self._write_builtin_snapshot_file("memory", [], limit_chars=100_000_000),
+                }
+            except Exception as exc:
+                logger.warning("Builtin snapshot cleanup failed: %s", exc)
+                result = {
+                    "success": False,
+                    "reason": "disabled_cleanup",
+                    "error": str(exc),
+                }
             self._store.set_state("last_builtin_snapshot_sync", json.dumps(result, sort_keys=True))
             return result
         try:
@@ -3038,6 +3036,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         cues: Dict[str, Any] | None = None,
         touch_recall: bool = True,
         allow_embeddings: bool = True,
+        allow_global_fallback: bool = True,
+        minimum_lexical_overlap: int = 0,
     ) -> Dict[str, List[Dict[str, Any]]]:
         if not self._store:
             return {}
@@ -3050,6 +3050,28 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
         results = self._store.search(clean, scope=scope, limit=int(candidate_limit), include_inactive=include_inactive)
         results = self._decorate_search_results(results)
+        if minimum_lexical_overlap > 0:
+            query_tokens = {
+                token for token in re.findall(r"\w+", normalize_text(clean), flags=re.UNICODE) if token not in STOPWORDS
+            }
+            required = min(max(1, int(minimum_lexical_overlap)), len(query_tokens))
+            if required:
+                for section in MemoryStore.SEARCH_SCOPES:
+                    results[section] = [
+                        row
+                        for row in results.get(section, [])
+                        if len(
+                            query_tokens
+                            & set(
+                                re.findall(
+                                    r"\w+",
+                                    normalize_text(self._memory_text(section, row)),
+                                    flags=re.UNICODE,
+                                )
+                            )
+                        )
+                        >= required
+                    ]
         results["facts"] = [
             row
             for row in results.get("facts", [])
@@ -3090,7 +3112,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 or self._query_allows_sensitive(clean, str(row.get("sensitivity") or ""))
             ][: self._section_limit("facts", limit)]
         if (
-            str(cue_map.get("mode") or "") in {"current_state", "provenance"}
+            allow_global_fallback
+            and str(cue_map.get("mode") or "") in {"current_state", "provenance"}
             and not str(cue_map.get("subject_key") or "")
             and not any(results.get(section) for section in MemoryStore.SEARCH_SCOPES)
         ):
@@ -4080,11 +4103,19 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if session_id:
                     self._prefetch_cache.pop(session_id, None)
 
-    def _cache_prefetch(self, session_id: str, query: str, rendered: str) -> None:
+    def _cache_prefetch(
+        self,
+        session_id: str,
+        query: str,
+        rendered: str,
+        *,
+        allow_global_fallback: bool = False,
+    ) -> None:
         with self._prefetch_lock:
             self._prefetch_cache[session_id] = {
                 "query": query,
                 "rendered": rendered,
+                "allow_global_fallback": allow_global_fallback,
                 "created_at": time.time(),
             }
             if len(self._prefetch_cache) > 64:
@@ -4198,8 +4229,10 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             session_id=session_id,
             cues=cues,
             touch_recall=self._write_enabled,
+            allow_global_fallback=False,
+            minimum_lexical_overlap=2,
         )
-        rendered = self._render_prefetch(query, results, cues=cues)
+        rendered = self._render_prefetch(query, results, cues=cues) if any(results.values()) else ""
         self._cache_prefetch(session_id, query, rendered)
 
     def _handle_mirror_memory(self, payload: Dict[str, Any]) -> None:
@@ -4760,22 +4793,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
         lines = [f"## Consolidating Memory Recall for: {query}", self._temporal_orientation()]
         if mode in {"current_state", "summary", "workflow"}:
-            lines.append(
-                "Current-state guidance: prefer active current memory and avoid mentioning older conflicting values unless the user explicitly asks for history or provenance."
-            )
-        if mode == "summary":
-            lines.append("Do not mention obsolete or superseded values, even as exclusions, contrasts, or examples.")
-            lines.append(
-                "When you answer, list only the current winner facts and stop. Do not append an exclusions note."
-            )
-            lines.append(
-                "Use the winner snapshot as the source of truth. Do not add replacement history, caveats, or extra workflow items that are not in the snapshot."
-            )
-        if mode == "workflow":
-            lines.append(
-                "Use only the current workflow winners below for shell, test command, deploy method, and Docker sudo behavior."
-            )
-            lines.append("Do not append an obsolete-values note, contrast list, or superseded examples.")
+            lines.append("Use current entries; discuss superseded values only when history is requested.")
         if mode == "current_state":
             if working_lines:
                 lines.append("Active working memory:")
@@ -4798,7 +4816,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             elif topic_lines:
                 lines.append("Current topic snapshots:")
                 lines.extend(topic_lines)
-            return "\n".join(lines)
+            return self._bounded_recall(lines)
         if mode in {"summary", "workflow"}:
             if snapshot_lines:
                 lines.append("Current workflow winners:" if mode == "workflow" else "Current winner snapshot:")
@@ -4816,7 +4834,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if fact_lines:
                     lines.append("Active direct matches:")
                     lines.extend(fact_lines)
-            return "\n".join(lines)
+            return self._bounded_recall(lines)
         if provenance_lines:
             lines.append("Provenance trail:")
             lines.extend(provenance_lines)
@@ -4847,7 +4865,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if contradiction_lines:
             lines.append("Changed assumptions:")
             lines.extend(contradiction_lines)
-        return "\n".join(lines)
+        return self._bounded_recall(lines)
 
 
 def register(ctx) -> None:

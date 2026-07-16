@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.3.2](https://img.shields.io/badge/version-3.3.2-14b8a6)](CHANGELOG.md)
+[![Version 3.4.0](https://img.shields.io/badge/version-3.4.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -10,6 +10,13 @@ A local-first, durable memory provider for [Hermes Agent](https://github.com/Nou
 Version 3 removes the old heuristic extractor. Automatic fact extraction is now model-backed and opt-in. With no model configured, the provider still records redacted episodes, mirrors explicit Hermes memory writes exactly, and performs local full-text recall; it never guesses facts with rules.
 
 Version 3.3 adds structured temporal memory. The extractor receives Hermes' local date, time, and timezone; facts distinguish when something happened, when a state is valid, and when it was merely recorded; recall renders absolute and relative time without treating a past plan as a confirmed event. Version 3.2 added strict non-thinking extraction for compatible Qwen and OpenAI-style endpoints. Version 3.1 added review-first profile onboarding.
+
+Version 3.4 reduces model pressure without removing operator capability. Automatic prefetch is
+strictly query-relevant, never falls back to an unrelated global snapshot, and injects at most
+4,500 characters in bounded lines. The model sees 19 everyday memory actions; nine maintenance,
+diagnostic, and export actions remain available through operator surfaces and compatibility
+handlers. Disabling built-in snapshots now removes only plugin-owned marked blocks and preserves
+manual `USER.md` and `MEMORY.md` text.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -143,7 +150,16 @@ Every fact also has a temporal class: `atemporal`, `current`, `event`, `schedule
 
 ### Recall
 
-At turn start, Hermes asks the provider for relevant context. Local FTS5 recall returns a small bounded set immediately. The injected block begins with the current localized time, explains the timestamp contract, and labels recalled objects with useful absolute and relative times such as `event: 2026-07-14 18:30 CEST (yesterday)` or `recorded 3 days ago`. Expired current-state facts are excluded, while their history and linked autobiographical timeline entries remain auditable. A passed scheduled time is explicitly a past plan, not proof that the event occurred.
+At turn start, Hermes asks the provider for relevant context. Local FTS5 recall returns a small
+bounded set immediately. Automatic prefetch requires at least two useful lexical overlaps and
+returns no memory when the turn is casual or unrelated; it does not replace an empty result with a
+global snapshot. Explicit `search` and `get_context` requests remain broader operator/model choices.
+The complete injected block is capped at 4,500 characters and each line at 500 characters.
+
+Recalled objects carry useful absolute and relative times such as
+`event: 2026-07-14 18:30 CEST (yesterday)` or `recorded 3 days ago`. Expired current-state facts are
+excluded, while their history and linked autobiographical timeline entries remain auditable. A
+passed scheduled time is explicitly a past plan, not proof that the event occurred.
 
 In `hybrid` mode, a configured embedding endpoint reranks FTS candidates off the request path and caches the result for the next turn. Sensitive text is never sent to a model endpoint unless separately allowed.
 
@@ -434,15 +450,19 @@ Generated wiki files are written atomically. A manifest lets later exports remov
 
 ## Memory tool actions
 
-The provider exposes the `consolidating_memory` tool with 28 actions:
+The provider accepts 28 actions, but its model-facing schema exposes only the 19 actions useful in
+ordinary conversation:
 
 | Group | Actions |
 | --- | --- |
-| Recall and inspect | `search`, `recent`, `contradictions`, `status`, `history`, `explain`, `timeline` |
-| Write and curate | `remember`, `forget`, `journal`, `policy`, `associate`, `merge`, `split`, `pin` |
-| Cognitive systems | `working`, `procedure`, `intention`, `review`, `decay` |
-| Consolidate and export | `consolidate`, `distill`, `export`, `export_json` |
-| Consent and operations | `approval`, `doctor`, `maintain`, `backup` |
+| Recall and inspect | `search`, `recent`, `contradictions`, `history`, `explain`, `timeline` |
+| Write and curate | `remember`, `forget`, `journal`, `policy`, `distill`, `associate`, `merge`, `split`, `pin` |
+| Cognitive systems | `working`, `procedure`, `intention` |
+| Consent | `approval` |
+
+Operator-only and compatibility actions are `status`, `consolidate`, `review`, `decay`, `export`,
+`doctor`, `maintain`, `backup`, and `export_json`. They remain callable from native administration
+commands and existing integrations but no longer consume model tool-schema attention.
 
 Mutating or sensitive actions are rejected outside the primary agent context. The tool schema describes the required fields for each action directly to Hermes.
 

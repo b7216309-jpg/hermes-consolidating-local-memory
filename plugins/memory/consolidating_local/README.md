@@ -1,4 +1,4 @@
-# consolidating_local 3.3.2
+# consolidating_local 3.4.0
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -6,7 +6,8 @@ This directory is the installable Hermes memory-provider bundle. Install it as `
 
 The provider implements the current lifecycle:
 
-- `prefetch` returns fast FTS recall and consumes a bounded, expiring per-session cache.
+- `prefetch` returns bounded FTS recall only when the turn has meaningful lexical relevance; it
+  never fills an empty automatic result with an unrelated global snapshot.
 - `queue_prefetch` optionally performs embedding reranking off the request path.
 - `sync_turn(..., messages=...)` queues the completed turn, captures its episode, and optionally runs configured LLM extraction.
 - `on_session_switch` rotates session state for new, resumed, branched, rewound, and compressed sessions.
@@ -37,7 +38,7 @@ The `consolidating_memory` tool supports recall and explicit writes plus `explai
 `procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`,
 `maintain`, `backup`, and `export_json`.
 
-Version 3.3.2 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
+Version 3.4.0 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
 or a direct human CLI turn. Synthetic gateway work and background review harnesses are excluded
 from recall warming, episodes, traces, working memory, fact extraction, and session summaries.
 Hermes 0.18.2 discovers the provider and general hooks separately, so `install.py` also enables the

@@ -42,7 +42,7 @@ def test_temporal_fact_creates_a_persistent_timeline_and_renders_age(tmp_path):
         observed = datetime(2026, 7, 15, 7, 0, tzinfo=UTC).timestamp()
         candidate = normalize_candidate_fact(
             {
-                "content": "The user welded SNCF train parts",
+                "content": "The user welded components for a national rail operator",
                 "category": "general",
                 "topic": "work",
                 "temporal_kind": "event",
@@ -56,7 +56,7 @@ def test_temporal_fact_creates_a_persistent_timeline_and_renders_age(tmp_path):
         )
         result = provider._store_candidate(candidate, source="test", session_id="temporal", observed_at=observed)
         fact = result["fact"]
-        events = provider._store.list_autobiographical_events("SNCF", limit=5)
+        events = provider._store.list_autobiographical_events("rail", limit=5)
 
         assert fact["temporal_kind"] == "event"
         assert fact["memory_class"] == "autobiographical"

@@ -8,7 +8,7 @@ from contextvars import copy_context
 from pathlib import Path
 from types import SimpleNamespace
 
-from consolidating_local import ConsolidatingLocalMemoryProvider, register
+from consolidating_local import TOOL_SCHEMA, ConsolidatingLocalMemoryProvider, register
 from consolidating_local.origin import (
     classify_turn,
     mark_gateway_user_dispatch,
@@ -230,6 +230,75 @@ def test_defaults_are_local_and_do_not_rewrite_builtin_memory():
     assert llm_disable_thinking["default"] == "false"
 
 
+def test_disabled_builtin_sync_removes_only_plugin_owned_snapshot_blocks(tmp_path):
+    memories = tmp_path / "memories"
+    memories.mkdir()
+    for name in ("USER.md", "MEMORY.md"):
+        (memories / name).write_text(
+            "<!-- consolidating_local:auto:start -->\n"
+            "- stale generated state\n"
+            "<!-- consolidating_local:auto:end -->\n\n"
+            "Manual operator note.\n",
+            encoding="utf-8",
+        )
+
+    provider = _provider(tmp_path, builtin_snapshot_sync_enabled=False)
+    try:
+        for name in ("USER.md", "MEMORY.md"):
+            content = (memories / name).read_text(encoding="utf-8")
+            assert "consolidating_local:auto" not in content
+            assert "stale generated state" not in content
+            assert content.strip() == "Manual operator note."
+        status = json.loads(provider._store.get_state("last_builtin_snapshot_sync"))
+        assert status["success"] is True
+        assert status["reason"] == "disabled_cleanup"
+    finally:
+        provider.shutdown()
+
+
+def test_model_memory_surface_is_compact_and_excludes_operator_maintenance(tmp_path):
+    encoded = json.dumps(TOOL_SCHEMA, separators=(",", ":"))
+    actions = set(TOOL_SCHEMA["parameters"]["properties"]["action"]["enum"])
+    assert len(encoded) < 3800
+    assert len(TOOL_SCHEMA["description"]) < 200
+    assert actions.isdisjoint(
+        {
+            "status",
+            "consolidate",
+            "review",
+            "decay",
+            "export",
+            "doctor",
+            "maintain",
+            "backup",
+            "export_json",
+        }
+    )
+
+    provider = _provider(tmp_path)
+    try:
+        prompt = provider.system_prompt_block()
+        assert len(prompt) < 120
+        assert "facts" not in prompt
+        assert "backend" not in prompt
+        results = {
+            "facts": [
+                {
+                    "content": f"fact-{number} " + "x" * 4000,
+                    "category": "general",
+                    "topic": "load-test",
+                }
+                for number in range(30)
+            ]
+        }
+        recall = provider._render_prefetch("bounded recall", results, cues={"mode": "current_state"})
+        assert len(recall) <= 4500
+        assert max(map(len, recall.splitlines())) <= 500
+        assert recall.count("superseded") == 1
+    finally:
+        provider.shutdown()
+
+
 def test_encrypted_provider_reports_unavailable_without_required_key(monkeypatch):
     monkeypatch.delenv("CONSOLIDATING_MEMORY_DB_KEY", raising=False)
     provider = ConsolidatingLocalMemoryProvider({"database_encryption": True})
@@ -304,6 +373,26 @@ def test_prefetch_is_immediately_useful_and_cache_is_invalidated(tmp_path):
         )
         provider._task_queue.join()
         assert "Alice" in provider.prefetch("What is my name?", session_id="session-old")
+    finally:
+        provider.shutdown()
+
+
+def test_automatic_prefetch_does_not_fall_back_to_unrelated_global_memory(tmp_path):
+    provider = _provider(tmp_path)
+    try:
+        provider.on_memory_write(
+            "add",
+            "memory",
+            "My shell is PowerShell.",
+            metadata={"session_id": "session-old", "write_origin": "assistant_tool"},
+        )
+        provider._task_queue.join()
+
+        automatic = provider.prefetch("A quiet afternoon with nothing needed.", session_id="session-new")
+        explicit = provider.get_context(query="A quiet afternoon with nothing needed.", session_id="session-old")
+
+        assert automatic == ""
+        assert "PowerShell" in explicit or "powershell" in explicit
     finally:
         provider.shutdown()
 

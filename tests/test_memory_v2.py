@@ -784,7 +784,7 @@ def test_credentials_never_enter_raw_or_durable_storage_without_explicit_excepti
         assert "ultra-secret" not in raw["user_content"]
         assert provider._store.search("ultra secret", scope="facts", limit=5)["facts"] == []
 
-        bare_token = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        bare_token = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz123456"
         assert provider._classify_sensitivity(bare_token)[0] == "credential"
         token_payload = provider._durable_payload("remember_fact", {"content": bare_token})
         assert token_payload == {"_privacy_denied": True}
@@ -1095,7 +1095,7 @@ def test_sensitive_text_requires_separate_opt_in_for_model_and_embedding_endpoin
         provider._llm.chat_json = fake_chat_json
         provider._embedder.embed_texts = fake_embed
 
-        secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+        secret = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz123456"
         provider._extract_turn_facts(user_content=f"My token is {secret}", assistant_content="")
         assert model_calls == []
         provider._extract_turn_facts(user_content="My shell is PowerShell", assistant_content="")

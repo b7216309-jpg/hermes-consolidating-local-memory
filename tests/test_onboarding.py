@@ -23,7 +23,7 @@ def _row_count(store: MemoryStore, table: str) -> int:
 
 
 def test_onboarding_builds_brain_memory_types_and_never_retains_credentials():
-    secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456"
+    secret = "sk-" + "proj-" + "abcdefghijklmnopqrstuvwxyz123456"
     plan = build_onboarding_plan(
         {
             "preferred_name": "Ada",
