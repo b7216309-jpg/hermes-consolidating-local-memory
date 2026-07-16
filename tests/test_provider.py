@@ -164,6 +164,36 @@ def test_gateway_internal_turns_never_enter_memory(tmp_path):
         reset_origin_state()
 
 
+def test_native_agency_heartbeat_does_not_contaminate_memory(tmp_path):
+    reset_origin_state()
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
+    provider.initialize(
+        "telegram-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+    )
+    try:
+        prompt = "[Hermes heartbeat poll]"
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message=prompt,
+            platform="telegram",
+        )
+        provider.sync_turn(
+            prompt,
+            "A synthetic heartbeat response",
+            session_id="telegram-session",
+        )
+        provider.queue_prefetch(prompt, session_id="telegram-session")
+        assert provider.prefetch(prompt, session_id="telegram-session") == ""
+        provider._task_queue.join()
+        assert provider._store.counts()["episodes"] == 0
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
 def test_real_gateway_turn_is_captured_once(tmp_path):
     reset_origin_state()
     provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})

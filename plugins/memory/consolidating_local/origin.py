@@ -28,6 +28,7 @@ _INTERNAL_SESSION_PREFIXES = (
     "subagent_",
 )
 _INTERNAL_MESSAGE_PREFIXES = (
+    "[Hermes heartbeat poll]",
     "Review the conversation above and consider saving to memory if appropriate.",
     "Review the conversation above and update the skill library.",
     "[IMPORTANT: Background process ",
@@ -159,6 +160,8 @@ def classify_turn(*, session_id: Any, user_message: Any, platform: Any, kwargs: 
     explicit = _explicit_origin(metadata)
     if explicit:
         return explicit
+    if str(user_message or "").lstrip().startswith("[Hermes heartbeat poll]"):
+        return "internal"
     session = _clean_text(session_id).casefold()
     surface = _clean_text(platform).casefold()
     if session.startswith(_INTERNAL_SESSION_PREFIXES) or surface in _INTERNAL_PLATFORMS:

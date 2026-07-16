@@ -1,5 +1,5 @@
 name: consolidating_local
-version: 3.4.0
+version: 3.4.1
 kind: standalone
 description: "Isolated, evidence-backed local memory with temporal, working, procedural, prospective, and autobiographical systems."
 hooks:

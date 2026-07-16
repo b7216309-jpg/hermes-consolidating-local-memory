@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.4.0](https://img.shields.io/badge/version-3.4.0-14b8a6)](CHANGELOG.md)
+[![Version 3.4.1](https://img.shields.io/badge/version-3.4.1-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -17,6 +17,11 @@ strictly query-relevant, never falls back to an unrelated global snapshot, and i
 diagnostic, and export actions remain available through operator surfaces and compatibility
 handlers. Disabling built-in snapshots now removes only plugin-owned marked blocks and preserves
 manual `USER.md` and `MEMORY.md` text.
+
+Version 3.4.1 adds a cross-suite regression guarantee for Conscious Agency 1.0: gateway-native
+heartbeat polls are internal turns and are excluded from episodes, recall warming, traces, working
+memory, summaries, and fact extraction. The shared Hermes transcript still gives Agency continuity;
+the memory database does not mistake self-generated heartbeat text for a user memory.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 

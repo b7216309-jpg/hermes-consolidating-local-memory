@@ -1,4 +1,4 @@
-# consolidating_local 3.4.0
+# consolidating_local 3.4.1
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -38,11 +38,13 @@ The `consolidating_memory` tool supports recall and explicit writes plus `explai
 `procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`,
 `maintain`, `backup`, and `export_json`.
 
-Version 3.4.0 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
+Version 3.4.1 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
 or a direct human CLI turn. Synthetic gateway work and background review harnesses are excluded
 from recall warming, episodes, traces, working memory, fact extraction, and session summaries.
 Hermes 0.18.2 discovers the provider and general hooks separately, so `install.py` also enables the
 same package as a lifecycle observer; both module namespaces share one bounded origin ledger.
+Conscious Agency 1.0's gateway-native `[Hermes heartbeat poll]` is explicitly internal, so its
+synthetic prompt and response cannot create episodes, warm prefetch, or enter fact extraction.
 
 ## Extraction and retrieval
 

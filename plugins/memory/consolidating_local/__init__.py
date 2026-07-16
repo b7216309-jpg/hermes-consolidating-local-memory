@@ -56,7 +56,7 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.4.0"
+__version__ = "3.4.1"
 RECALL_CONTEXT_CHAR_LIMIT = 4500
 RECALL_LINE_CHAR_LIMIT = 500
 

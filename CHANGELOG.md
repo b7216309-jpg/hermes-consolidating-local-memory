@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.4.1 — 2026-07-16
+
+- Added cross-suite regression coverage proving Conscious Agency 1.0 native heartbeat polls and
+  responses remain internal and cannot contaminate episodes, prefetch, or fact extraction.
+- Documented main-session heartbeat continuity without changing the 3.4 storage, extraction,
+  retrieval, configuration, or migration contracts.
+
 ## 3.4.0 — 2026-07-16
 
 - Reduced the injected system contract to a two-line capability marker and removed operational
