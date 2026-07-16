@@ -56,9 +56,10 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.4.1"
+__version__ = "3.5.0"
 RECALL_CONTEXT_CHAR_LIMIT = 4500
 RECALL_LINE_CHAR_LIMIT = 500
+_AGENCY_HEARTBEAT_THREAD_RE = re.compile(r"^agency-heartbeat-[0-9a-f]{32}$")
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -214,6 +215,13 @@ def _load_plugin_config() -> dict:
 
 
 class ConsolidatingLocalMemoryProvider(MemoryProvider):
+    @staticmethod
+    def tracks_session_thread(thread_id: str) -> bool:
+        """Return whether a Hermes thread represents a durable user memory session."""
+
+        normalized = normalize_whitespace(str(thread_id or ""))
+        return not bool(_AGENCY_HEARTBEAT_THREAD_RE.fullmatch(normalized))
+
     def __init__(self, config: dict | None = None):
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._store: MemoryStore | None = None
@@ -233,6 +241,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._accepting_tasks = False
         self._draining = False
         self._write_enabled = True
+        self._session_tracking_enabled = True
         self._last_scan_at = 0.0
         self._scope_id = "legacy"
         self._platform = "cli"
@@ -260,7 +269,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def get_advanced_config_schema(self) -> List[Dict[str, Any]]:
         """Machine-readable reference for optional config.yaml settings."""
-        return [
+        schema = [
             {
                 "key": "db_path",
                 "description": "SQLite database path",
@@ -531,6 +540,102 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 "default": "120",
             },
         ]
+        boolean_keys = {
+            "allow_credential_memory",
+            "allow_sensitive_model_processing",
+            "database_encryption",
+            "export_redact_sensitive",
+            "builtin_snapshot_sync_enabled",
+            "wiki_export_enabled",
+            "wiki_export_on_consolidate",
+            "llm_disable_thinking",
+        }
+        integer_keys = {
+            "queue_max_size",
+            "queue_max_attempts",
+            "consolidation_max_batches",
+            "consolidation_batch_size",
+            "working_memory_capacity",
+            "min_sessions",
+            "scan_cooldown_seconds",
+            "prefetch_limit",
+            "max_topic_facts",
+            "topic_summary_chars",
+            "session_summary_chars",
+            "prune_after_days",
+            "builtin_snapshot_user_chars",
+            "builtin_snapshot_memory_chars",
+            "wiki_export_session_limit",
+            "wiki_export_topic_limit",
+            "llm_timeout_seconds",
+            "llm_failure_cooldown_seconds",
+            "llm_max_input_chars",
+            "embedding_timeout_seconds",
+            "embedding_candidate_limit",
+        }
+        number_keys = {
+            "shutdown_timeout_seconds",
+            "max_database_mb",
+            "trace_retention_days",
+            "history_retention_days",
+            "sensitive_retention_days",
+            "min_hours",
+            "episode_body_retention_hours",
+            "decay_half_life_days",
+            "reconsolidation_window_hours",
+            "decay_min_salience",
+            "prefetch_cache_ttl_seconds",
+        }
+        numeric_ranges = {
+            "queue_max_size": (8, 100000),
+            "queue_max_attempts": (1, 100),
+            "shutdown_timeout_seconds": (1, 60),
+            "max_database_mb": (16, 102400),
+            "trace_retention_days": (1, 36500),
+            "history_retention_days": (1, 36500),
+            "sensitive_retention_days": (1, 36500),
+            "consolidation_max_batches": (1, 100),
+            "consolidation_batch_size": (1, 5000),
+            "working_memory_capacity": (1, 100),
+            "min_hours": (0, 8760),
+            "min_sessions": (1, 10000),
+            "scan_cooldown_seconds": (1, 86400),
+            "prefetch_limit": (1, 50),
+            "max_topic_facts": (1, 100),
+            "topic_summary_chars": (100, 10000),
+            "session_summary_chars": (100, 20000),
+            "prune_after_days": (1, 36500),
+            "episode_body_retention_hours": (0, 87600),
+            "decay_half_life_days": (0.01, 36500),
+            "reconsolidation_window_hours": (0, 8760),
+            "decay_min_salience": (0, 1),
+            "builtin_snapshot_user_chars": (100, 100000),
+            "builtin_snapshot_memory_chars": (100, 100000),
+            "wiki_export_session_limit": (1, 10000),
+            "wiki_export_topic_limit": (1, 10000),
+            "llm_timeout_seconds": (1, 300),
+            "llm_failure_cooldown_seconds": (1, 86400),
+            "llm_max_input_chars": (256, 100000),
+            "embedding_timeout_seconds": (1, 300),
+            "embedding_candidate_limit": (1, 100),
+            "prefetch_cache_ttl_seconds": (0, 86400),
+        }
+        for item in schema:
+            key = item["key"]
+            if key in boolean_keys:
+                item["type"] = "boolean"
+                item["default"] = str(item["default"]).strip().casefold() == "true"
+            elif key in integer_keys:
+                item["type"] = "integer"
+                item["default"] = int(item["default"])
+            elif key in number_keys:
+                item["type"] = "number"
+                item["default"] = float(item["default"])
+            else:
+                item["type"] = "string"
+            if key in numeric_ranges:
+                item["minimum"], item["maximum"] = numeric_ranges[key]
+        return schema
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         config_path = Path(hermes_home) / "config.yaml"
@@ -580,6 +685,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         platform = str(kwargs.get("platform") or "cli").strip().lower()
         self._platform = platform
         self._write_enabled = agent_context == "primary" and platform != "cron"
+        thread_id = normalize_whitespace(str(kwargs.get("thread_id") or ""))
+        self._session_tracking_enabled = self.tracks_session_thread(thread_id)
         db_path = str(self._config.get("db_path", "$HERMES_HOME/consolidating_memory.db"))
         db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
         base_db_path = Path(db_path).expanduser()
@@ -654,18 +761,23 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             encryption_key=encryption_key,
             conflict_policy=str(self._config.get("conflict_policy") or "evidence").strip().lower(),
         )
-        self._store.set_state("memory_scope", self._scope_id)
-        if self._write_enabled:
+        if self._write_enabled and self._session_tracking_enabled:
+            self._store.set_state("memory_scope", self._scope_id)
             self._store.ensure_memory_session(session_id, label=session_id, status="open")
             self._sync_builtin_snapshot(reason="initialize")
         self._task_queue = queue.Queue(maxsize=self._cfg()["queue_max_size"])
         self._queue_metrics = {"enqueued": 0, "dropped_prefetch": 0, "spooled": 0, "failed": 0}
         self._stop_event.clear()
         self._draining = False
-        self._accepting_tasks = True
-        self._worker = threading.Thread(target=self._worker_loop, name="consolidating-memory", daemon=True)
-        self._worker.start()
-        if self._write_enabled:
+        self._accepting_tasks = self._write_enabled and self._session_tracking_enabled
+        self._worker = None
+        if self._accepting_tasks:
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="consolidating-memory",
+                daemon=True,
+            )
+            self._worker.start()
             self._enqueue("maintenance")
 
     def system_prompt_block(self) -> str:
@@ -750,7 +862,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         clean = normalize_whitespace(query)
-        if not clean or not self._store:
+        if not clean or not self._store or not self._session_tracking_enabled:
             return
         key = session_id or self._session_id
         if not should_capture_memory(
@@ -769,7 +881,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         session_id: str = "",
         messages: List[Dict[str, Any]] | None = None,
     ) -> None:
-        if not self._write_enabled:
+        if not self._write_enabled or not self._session_tracking_enabled:
             return
         key = session_id or self._session_id
         if not should_capture_memory(
@@ -788,7 +900,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        if not self._store or not self._write_enabled:
+        if not self._store or not self._write_enabled or not self._session_tracking_enabled:
             return
         cooldown = float(self._cfg()["scan_cooldown_seconds"])
         now = time.time()
@@ -807,17 +919,59 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             self._request_consolidation(reason="turn_gate")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        if not self._store or not self._write_enabled:
+        if not self._store or not self._write_enabled or not self._session_tracking_enabled:
             return
-        self._enqueue("extract_messages", session_id=self._session_id, messages=messages or [], source="session_end")
+        filtered = self._filter_internal_message_pairs(messages or [], session_id=self._session_id)
+        # Completed user turns are extracted by sync_turn. Session finalization keeps
+        # summary/closure semantics without replaying the entire transcript through the
+        # extractor a second time (which also used to reinterpret old relative dates).
+        # Even an empty/internal-only transcript is queued so the session row is
+        # deterministically closed instead of remaining open forever.
+        self._enqueue(
+            "extract_messages",
+            session_id=self._session_id,
+            messages=filtered,
+            source="session_end",
+            extract_facts=False,
+        )
         self._request_consolidation(reason="session_end")
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        if not self._store or not self._write_enabled:
+        if not self._store or not self._write_enabled or not self._session_tracking_enabled:
             return ""
-        if is_gateway_platform(self._platform) and not gateway_user_dispatch_active():
+        filtered = self._filter_internal_message_pairs(messages or [], session_id=self._session_id)
+        latest_turn: List[Dict[str, Any]] = []
+        for message in reversed(filtered):
+            latest_turn.append(message)
+            role = str(message.get("role") or message.get("type") or "").strip().casefold()
+            if role in {"user", "human"}:
+                break
+        latest_turn.reverse()
+        latest_user = next(
+            (
+                message_content_text(message.get("content", ""))
+                for message in latest_turn
+                if str(message.get("role") or message.get("type") or "").strip().casefold()
+                in {"user", "human"}
+            ),
+            "",
+        )
+        # Preflight compression runs before pre_llm_call, while the authorized
+        # dispatch marker is still live. Mid-turn compression runs afterwards,
+        # when pre_llm_call has consumed that marker; use its durable origin
+        # record then. This keeps real gateway turns protected at both call
+        # sites without ever admitting an unknown or synthetic gateway turn.
+        if (
+            is_gateway_platform(self._platform)
+            and not gateway_user_dispatch_active()
+            and not should_capture_memory(
+                session_id=self._session_id,
+                user_message=latest_user,
+                platform=self._platform,
+            )
+        ):
             return ""
-        candidates = self._extract_messages_facts(messages or [], session_id=self._session_id)
+        candidates = self._extract_messages_facts(latest_turn, session_id=self._session_id)
         inserted = 0
         preserved_candidates: List[Dict[str, Any]] = []
         source_refs: List[Dict[str, Any]] = []
@@ -871,7 +1025,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         content: str,
         metadata: Dict[str, Any] | None = None,
     ) -> None:
-        if not self._write_enabled:
+        if not self._write_enabled or not self._session_tracking_enabled:
             return
         provenance = dict(metadata or {})
         execution_context = str(provenance.get("execution_context") or "").strip().lower()
@@ -900,7 +1054,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         previous = self._session_id
         self._session_id = clean_id
         self._invalidate_prefetch_cache(previous, clean_id)
-        if not self._store or not self._write_enabled:
+        if not self._store or not self._write_enabled or not self._session_tracking_enabled:
             return
         self._store.ensure_memory_session(clean_id, label=clean_id, status="open")
         parent = normalize_whitespace(parent_session_id or previous)
@@ -912,21 +1066,6 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 parent,
                 "rewound_from" if rewound else "continues_from",
             )
-
-    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
-        if not self._write_enabled:
-            return
-        content = f"Delegated task completed. Task: {normalize_whitespace(task)} Result: {normalize_whitespace(result)}"
-        self._enqueue(
-            "remember_fact",
-            content=content[:500],
-            category="workflow",
-            topic="delegation-results",
-            source="delegation",
-            importance=5,
-            confidence=0.45,
-            metadata={"child_session_id": child_session_id},
-        )
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [TOOL_SCHEMA]
@@ -4007,19 +4146,66 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             return 0
         drained = 0
         max_attempts = int(self._cfg()["queue_max_attempts"])
-        for operation in self._store.claim_operations(limit=limit, max_attempts=max_attempts):
+        lease_seconds = max(300.0, float(self._cfg()["llm_timeout_seconds"]) * 4.0)
+        for operation in self._store.claim_operations(
+            limit=limit,
+            max_attempts=max_attempts,
+            owner_id=self._owner_id,
+            lease_seconds=lease_seconds,
+        ):
             operation_kind = str(operation.get("operation_type") or "")
+            operation_id = int(operation["id"])
+            stop_renewal = threading.Event()
+            lease_lost = threading.Event()
+
+            def renew_claim() -> None:
+                try:
+                    while not stop_renewal.wait(max(1.0, lease_seconds / 3.0)):
+                        store = self._store
+                        if store is None or not store.renew_operation_claim(
+                            operation_id,
+                            self._owner_id,
+                            lease_seconds=lease_seconds,
+                        ):
+                            lease_lost.set()
+                            return
+                except Exception:
+                    # An unobserved renewal-thread exception previously let the
+                    # dispatcher finalize work under an ownership lease it could
+                    # no longer prove. Preserve the durable row for recovery.
+                    lease_lost.set()
+                    logger.exception(
+                        "Durable memory operation %s lease renewal failed",
+                        operation_id,
+                    )
+
+            renewal = threading.Thread(
+                target=renew_claim,
+                name=f"memory-operation-lease-{operation_id}",
+                daemon=True,
+            )
+            renewal.start()
             try:
                 self._dispatch_task(
                     operation_kind,
                     dict(operation.get("payload") or {}),
                 )
+                if lease_lost.is_set():
+                    raise RuntimeError("durable operation lease was lost during execution")
             except Exception as exc:
-                failed = self._store.fail_operation(
-                    int(operation["id"]),
-                    str(exc),
-                    max_attempts=max_attempts,
-                )
+                try:
+                    failed = self._store.fail_operation(
+                        operation_id,
+                        str(exc),
+                        max_attempts=max_attempts,
+                        owner_id=self._owner_id,
+                    )
+                except RuntimeError:
+                    logger.error(
+                        "Durable memory operation %s lost ownership; its new owner was not modified",
+                        operation_id,
+                    )
+                    failed = {"status": "running"}
                 self._queue_metrics["failed"] += 1
                 logger.warning(
                     "Durable memory operation %s %s after attempt %s: %s",
@@ -4029,9 +4215,32 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                     exc,
                 )
             else:
-                self._store.complete_operation(int(operation["id"]))
-                drained += 1
+                try:
+                    self._store.complete_operation(operation_id, owner_id=self._owner_id)
+                except RuntimeError:
+                    # The dispatch may have finished just as a suspended or
+                    # paused process lost its lease. Never delete a row now
+                    # owned by another process, and never let that race kill
+                    # the sole background worker.
+                    self._queue_metrics["failed"] += 1
+                    logger.error(
+                        "Durable memory operation %s completed after losing ownership; "
+                        "its current owner was not modified",
+                        operation_id,
+                    )
+                except Exception:
+                    # Leave the running row intact. Its lease expiry makes it
+                    # eligible for a safe retry after a transient store error.
+                    self._queue_metrics["failed"] += 1
+                    logger.exception(
+                        "Could not finalize durable memory operation %s; it will be reclaimed",
+                        operation_id,
+                    )
+                else:
+                    drained += 1
             finally:
+                stop_renewal.set()
+                renewal.join(timeout=1.0)
                 if operation_kind == "consolidate":
                     with self._state_lock:
                         self._consolidation_requested = False
@@ -4046,11 +4255,26 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 # backoff while Hermes is otherwise idle. Wake it without
                 # requiring a new user turn or process restart.
                 if self._store and self._store.pending_operation_count():
-                    self._drain_durable_operations(limit=10)
+                    try:
+                        self._drain_durable_operations(limit=10)
+                    except Exception:
+                        # Claim/read failures must not terminate the only
+                        # worker. The next idle tick retries against the same
+                        # durable rows.
+                        self._queue_metrics["failed"] += 1
+                        logger.exception("Idle durable memory drain failed; will retry")
                 continue
             if item is None:
                 while self._store and self._store.pending_operation_count():
-                    if self._drain_durable_operations(limit=1000) == 0:
+                    try:
+                        drained = self._drain_durable_operations(limit=1000)
+                    except Exception:
+                        self._queue_metrics["failed"] += 1
+                        logger.exception(
+                            "Final durable memory drain failed; rows remain recoverable"
+                        )
+                        break
+                    if drained == 0:
                         break
                 self._task_queue.task_done()
                 break
@@ -4346,17 +4570,26 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
         source = str(payload.get("source") or "messages")
         inserted_ids: List[int] = []
-        for candidate in self._extract_messages_facts(messages, session_id=session_id):
-            result = self._store_candidate(candidate, source=source, session_id=session_id)
-            fact_id = dict(result.get("fact") or {}).get("id")
-            if fact_id is not None:
-                inserted_ids.append(int(fact_id))
+        if _flag(payload.get("extract_facts"), True):
+            for candidate in self._extract_messages_facts(messages, session_id=session_id):
+                metadata = dict(candidate.get("metadata") or {})
+                observed_at = metadata.get("reference_unix_time")
+                result = self._store_candidate(
+                    candidate,
+                    source=source,
+                    session_id=session_id,
+                    observed_at=float(observed_at) if observed_at is not None else None,
+                )
+                fact_id = dict(result.get("fact") or {}).get("id")
+                if fact_id is not None:
+                    inserted_ids.append(int(fact_id))
         if len(inserted_ids) > 1:
             self._store.associate_fact_group(inserted_ids, relation="same_session_extract")
-        self._store.rebuild_topics(
-            max_facts=self._cfg()["max_topic_facts"],
-            max_chars=self._cfg()["topic_summary_chars"],
-        )
+        if inserted_ids:
+            self._store.rebuild_topics(
+                max_facts=self._cfg()["max_topic_facts"],
+                max_chars=self._cfg()["topic_summary_chars"],
+            )
         if session_id:
             artifacts = self._store.get_session_artifacts(session_id, limit=8)
             summary = self._build_summary_text(artifacts=artifacts, messages=messages)
@@ -4465,15 +4698,51 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 if skipping_internal_turn:
                     continue
             elif skipping_internal_turn:
-                if role in {"assistant", "ai"}:
-                    skipping_internal_turn = False
                 continue
             filtered.append(message)
         return filtered
 
+    @staticmethod
+    def _message_observed_at(message: Dict[str, Any]) -> float | None:
+        for key in ("timestamp", "created_at", "observed_at"):
+            value = message.get(key)
+            if value in (None, ""):
+                continue
+            if isinstance(value, datetime):
+                parsed = value
+            else:
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    try:
+                        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    if math.isfinite(numeric) and numeric > 0:
+                        return numeric
+                    continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+            numeric = parsed.timestamp()
+            if math.isfinite(numeric) and numeric > 0:
+                return numeric
+        return None
+
     def _extract_messages_facts(self, messages: List[Dict[str, Any]], *, session_id: str = "") -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
         pending_user = ""
+        pending_observed_at: float | None = None
+
+        def extract_pair(user: str, assistant: str, observed_at: float | None):
+            kwargs: Dict[str, Any] = {
+                "user_content": user,
+                "assistant_content": assistant,
+            }
+            if observed_at is not None:
+                kwargs["created_at"] = observed_at
+            return self._extract_turn_facts(**kwargs)
+
         for message in self._filter_internal_message_pairs(messages, session_id=session_id):
             role = str(message.get("role") or message.get("type") or "").strip().casefold()
             text = message_content_text(message.get("content", ""))
@@ -4481,13 +4750,21 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 continue
             if role in {"user", "human"}:
                 if pending_user:
-                    candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=""))
+                    candidates.extend(extract_pair(pending_user, "", pending_observed_at))
                 pending_user = text
-            elif role in {"assistant", "ai"}:
-                candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=text))
+                pending_observed_at = self._message_observed_at(message)
+            elif role in {"assistant", "ai"} and pending_user:
+                candidates.extend(
+                    extract_pair(
+                        pending_user,
+                        text,
+                        pending_observed_at or self._message_observed_at(message),
+                    )
+                )
                 pending_user = ""
+                pending_observed_at = None
         if pending_user:
-            candidates.extend(self._extract_turn_facts(user_content=pending_user, assistant_content=""))
+            candidates.extend(extract_pair(pending_user, "", pending_observed_at))
         return self._dedupe_candidates(candidates)
 
     def _extract_turn_facts(
@@ -4517,9 +4794,18 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
     ) -> List[Dict[str, Any]]:
         if not self._llm or not self._llm.enabled:
             return []
-        reference_timestamp = float(created_at if created_at is not None else time.time())
+        try:
+            reference_timestamp = float(created_at) if created_at is not None else None
+        except (TypeError, ValueError, OverflowError):
+            reference_timestamp = None
+        if reference_timestamp is not None and (not math.isfinite(reference_timestamp) or reference_timestamp <= 0):
+            reference_timestamp = None
         reference_zone, reference_timezone = self._temporal_zone()
-        reference_local = datetime.fromtimestamp(reference_timestamp, reference_zone).isoformat()
+        reference_local = (
+            datetime.fromtimestamp(reference_timestamp, reference_zone).isoformat()
+            if reference_timestamp is not None
+            else None
+        )
         max_chars = self._cfg()["llm_max_input_chars"]
         user_text = normalize_whitespace(user_content)[:max_chars]
         assistant_text = normalize_whitespace(assistant_content)[: max(0, max_chars - len(user_text))]
@@ -4563,6 +4849,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             "date-times. Preserve the stated precision and never invent an hour when only a date is known. event_at is when "
             "the event happened or is scheduled, not when it was mentioned. valid_until is exclusive. One-time scheduled "
             "facts should expire after their scheduled date while their timeline event remains historical. "
+            "If reference_time_known is false, do not resolve relative phrases to the extraction time: keep absolute "
+            "temporal fields empty/unknown rather than inventing when today, tomorrow, yesterday, or next week means. "
             "Extract ALL personal details: family members by name, pets, hobbies, physical traits, "
             "daily routines, food preferences, personality, beliefs, finances. "
             "Never treat an assistant guess or suggestion as a user fact; assistant-supported facts require explicit confirmation. "
@@ -4572,6 +4860,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         )
         user_prompt = json.dumps(
             {
+                "reference_time_known": reference_timestamp is not None,
                 "reference_unix_time": reference_timestamp,
                 "reference_local_time": reference_local,
                 "reference_timezone": reference_timezone,
@@ -4591,16 +4880,13 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             raise RuntimeError(f"automatic memory extraction failed: {state.get('last_error') or 'model unavailable'}")
         if not data or not isinstance(data.get("facts"), list):
             raise RuntimeError("automatic memory extractor returned an invalid facts payload")
-            return []
         facts: List[Dict[str, Any]] = []
         for raw in data.get("facts", [])[:10]:
             if not isinstance(raw, dict):
                 continue
-            raw = {
-                **raw,
-                "reference_unix_time": reference_timestamp,
-                "reference_timezone": reference_timezone,
-            }
+            raw = {**raw, "reference_timezone": reference_timezone}
+            if reference_timestamp is not None:
+                raw["reference_unix_time"] = reference_timestamp
             raw_role = str(raw.get("source_role") or "").strip().casefold()
             source_role = raw_role if raw_role in {"user", "assistant"} else ("user" if user_text else "assistant")
             normalized = normalize_candidate_fact(raw, source_role=source_role)

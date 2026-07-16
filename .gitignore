@@ -1,5 +1,6 @@
 __pycache__/
 .pytest_cache/
+.pytest-cache/
 .ruff_cache/
 .venv/
 *.egg-info/
@@ -17,3 +18,4 @@ bench_results*.json
 bench_dim*.json
 Hermes_Memory_Comparative_Report_*.pdf
 artifacts/
+uv.lock

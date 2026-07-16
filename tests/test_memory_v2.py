@@ -444,6 +444,38 @@ def test_durable_queue_leases_doctor_backup_and_portable_import(tmp_path):
         store.close()
 
 
+def test_durable_operation_claim_is_owner_bound_and_renewable(tmp_path):
+    first = MemoryStore(tmp_path / "memory.db")
+    second = MemoryStore(tmp_path / "memory.db")
+    try:
+        operation_id = first.enqueue_operation("remember_fact", {"content": "once"})
+        claimed = first.claim_operations(
+            limit=1,
+            owner_id="worker-a",
+            lease_seconds=60,
+            stale_after_seconds=1,
+        )
+        assert claimed[0]["claim_owner"] == "worker-a"
+        assert (
+            second.claim_operations(
+                limit=1,
+                owner_id="worker-b",
+                lease_seconds=60,
+                stale_after_seconds=1,
+            )
+            == []
+        )
+        assert first.renew_operation_claim(operation_id, "worker-a", lease_seconds=120)
+        assert not second.renew_operation_claim(operation_id, "worker-b", lease_seconds=120)
+        with pytest.raises(RuntimeError, match="no longer owned"):
+            second.complete_operation(operation_id, owner_id="worker-b")
+        first.complete_operation(operation_id, owner_id="worker-a")
+        assert first.pending_operation_count() == 0
+    finally:
+        second.close()
+        first.close()
+
+
 def test_provider_user_isolation_sensitive_consent_and_brain_tools(tmp_path):
     config = {
         "db_path": str(tmp_path / "memory.db"),
@@ -876,6 +908,79 @@ def test_idle_worker_wakes_durable_operations_without_a_new_turn(tmp_path):
         provider.shutdown()
 
 
+def test_idle_durable_claim_failure_does_not_kill_worker(tmp_path, monkeypatch):
+    provider = ConsolidatingLocalMemoryProvider(
+        {"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8}
+    )
+    try:
+        provider.initialize("idle-retry", hermes_home=str(tmp_path), platform="cli", agent_context="primary")
+        provider._task_queue.join()
+        assert provider._store is not None
+        original_claim = provider._store.claim_operations
+        calls = 0
+
+        def fail_once(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("temporary claim failure")
+            return original_claim(**kwargs)
+
+        monkeypatch.setattr(provider._store, "claim_operations", fail_once)
+        provider._store.enqueue_operation(
+            "remember_fact",
+            {
+                "content": "Idle retry survived a claim failure",
+                "category": "workflow",
+                "topic": "queue",
+                "source": "test",
+                "session_id": "idle-retry",
+            },
+        )
+        deadline = time.time() + 5
+        while provider._store.pending_operation_count() and time.time() < deadline:
+            time.sleep(0.05)
+        assert calls >= 2
+        assert provider._worker is not None and provider._worker.is_alive()
+        assert provider._store.pending_operation_count() == 0
+        assert provider._store.search("Idle retry survived", scope="facts", limit=5)["facts"]
+    finally:
+        provider.shutdown()
+
+
+def test_lost_lease_during_completion_does_not_escape_durable_drain(tmp_path, monkeypatch):
+    provider = ConsolidatingLocalMemoryProvider(
+        {"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8}
+    )
+    provider._store = MemoryStore(tmp_path / "memory.db")
+    try:
+        operation_id = provider._store.enqueue_operation(
+            "remember_fact",
+            {
+                "content": "Lease-race dispatch remains recoverable",
+                "category": "workflow",
+                "topic": "queue",
+                "source": "test",
+                "session_id": "lease-race",
+            },
+        )
+        original_complete = provider._store.complete_operation
+
+        def lose_lease(*args, **kwargs):
+            raise RuntimeError("Durable operation lease is no longer owned")
+
+        monkeypatch.setattr(provider._store, "complete_operation", lose_lease)
+        assert provider._drain_durable_operations(limit=1) == 0
+        assert provider._queue_metrics["failed"] == 1
+        row = provider._store._fetchone("SELECT status FROM pending_operations WHERE id=?", (operation_id,))
+        assert row and row["status"] == "running"
+
+        monkeypatch.setattr(provider._store, "complete_operation", original_complete)
+        original_complete(operation_id, owner_id=provider._owner_id)
+    finally:
+        provider.shutdown()
+
+
 def test_failed_in_memory_write_is_replayed_from_durable_queue(tmp_path):
     provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8})
     try:
@@ -1052,6 +1157,31 @@ def test_doctor_repairs_non_fact_fts_and_dangling_links(tmp_path):
         repaired = store.doctor(repair=True)
         assert repaired["ok"] is True
         assert repaired["dangling_links"] == 0
+    finally:
+        store.close()
+
+
+def test_doctor_detects_equal_count_fts_content_drift_and_refresh_repairs_it(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    try:
+        fact = store.upsert_fact(
+            content="Archaicneedle wording",
+            category="project",
+            topic="search",
+            source="user",
+        )["fact"]
+        store._execute(
+            "UPDATE facts SET content=?, normalized_content=? WHERE id=?",
+            ("Freshneedle wording", "freshneedle wording", fact["id"]),
+        )
+        broken = store.doctor()
+        assert broken["ok"] is False
+        assert broken["fts_content_mismatches"]["facts_fts"] == 1
+        current = store._fetchone("SELECT * FROM facts WHERE id=?", (fact["id"],))
+        store.refresh_search_document("facts", current)
+        assert store.doctor()["ok"] is True
+        assert store.search("Freshneedle", scope="facts")["facts"]
+        assert store.search("Archaicneedle", scope="facts")["facts"] == []
     finally:
         store.close()
 

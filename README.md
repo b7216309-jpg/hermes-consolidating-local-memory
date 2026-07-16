@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.4.1](https://img.shields.io/badge/version-3.4.1-14b8a6)](CHANGELOG.md)
+[![Version 3.5.0](https://img.shields.io/badge/version-3.5.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -18,10 +18,11 @@ diagnostic, and export actions remain available through operator surfaces and co
 handlers. Disabling built-in snapshots now removes only plugin-owned marked blocks and preserves
 manual `USER.md` and `MEMORY.md` text.
 
-Version 3.4.1 adds a cross-suite regression guarantee for Conscious Agency 1.0: gateway-native
-heartbeat polls are internal turns and are excluded from episodes, recall warming, traces, working
-memory, summaries, and fact extraction. The shared Hermes transcript still gives Agency continuity;
-the memory database does not mistake self-generated heartbeat text for a user memory.
+Version 3.5 hardens cross-process work recovery and the Memory–Agency boundary. Durable operations
+use renewable owner-bound leases; stale workers cannot finalize another worker's claim; transient
+claim failures do not kill the only worker. Conscious Agency 1.1 heartbeat runs use exact synthetic
+thread markers: Memory can still be read explicitly, but no Memory session, maintenance worker,
+prefetch, compression extraction, mirror, episode, or fact is created for the disposable turn.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -40,13 +41,16 @@ the memory database does not mistake self-generated heartbeat text for a user me
 
 | Component | Supported/tested |
 | --- | --- |
-| Hermes Agent | Tested end-to-end with `0.18.2` and upstream commit `226e8de827a669e8ffa7035b27d70c19e44b1208` |
+| Hermes Agent | Tested with `0.18.2` and upstream commit `10b6d1a910411f293c9c2422da3b6df6ec66becc` |
 | Python | `3.11`, `3.12`, and `3.13` |
 | Operating systems | Linux and Windows in CI |
 | Storage | SQLite with FTS5; optional SQLCipher |
 | Model APIs | Explicitly configured OpenAI-compatible chat and embedding endpoints |
 
-The Hermes compatibility simulation covers plugin discovery, provider routing, all tool actions, a real HTTP model endpoint, transient endpoint failure and durable replay, scope isolation, built-in memory mirroring, redaction, abrupt and graceful restarts, the native CLI, FTS integrity, and reference integrity.
+The Hermes compatibility simulation covers plugin discovery, provider routing, all tool actions, a
+real HTTP model endpoint, transient endpoint failure and durable replay, scope isolation, built-in
+memory mirroring, redaction, abrupt and graceful restarts, native-heartbeat isolation, the native
+CLI, FTS content integrity, and reference integrity.
 
 ## Install
 
@@ -70,11 +74,12 @@ $HERMES_HOME/plugins/consolidating_local/
 python install.py --hermes-home /path/to/hermes-home
 ```
 
-The installer also enables `consolidating_local` in Hermes' general plugin allow-list. Hermes
-0.18.2 loads memory providers and lifecycle hooks through separate discovery paths: provider
-selection supplies storage, while the enabled lifecycle observer supplies authoritative human-turn
-provenance. Both are required for automatic gateway capture and share one bounded in-process origin
-ledger. No model tool override is granted.
+On a fresh install, the installer also enables `consolidating_local` in Hermes' general plugin
+allow-list without granting a model tool override. On an update it preserves the operator's
+current enablement and grant settings. Hermes 0.18.2 loads memory providers and lifecycle hooks
+through separate discovery paths: provider selection supplies storage, while the enabled lifecycle
+observer supplies authoritative human-turn provenance. Both are required for automatic gateway
+capture and share one bounded in-process origin ledger.
 
 Preview the destination without changing files:
 

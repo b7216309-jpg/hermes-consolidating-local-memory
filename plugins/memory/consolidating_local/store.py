@@ -356,14 +356,26 @@ class MemoryStore:
         "policies",
     )
 
-    def __init__(self, db_path: str | Path, *, encryption_key: str = "", conflict_policy: str = "evidence"):
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        encryption_key: str = "",
+        conflict_policy: str = "evidence",
+        read_only: bool = False,
+    ):
         self.db_path = str(Path(db_path).expanduser())
         db_parent = Path(self.db_path).parent
-        db_parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(db_parent, 0o700)
-        except OSError:
-            pass
+        self._read_only = bool(read_only)
+        if self._read_only:
+            if not Path(self.db_path).is_file():
+                raise FileNotFoundError(self.db_path)
+        else:
+            db_parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(db_parent, 0o700)
+            except OSError:
+                pass
         self._lock = threading.RLock()
         self._transaction_depth = 0
         self.conflict_policy = conflict_policy if conflict_policy in {"evidence", "newest"} else "evidence"
@@ -378,7 +390,11 @@ class MemoryStore:
                 ) from exc
             self._dbapi = sqlcipher
         self._operational_errors = tuple(dict.fromkeys((sqlite3.OperationalError, self._dbapi.OperationalError)))
-        self._conn = self._dbapi.connect(self.db_path, check_same_thread=False)
+        if self._read_only:
+            uri = Path(self.db_path).resolve().as_uri() + "?mode=ro"
+            self._conn = self._dbapi.connect(uri, uri=True, check_same_thread=False)
+        else:
+            self._conn = self._dbapi.connect(self.db_path, check_same_thread=False)
         self._closed = False
         try:
             self._conn.row_factory = self._dbapi.Row
@@ -392,22 +408,41 @@ class MemoryStore:
                 self._conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
             self._conn.execute("PRAGMA busy_timeout = 5000")
             self._conn.execute("PRAGMA foreign_keys = ON")
-            self._conn.execute("PRAGMA synchronous = NORMAL")
-            self._conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
-            try:
-                self._conn.execute("PRAGMA journal_mode=WAL")
-            except self._operational_errors:
-                pass
             self._fts_enabled = False
-            self._init_schema()
+            if self._read_only:
+                self._conn.execute("PRAGMA query_only = ON")
+                required_fts = {
+                    "facts_fts",
+                    "topics_fts",
+                    "episodes_fts",
+                    "memory_summaries_fts",
+                    "memory_journals_fts",
+                    "memory_preferences_fts",
+                    "memory_policies_fts",
+                    "memory_traces_fts",
+                }
+                present = {
+                    str(row[0])
+                    for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+                }
+                self._fts_enabled = required_fts.issubset(present)
+            else:
+                self._conn.execute("PRAGMA synchronous = NORMAL")
+                self._conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+                try:
+                    self._conn.execute("PRAGMA journal_mode=WAL")
+                except self._operational_errors:
+                    pass
+                self._init_schema()
         except BaseException:
             self._conn.close()
             self._closed = True
             raise
-        try:
-            os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
+        if not self._read_only:
+            try:
+                os.chmod(self.db_path, 0o600)
+            except OSError:
+                pass
 
     def close(self) -> None:
         with self._lock:
@@ -418,6 +453,8 @@ class MemoryStore:
 
     @contextmanager
     def transaction(self):
+        if self._read_only:
+            raise RuntimeError("MemoryStore is read-only")
         with self._lock:
             outermost = self._transaction_depth == 0
             savepoint = f"memory_sp_{self._transaction_depth}"
@@ -444,6 +481,8 @@ class MemoryStore:
                     self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
 
     def _execute(self, sql: str, params: Iterable[Any] = ()) -> Any:
+        if self._read_only:
+            raise RuntimeError("MemoryStore is read-only")
         with self._lock:
             cur = self._conn.execute(sql, tuple(params))
             if self._transaction_depth == 0:
@@ -858,6 +897,8 @@ class MemoryStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 available_at REAL NOT NULL DEFAULT 0,
                 claimed_at REAL NOT NULL DEFAULT 0,
+                claim_owner TEXT NOT NULL DEFAULT '',
+                claim_expires_at REAL NOT NULL DEFAULT 0,
                 error TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
@@ -910,6 +951,8 @@ class MemoryStore:
         self._ensure_column("episodes", "sensitivity", "TEXT NOT NULL DEFAULT 'normal'")
         self._ensure_column("episodes", "operation_key", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("memory_approvals", "candidate_fingerprint", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("pending_operations", "claim_owner", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("pending_operations", "claim_expires_at", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("topics", "salience", "REAL NOT NULL DEFAULT 0.55")
         self._ensure_column("topics", "source_session_id", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("topics", "last_recalled_at", "REAL NOT NULL DEFAULT 0")
@@ -4434,6 +4477,29 @@ class MemoryStore:
         if self._fts_enabled:
             self._execute("DELETE FROM memory_traces_fts WHERE trace_id = ?", (int(trace_id),))
 
+    def refresh_search_document(self, logical_table: str, row: Dict[str, Any]) -> None:
+        """Synchronize one operator-edited row with its authoritative FTS document."""
+
+        logical = normalize_text(logical_table)
+        active = int(row.get("active", 1) or 0) == 1
+        row_id = int(row.get("id") or 0)
+        if not row_id:
+            return
+        if logical == "facts":
+            self._upsert_fact_fts(row) if active else self._delete_fact_fts(row_id)
+        elif logical == "topics":
+            self._upsert_topic_fts(row)
+        elif logical == "traces":
+            self._upsert_trace_fts(row) if active else self._delete_trace_fts(row_id)
+        elif logical == "journals":
+            self._upsert_journal_fts(row) if active else self._delete_journal_fts(row_id)
+        elif logical == "summaries":
+            self._upsert_summary_fts(row) if active else self._delete_summary_fts(row_id)
+        elif logical == "preferences":
+            self._upsert_preference_fts(row) if active else self._delete_preference_fts(row_id)
+        elif logical == "policies":
+            self._upsert_policy_fts(row) if active else self._delete_policy_fts(row_id)
+
     # ------------------------------------------------------------------
     # Evidence, temporal state, and higher-level memory systems
 
@@ -5098,27 +5164,43 @@ class MemoryStore:
         limit: int = 25,
         stale_after_seconds: float = 300,
         max_attempts: int = 5,
+        owner_id: str = "",
+        lease_seconds: float | None = None,
     ) -> List[Dict[str, Any]]:
         now = now_ts()
+        owner = normalize_whitespace(owner_id) or f"legacy-{os.getpid()}-{threading.get_ident()}"
+        lease_ttl = max(
+            1.0,
+            float(lease_seconds if lease_seconds is not None else stale_after_seconds),
+        )
         attempt_limit = max(1, int(max_attempts))
         stale_before = now - max(1.0, float(stale_after_seconds))
         self._execute(
             """UPDATE pending_operations
                SET status='failed', available_at=0, claimed_at=0,
+                   claim_owner='', claim_expires_at=0,
                    error=CASE WHEN error='' THEN 'Worker lease expired after maximum attempts' ELSE error END,
                    updated_at=?
-               WHERE status='running' AND claimed_at < ? AND attempts >= ?""",
-            (now, stale_before, attempt_limit),
+               WHERE status='running'
+                 AND ((claim_expires_at > 0 AND claim_expires_at < ?)
+                      OR (claim_expires_at <= 0 AND claimed_at < ?))
+                 AND attempts >= ?""",
+            (now, now, stale_before, attempt_limit),
         )
         self._execute(
-            """UPDATE pending_operations SET status='pending', claimed_at=0, updated_at=?
-               WHERE status='running' AND claimed_at < ? AND attempts < ?""",
-            (now, stale_before, attempt_limit),
+            """UPDATE pending_operations
+               SET status='pending', claimed_at=0, claim_owner='', claim_expires_at=0, updated_at=?
+               WHERE status='running'
+                 AND ((claim_expires_at > 0 AND claim_expires_at < ?)
+                      OR (claim_expires_at <= 0 AND claimed_at < ?))
+                 AND attempts < ?""",
+            (now, now, stale_before, attempt_limit),
         )
         # Migrate any legacy poison rows that reached the limit while pending.
         self._execute(
             """UPDATE pending_operations
                SET status='failed', available_at=0, claimed_at=0,
+                   claim_owner='', claim_expires_at=0,
                    error=CASE WHEN error='' THEN 'Maximum retry attempts reached' ELSE error END,
                    updated_at=?
                WHERE status='pending' AND attempts >= ?""",
@@ -5131,18 +5213,50 @@ class MemoryStore:
             (attempt_limit, now, max(1, int(limit))),
         )
         for row in rows:
-            self._execute(
-                "UPDATE pending_operations SET status='running', attempts=attempts+1, claimed_at=?, updated_at=? WHERE id=?",
-                (now, now, int(row["id"])),
+            changed = self._execute(
+                """UPDATE pending_operations
+                   SET status='running', attempts=attempts+1, claimed_at=?,
+                       claim_owner=?, claim_expires_at=?, updated_at=?
+                   WHERE id=? AND status='pending'""",
+                (now, owner, now + lease_ttl, now, int(row["id"])),
             )
+            if int(changed.rowcount or 0) != 1:
+                continue
             row["status"] = "running"
             row["attempts"] = int(row.get("attempts") or 0) + 1
             row["claimed_at"] = now
-        return rows
+            row["claim_owner"] = owner
+            row["claim_expires_at"] = now + lease_ttl
+        return [row for row in rows if row.get("claim_owner") == owner]
 
     @_transactional
-    def complete_operation(self, operation_id: int) -> None:
-        self._execute("DELETE FROM pending_operations WHERE id = ?", (int(operation_id),))
+    def renew_operation_claim(self, operation_id: int, owner_id: str, *, lease_seconds: float = 300) -> bool:
+        now = now_ts()
+        changed = self._execute(
+            """UPDATE pending_operations SET claim_expires_at=?, updated_at=?
+               WHERE id=? AND status='running' AND claim_owner=?""",
+            (
+                now + max(1.0, float(lease_seconds)),
+                now,
+                int(operation_id),
+                normalize_whitespace(owner_id),
+            ),
+        )
+        return int(changed.rowcount or 0) == 1
+
+    @_transactional
+    def complete_operation(self, operation_id: int, *, owner_id: str = "") -> None:
+        params: tuple[Any, ...] = (int(operation_id),)
+        owner_clause = ""
+        if owner_id:
+            owner_clause = " AND status='running' AND claim_owner=?"
+            params = (int(operation_id), normalize_whitespace(owner_id))
+        changed = self._execute(
+            f"DELETE FROM pending_operations WHERE id = ?{owner_clause}",
+            params,
+        )
+        if owner_id and int(changed.rowcount or 0) != 1:
+            raise RuntimeError(f"Durable operation {operation_id} lease is no longer owned")
 
     @_transactional
     def fail_operation(
@@ -5152,6 +5266,7 @@ class MemoryStore:
         *,
         retry_delay_seconds: float = 30,
         max_attempts: int = 5,
+        owner_id: str = "",
     ) -> Dict[str, Any]:
         row = self._fetchone("SELECT * FROM pending_operations WHERE id = ?", (int(operation_id),))
         if not row:
@@ -5162,17 +5277,25 @@ class MemoryStore:
         now = now_ts()
         base_delay = max(0.0, float(retry_delay_seconds))
         retry_delay = min(3600.0, base_delay * (2 ** max(0, attempts - 1)))
-        self._execute(
-            """UPDATE pending_operations SET status=?, available_at=?, claimed_at=0,
-               error=?, updated_at=? WHERE id=?""",
-            (
-                "failed" if failed else "pending",
-                0.0 if failed else now + retry_delay,
-                normalize_whitespace(error)[:1000],
-                now,
-                int(operation_id),
-            ),
+        params: list[Any] = [
+            "failed" if failed else "pending",
+            0.0 if failed else now + retry_delay,
+            normalize_whitespace(error)[:1000],
+            now,
+            int(operation_id),
+        ]
+        owner_clause = ""
+        if owner_id:
+            owner_clause = " AND status='running' AND claim_owner=?"
+            params.append(normalize_whitespace(owner_id))
+        changed = self._execute(
+            f"""UPDATE pending_operations SET status=?, available_at=?, claimed_at=0,
+               claim_owner='', claim_expires_at=0, error=?, updated_at=?
+               WHERE id=?{owner_clause}""",
+            tuple(params),
         )
+        if owner_id and int(changed.rowcount or 0) != 1:
+            raise RuntimeError(f"Durable operation {operation_id} lease is no longer owned")
         return self._fetchone("SELECT * FROM pending_operations WHERE id = ?", (int(operation_id),)) or {}
 
     def pending_operation_count(self) -> int:
@@ -5210,7 +5333,7 @@ class MemoryStore:
             self._execute(
                 f"""UPDATE pending_operations
                     SET status='pending', attempts=0, available_at=0, claimed_at=0,
-                        error='', updated_at=?
+                        claim_owner='', claim_expires_at=0, error='', updated_at=?
                     WHERE status='failed' AND id IN ({placeholders})""",
                 (now_ts(), *ids),
             ).rowcount
@@ -5615,6 +5738,7 @@ class MemoryStore:
         fts_counts: Dict[str, int] = {}
         fts_expected: Dict[str, int] = {}
         fts_mismatches: Dict[str, Dict[str, int]] = {}
+        fts_content_mismatches: Dict[str, int] = {}
         if self._fts_enabled:
             mappings = {
                 "facts_fts": "SELECT COUNT(*) AS count FROM facts WHERE active=1",
@@ -5636,6 +5760,79 @@ class MemoryStore:
                         "indexed": fts_counts[table],
                         "expected": fts_expected[table],
                     }
+            content_maps = {
+                "facts_fts": (
+                    "facts",
+                    "fact_id",
+                    "active=1",
+                    ("content", "topic", "category", "subject_key"),
+                ),
+                "topics_fts": (
+                    "topics",
+                    "topic_id",
+                    "1=1",
+                    ("title", "summary", "category"),
+                ),
+                "episodes_fts": (
+                    "episodes",
+                    "episode_id",
+                    "1=1",
+                    ("digest", "user_content", "assistant_content"),
+                ),
+                "memory_summaries_fts": (
+                    "memory_summaries",
+                    "summary_id",
+                    "active=1",
+                    ("label", "summary", "content", "summary_type"),
+                ),
+                "memory_journals_fts": (
+                    "memory_journals",
+                    "journal_id",
+                    "active=1",
+                    ("label", "content", "journal_type"),
+                ),
+                "memory_preferences_fts": (
+                    "memory_preferences",
+                    "preference_id",
+                    "active=1",
+                    ("preference_key", "label", "value", "content"),
+                ),
+                "memory_policies_fts": (
+                    "memory_policies",
+                    "policy_id",
+                    "active=1",
+                    ("policy_key", "label", "content"),
+                ),
+                "memory_traces_fts": (
+                    "memory_traces",
+                    "trace_id",
+                    "active=1",
+                    ("label", "content", "trace_type"),
+                ),
+            }
+            for index, (source, index_id, condition, columns) in content_maps.items():
+                source_rows = {
+                    str(row["id"]): row
+                    for row in self._fetchall(f"SELECT id, {', '.join(columns)} FROM {source} WHERE {condition}")
+                }
+                indexed_rows = {
+                    str(row[index_id]): row
+                    for row in self._fetchall(f"SELECT {index_id}, {', '.join(columns)} FROM {index}")
+                }
+                mismatched = set(source_rows) ^ set(indexed_rows)
+                for row_id in set(source_rows) & set(indexed_rows):
+                    if any(
+                        str(source_rows[row_id].get(column) or "") != str(indexed_rows[row_id].get(column) or "")
+                        for column in columns
+                    ):
+                        mismatched.add(row_id)
+                if mismatched:
+                    fts_content_mismatches[index] = len(mismatched)
+                    details = fts_mismatches.setdefault(
+                        index,
+                        {"indexed": fts_counts[index], "expected": fts_expected[index]},
+                    )
+                    details["content"] = len(mismatched)
         dangling = self._dangling_reference_counts()
         repaired: Dict[str, Any] = {}
         if repair:
@@ -5661,6 +5858,7 @@ class MemoryStore:
             "fts_counts": fts_counts,
             "fts_expected": fts_expected,
             "fts_mismatches": fts_mismatches,
+            "fts_content_mismatches": fts_content_mismatches,
             "source_counts": source_counts,
             "dangling_links": dangling["links"],
             "dangling_associations": dangling["associations"],

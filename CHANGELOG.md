@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.5.0 - 2026-07-17
+
+- Made repeated installs preserve existing plugin enablement and grant settings instead of
+  re-enabling an already loaded lifecycle observer and returning a false tool-override error.
+
+- Made durable background work owner-bound with renewable SQLite leases, atomic claims, safe
+  cross-process recovery, and dead-letter handling that cannot let a stale worker finalize another
+  worker's operation.
+- Kept the background worker alive across transient claim/finalization failures and made timed-out
+  shutdown leave the database open until the worker safely drains and closes it.
+- Hardened automatic capture against forged or stale gateway origin markers, orphan assistant
+  messages, session-end transcript replay, malformed extraction timestamps, and non-finite time.
+- Made pre-compression preserve only the latest genuine user turn and rebuild topics only after a
+  new fact was actually inserted.
+- Added true read-only store support for Control Center and FTS content-consistency diagnostics.
+- Isolated exact Conscious Agency disposable heartbeat threads from Memory sessions, maintenance,
+  prefetch warming, compression extraction, mirroring, and worker startup while preserving
+  explicit read access.
+- Added current-Hermes compatibility coverage, concurrency/recovery regressions, and a clean SPDX
+  package license declaration.
+
 ## 3.4.1 — 2026-07-16
 
 - Added cross-suite regression coverage proving Conscious Agency 1.0 native heartbeat polls and

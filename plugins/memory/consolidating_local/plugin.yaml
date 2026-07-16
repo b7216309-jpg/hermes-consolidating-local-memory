@@ -1,5 +1,5 @@
 name: consolidating_local
-version: 3.4.1
+version: 3.5.0
 kind: standalone
 description: "Isolated, evidence-backed local memory with temporal, working, procedural, prospective, and autobiographical systems."
 hooks:
@@ -8,7 +8,6 @@ hooks:
   - on_session_switch
   - on_pre_compress
   - on_memory_write
-  - on_delegation
 provides_hooks:
   - pre_gateway_dispatch
   - pre_llm_call

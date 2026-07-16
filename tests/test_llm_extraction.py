@@ -116,6 +116,7 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
             prompt = endpoint.requests[-1]["messages"][-1]["content"]
             assert "seed_facts" not in prompt
             prompt_payload = json.loads(prompt)
+            assert prompt_payload["reference_time_known"] is True
             assert prompt_payload["reference_timezone"] == "Europe/Paris"
             assert "+" in prompt_payload["reference_local_time"]
             assert endpoint.requests[-1]["chat_template_kwargs"] == {"enable_thinking": False}
@@ -124,3 +125,41 @@ def test_openai_compatible_extraction_retries_durably_after_transient_http_failu
             assert status["llm_disable_thinking"] is True
         finally:
             provider.shutdown()
+
+
+def test_missing_or_malformed_historical_timestamp_is_not_replaced_with_extraction_time(tmp_path):
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "timezone": "Europe/Paris"})
+
+    class LLM:
+        enabled = True
+        last_request_succeeded = True
+        circuit_state = {}
+
+        def __init__(self):
+            self.payload = None
+            self.system_prompt = ""
+
+        def chat_json(self, *, system_prompt, user_prompt, **kwargs):
+            self.system_prompt = system_prompt
+            self.payload = json.loads(user_prompt)
+            return {"facts": []}
+
+    try:
+        provider.initialize("session", hermes_home=str(tmp_path), platform="cli")
+        fake = LLM()
+        provider._llm = fake
+        for created_at in (None, "not-a-timestamp", float("nan"), float("inf")):
+            assert (
+                provider._llm_extract_turn_facts(
+                    user_content="Tomorrow I weld the frame",
+                    assistant_content="Understood",
+                    created_at=created_at,
+                )
+                == []
+            )
+            assert fake.payload["reference_time_known"] is False
+            assert fake.payload["reference_unix_time"] is None
+            assert fake.payload["reference_local_time"] is None
+        assert "do not resolve relative phrases to the extraction time" in fake.system_prompt
+    finally:
+        provider.shutdown()

@@ -12,6 +12,7 @@ from consolidating_local import TOOL_SCHEMA, ConsolidatingLocalMemoryProvider, r
 from consolidating_local.origin import (
     classify_turn,
     mark_gateway_user_dispatch,
+    message_was_internal,
     note_llm_turn,
     reset_origin_state,
 )
@@ -135,6 +136,23 @@ def test_gateway_marker_is_single_use_across_copied_contexts():
     reset_origin_state()
 
 
+def test_unauthorized_gateway_sender_cannot_acquire_user_origin():
+    reset_origin_state()
+    source = SimpleNamespace(user_id="unknown")
+    gateway = SimpleNamespace(_is_user_authorized=lambda candidate: False)
+    mark_gateway_user_dispatch(SimpleNamespace(internal=False, source=source), gateway=gateway)
+    note_llm_turn(
+        session_id="gateway-session",
+        user_message="please remember an unauthorized claim",
+        platform="telegram",
+    )
+    assert message_was_internal(
+        session_id="gateway-session",
+        user_message="please remember an unauthorized claim",
+    )
+    reset_origin_state()
+
+
 def test_gateway_internal_turns_never_enter_memory(tmp_path):
     reset_origin_state()
     provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
@@ -194,6 +212,56 @@ def test_native_agency_heartbeat_does_not_contaminate_memory(tmp_path):
         reset_origin_state()
 
 
+def test_native_heartbeat_tool_chain_and_session_end_leave_no_memory(tmp_path):
+    reset_origin_state()
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
+    provider.initialize(
+        "telegram-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+    )
+    prompt = "[Hermes heartbeat poll]"
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "I will inspect", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "content": "synthetic private observation", "tool_call_id": "call-1"},
+        {"role": "assistant", "content": "synthetic subjective conclusion"},
+    ]
+    baseline = provider._store.counts()
+    try:
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message=prompt,
+            platform="telegram",
+            internal=True,
+        )
+        provider.sync_turn(
+            prompt,
+            "synthetic subjective conclusion",
+            session_id="telegram-session",
+            messages=messages,
+        )
+        provider.on_session_end(messages)
+        provider._task_queue.join()
+        counts = provider._store.counts()
+        assert counts["episodes"] == 0
+        assert counts["sessions"] == baseline["sessions"]
+        assert counts["summaries"] == 0
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
+def test_authenticated_user_text_that_matches_internal_prefix_remains_user_authored():
+    reset_origin_state()
+    prompt = "[Hermes heartbeat poll] this text was typed by the owner"
+    mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+    note_llm_turn(session_id="telegram-session", user_message=prompt, platform="telegram")
+    assert not message_was_internal(session_id="telegram-session", user_message=prompt)
+    reset_origin_state()
+
+
 def test_real_gateway_turn_is_captured_once(tmp_path):
     reset_origin_state()
     provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
@@ -246,18 +314,295 @@ def test_background_review_and_its_assistant_pair_are_excluded_from_history_extr
         provider.shutdown()
 
 
+def test_internal_turn_with_tools_is_skipped_until_the_next_user_message(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    calls = []
+    monkeypatch.setattr(provider, "_extract_turn_facts", lambda **kwargs: calls.append(kwargs) or [])
+    review_prompt = "Review the conversation above and consider saving to memory if appropriate."
+    try:
+        provider._extract_messages_facts(
+            [
+                {"role": "user", "content": review_prompt},
+                {"role": "assistant", "content": "I will inspect it", "tool_calls": [{}]},
+                {"role": "tool", "content": "private tool result"},
+                {"role": "assistant", "content": "synthetic final answer"},
+                {
+                    "role": "user",
+                    "content": "a genuine later turn",
+                    "timestamp": "2026-07-15T20:30:00+00:00",
+                },
+                {"role": "assistant", "content": "a genuine later answer"},
+            ],
+            session_id="session-old",
+        )
+        assert calls == [
+            {
+                "user_content": "a genuine later turn",
+                "assistant_content": "a genuine later answer",
+                "created_at": 1784147400.0,
+            }
+        ]
+    finally:
+        provider.shutdown()
+
+
+def test_orphan_assistant_history_is_never_extracted_as_user_memory(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    calls = []
+    monkeypatch.setattr(provider, "_extract_turn_facts", lambda **kwargs: calls.append(kwargs) or [])
+    try:
+        provider._extract_messages_facts(
+            [
+                {"role": "assistant", "content": "The user probably lives on Mars"},
+                {"role": "tool", "content": "untrusted model context"},
+                {"role": "user", "content": "My workshop is in Lille"},
+                {"role": "assistant", "content": "Understood"},
+            ],
+            session_id="session-old",
+        )
+        assert calls == [
+            {
+                "user_content": "My workshop is in Lille",
+                "assistant_content": "Understood",
+            }
+        ]
+    finally:
+        provider.shutdown()
+
+
+def test_historical_message_timestamp_is_the_extraction_reference(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    calls = []
+    monkeypatch.setattr(provider, "_extract_turn_facts", lambda **kwargs: calls.append(kwargs) or [])
+    try:
+        provider._extract_messages_facts(
+            [
+                {
+                    "role": "user",
+                    "content": "Tomorrow I weld the frame",
+                    "timestamp": "2024-01-02T10:00:00+01:00",
+                },
+                {"role": "assistant", "content": "Understood"},
+            ],
+            session_id="session-old",
+        )
+        assert calls[0]["created_at"] == 1704186000.0
+    finally:
+        provider.shutdown()
+
+
+def test_invalid_primary_message_timestamp_falls_back_to_valid_created_at(tmp_path):
+    provider = _provider(tmp_path)
+    try:
+        observed = provider._message_observed_at(
+            {
+                "timestamp": float("nan"),
+                "created_at": "2024-01-02T10:00:00+01:00",
+            }
+        )
+        assert observed == 1704186000.0
+    finally:
+        provider.shutdown()
+
+
+def test_mid_turn_gateway_compression_uses_recorded_user_origin(tmp_path, monkeypatch):
+    reset_origin_state()
+    provider = ConsolidatingLocalMemoryProvider(
+        {"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"}
+    )
+    provider.initialize(
+        "telegram-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+    )
+    calls = []
+    monkeypatch.setattr(
+        provider,
+        "_extract_messages_facts",
+        lambda messages, **kwargs: calls.append((messages, kwargs)) or [],
+    )
+    try:
+        mark_gateway_user_dispatch(SimpleNamespace(internal=False))
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message="A genuine turn compressed after pre_llm_call",
+            platform="telegram",
+        )
+        assert not provider.on_pre_compress(
+            [
+                {"role": "user", "content": "A genuine turn compressed after pre_llm_call"},
+                {"role": "assistant", "content": "A partial answer"},
+            ]
+        )
+        assert len(calls) == 1
+
+        note_llm_turn(
+            session_id="telegram-session",
+            user_message="synthetic compression turn",
+            platform="telegram",
+            internal=True,
+        )
+        assert not provider.on_pre_compress(
+            [
+                {"role": "user", "content": "synthetic compression turn"},
+                {"role": "assistant", "content": "must stay out"},
+            ]
+        )
+        assert len(calls) == 1
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
+def test_session_end_summarizes_without_reextracting_full_history(tmp_path, monkeypatch):
+    provider = _provider(tmp_path)
+    provider._task_queue.join()
+    monkeypatch.setattr(
+        provider,
+        "_extract_messages_facts",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not re-extract")),
+    )
+    try:
+        provider.on_session_end(
+            [
+                {"role": "user", "content": "A completed historic turn"},
+                {"role": "assistant", "content": "Acknowledged"},
+            ]
+        )
+        provider._task_queue.join()
+        row = provider._store._fetchone("SELECT status FROM memory_sessions WHERE session_id=?", ("session-old",))
+        assert row["status"] == "closed"
+    finally:
+        provider.shutdown()
+
+
+def test_empty_or_internal_only_session_end_still_closes_session(tmp_path):
+    provider = _provider(tmp_path)
+    provider._task_queue.join()
+    try:
+        provider.on_session_end(
+            [
+                {
+                    "role": "user",
+                    "content": "Review the conversation above and consider saving to memory if appropriate.",
+                },
+                {"role": "assistant", "content": "synthetic review"},
+            ]
+        )
+        provider._task_queue.join()
+        row = provider._store._fetchone(
+            "SELECT status FROM memory_sessions WHERE session_id=?",
+            ("session-old",),
+        )
+        assert row and row["status"] == "closed"
+        assert provider._store.counts()["summaries"] == 0
+    finally:
+        provider.shutdown()
+
+
+def test_disposable_agency_heartbeat_does_not_create_memory_session(tmp_path):
+    provider = ConsolidatingLocalMemoryProvider(
+        {
+            "db_path": str(tmp_path / "memory.db"),
+            "llm_model": "",
+            "embedding_model": "",
+        }
+    )
+    provider.initialize(
+        "heartbeat-work-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+        user_id="operator",
+        thread_id="agency-heartbeat-" + "a" * 32,
+    )
+    try:
+        assert provider._session_tracking_enabled is False
+        assert provider._worker is None
+        assert provider._accepting_tasks is False
+        assert provider._store._fetchone(
+            "SELECT session_id FROM memory_sessions WHERE session_id=?",
+            ("heartbeat-work-session",),
+        ) is None
+        assert provider._store.get_state("memory_scope", "") == ""
+
+        provider.on_turn_start(1, "internal heartbeat")
+        provider.on_session_end([])
+        provider.sync_turn(
+            "This ordinary-looking synthetic sentence must not be captured",
+            "Nor should this generated answer",
+        )
+        provider.on_memory_write(
+            "add",
+            "memory",
+            "Synthetic heartbeat mirror must not be captured",
+        )
+        assert (
+            provider.on_pre_compress(
+                [
+                    {
+                        "role": "user",
+                        "content": "Synthetic heartbeat compression must not be captured",
+                    }
+                ]
+            )
+            == ""
+        )
+        provider._task_queue.join()
+        assert provider._store.counts()["sessions"] == 0
+        assert provider._store.counts()["facts"] == 0
+        assert provider._store.counts()["episodes"] == 0
+    finally:
+        provider.shutdown()
+
+
+def test_heartbeat_thread_lookalike_keeps_normal_session_tracking(tmp_path):
+    provider = ConsolidatingLocalMemoryProvider(
+        {"db_path": str(tmp_path / "memory.db"), "llm_model": ""}
+    )
+    provider.initialize(
+        "normal-session",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+        user_id="operator",
+        thread_id="agency-heartbeat-not-a-run-id",
+    )
+    try:
+        provider._task_queue.join()
+        assert provider._session_tracking_enabled is True
+        assert provider._worker is not None and provider._worker.is_alive()
+        assert provider._store._fetchone(
+            "SELECT session_id FROM memory_sessions WHERE session_id=?",
+            ("normal-session",),
+        ) is not None
+    finally:
+        provider.shutdown()
+
+
 def test_defaults_are_local_and_do_not_rewrite_builtin_memory():
     provider = ConsolidatingLocalMemoryProvider()
     assert provider._cfg()["builtin_snapshot_sync_enabled"] is False
     assert provider.get_config_schema() == []
     advanced = provider.get_advanced_config_schema()
     builtin_sync = next(item for item in advanced if item["key"] == "builtin_snapshot_sync_enabled")
-    assert builtin_sync["default"] == "false"
+    assert builtin_sync["default"] is False
+    assert builtin_sync["type"] == "boolean"
     assert all(item["key"] != "extractor_backend" for item in advanced)
     llm_model = next(item for item in advanced if item["key"] == "llm_model")
     assert llm_model["default"] == ""
+    assert llm_model["type"] == "string"
     llm_disable_thinking = next(item for item in advanced if item["key"] == "llm_disable_thinking")
-    assert llm_disable_thinking["default"] == "false"
+    assert llm_disable_thinking["default"] is False
+    assert llm_disable_thinking["type"] == "boolean"
+    queue_size = next(item for item in advanced if item["key"] == "queue_max_size")
+    assert queue_size["default"] == 256
+    assert queue_size["type"] == "integer"
+    assert (queue_size["minimum"], queue_size["maximum"]) == (8, 100000)
+    decay = next(item for item in advanced if item["key"] == "decay_half_life_days")
+    assert decay["default"] == 90.0
+    assert decay["type"] == "number"
 
 
 def test_disabled_builtin_sync_removes_only_plugin_owned_snapshot_blocks(tmp_path):

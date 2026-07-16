@@ -46,6 +46,7 @@ def main() -> int:
     plugins_dir.mkdir(parents=True, exist_ok=True)
     stage = plugins_dir / ".consolidating_local.installing"
     backup = plugins_dir / ".consolidating_local.backup"
+    updating_existing = destination.exists() or backup.exists()
     if backup.exists() and not destination.exists():
         # Recover an installation interrupted after the old plugin was moved
         # aside but before the staged replacement became active.
@@ -73,22 +74,25 @@ def main() -> int:
     print(f"Installed consolidating_local to {destination}")
     if not args.no_enable:
         hermes = _hermes_executable()
-        if not hermes:
+        if updating_existing:
+            print("Existing install updated; preserving its enablement and grant settings.")
+        elif not hermes:
             print(
                 "Plugin copied, but Hermes was not found. Run `hermes plugins enable consolidating_local --no-allow-tool-override` before use.",
                 file=sys.stderr,
             )
             return 1
-        completed = subprocess.run(
-            [hermes, "plugins", "enable", "consolidating_local", "--no-allow-tool-override"],
-            check=False,
-        )
-        if completed.returncode:
-            print(
-                "Plugin copied, but its lifecycle observer could not be enabled. Automatic gateway capture is fail-closed until it is enabled.",
-                file=sys.stderr,
+        else:
+            completed = subprocess.run(
+                [hermes, "plugins", "enable", "consolidating_local", "--no-allow-tool-override"],
+                check=False,
             )
-            return completed.returncode
+            if completed.returncode:
+                print(
+                    "Plugin copied, but its lifecycle observer could not be enabled. Automatic gateway capture is fail-closed until it is enabled.",
+                    file=sys.stderr,
+                )
+                return completed.returncode
     print("Next: run `hermes memory setup` and select `consolidating_local`, or set memory.provider in config.yaml.")
     return 0
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from consolidating_local.store import MemoryStore, normalize_text, slugify
 
 
@@ -96,3 +98,26 @@ def test_fts_repairs_missing_rows_on_reopen(tmp_path):
         assert repaired.search("concise", scope="facts")["facts"]
     finally:
         repaired.close()
+
+
+def test_read_only_store_does_not_initialize_or_modify_database(tmp_path):
+    path = tmp_path / "memory.db"
+    writable = MemoryStore(path)
+    writable.upsert_fact(
+        content="Synthetic read-only proof",
+        category="test",
+        topic="test",
+        source="test",
+    )
+    writable.close()
+    before = path.stat().st_mtime_ns
+
+    read_only = MemoryStore(path, read_only=True)
+    try:
+        assert read_only.search("read-only", scope="facts")["facts"]
+        with pytest.raises(RuntimeError, match="read-only"):
+            read_only.set_state("forbidden", "write")
+    finally:
+        read_only.close()
+
+    assert path.stat().st_mtime_ns == before

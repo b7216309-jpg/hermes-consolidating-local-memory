@@ -1,10 +1,10 @@
 """Deterministic turn-origin tracking for Hermes gateway lifecycle hooks.
 
 Hermes invokes memory providers for both human-authored turns and synthetic
-agent turns.  The gateway's ``pre_gateway_dispatch`` hook is the authoritative
-boundary: it only fires for real inbound messages.  This module carries that
-signal into ``pre_llm_call`` and records it for the memory provider's
-background worker.
+agent turns.  The gateway's ``pre_gateway_dispatch`` hook is the earliest
+inbound boundary, but current Hermes invokes it before authorization.  This
+module rechecks authorization, carries the genuine-user signal into
+``pre_llm_call``, and records it for the memory provider's background worker.
 """
 
 from __future__ import annotations
@@ -160,25 +160,43 @@ def classify_turn(*, session_id: Any, user_message: Any, platform: Any, kwargs: 
     explicit = _explicit_origin(metadata)
     if explicit:
         return explicit
-    if str(user_message or "").lstrip().startswith("[Hermes heartbeat poll]"):
-        return "internal"
     session = _clean_text(session_id).casefold()
     surface = _clean_text(platform).casefold()
     if session.startswith(_INTERNAL_SESSION_PREFIXES) or surface in _INTERNAL_PLATFORMS:
         return "internal"
     if is_gateway_platform(surface):
         marker = _gateway_user_dispatch.get()
-        return "user" if marker and marker.consume() else "internal"
+        if marker and marker.consume():
+            return "user"
+        return "internal"
     if is_internal_harness_message(user_message):
         return "internal"
     return "user"
 
 
-def mark_gateway_user_dispatch(event: Any = None, **_: Any) -> None:
-    """Mark the current context when Hermes dispatches a real inbound event."""
+def mark_gateway_user_dispatch(event: Any = None, gateway: Any = None, **_: Any) -> None:
+    """Mark an inbound event only after Hermes' own authorization check passes.
+
+    Current Hermes invokes ``pre_gateway_dispatch`` before authorization so
+    plugins can implement handover workflows.  Memory must fail closed at that
+    boundary: an unknown sender may never acquire the genuine-user marker.
+    Older harnesses that do not pass a gateway retain their original behavior.
+    """
 
     marker = None
     if event is not None and not getattr(event, "internal", False):
+        if gateway is not None:
+            authorize = getattr(gateway, "_is_user_authorized", None)
+            if not callable(authorize):
+                _gateway_user_dispatch.set(None)
+                return
+            try:
+                if not bool(authorize(getattr(event, "source", None))):
+                    _gateway_user_dispatch.set(None)
+                    return
+            except Exception:
+                _gateway_user_dispatch.set(None)
+                return
         marker = _GatewayDispatchMarker()
     _gateway_user_dispatch.set(marker)
 
@@ -223,7 +241,9 @@ def should_capture_memory(*, session_id: Any, user_message: Any, platform: Any) 
 
 def message_was_internal(*, session_id: Any, user_message: Any) -> bool:
     origin = recorded_origin(session_id, user_message)
-    return origin == "internal" or is_internal_harness_message(user_message)
+    if origin != "unknown":
+        return origin == "internal"
+    return is_internal_harness_message(user_message)
 
 
 def reset_origin_state() -> None:
