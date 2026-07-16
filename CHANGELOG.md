@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.3.2 — 2026-07-16
+
+- Removed an unused wiki importance renderer and the unreachable fallback for a store API that is
+  part of the installed provider contract.
+- Removed the stale duplicated Control Center integration guide; the companion app now owns its
+  operational documentation and this repository links to it directly.
+- Kept the database schema, configuration contract, Hermes hooks, extraction, retrieval, and live
+  memory behavior unchanged.
+
 ## 3.3.1 — 2026-07-15
 
 - Added deterministic human-turn provenance using Hermes' user-only `pre_gateway_dispatch` hook

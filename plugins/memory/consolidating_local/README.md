@@ -1,4 +1,4 @@
-# consolidating_local 3.3
+# consolidating_local 3.3.2
 
 This directory is the installable Hermes memory-provider bundle. Install it as `$HERMES_HOME/plugins/consolidating_local/`; the repository-level [`install.py`](../../../install.py) performs an atomic update.
 
@@ -33,11 +33,11 @@ Facts distinguish semantic state from time: `temporal_kind` identifies atemporal
 
 ## Tool
 
-The `consolidating_memory` tool supports:
+The `consolidating_memory` tool supports recall and explicit writes plus `explain`, `working`,
+`procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`,
+`maintain`, `backup`, and `export_json`.
 
-Alongside the original actions, v2 adds `explain`, `working`, `procedure`, `intention`, `timeline`, `approval`, `associate`, `merge`, `split`, `pin`, `doctor`, `maintain`, `backup`, and `export_json`.
-
-Version 3.3.1 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
+Version 3.3.2 accepts automatic turn capture only from Hermes' authoritative inbound gateway hook
 or a direct human CLI turn. Synthetic gateway work and background review harnesses are excluded
 from recall warming, episodes, traces, working memory, fact extraction, and session summaries.
 Hermes 0.18.2 discovers the provider and general hooks separately, so `install.py` also enables the

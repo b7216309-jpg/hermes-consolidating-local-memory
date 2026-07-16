@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.3.1](https://img.shields.io/badge/version-3.3.1-14b8a6)](CHANGELOG.md)
+[![Version 3.3.2](https://img.shields.io/badge/version-3.3.2-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -659,7 +659,7 @@ CI runs the test, lint, formatting, compilation, build, and encryption smoke sui
 ## More documentation
 
 - [Architecture, schema, privacy, and recovery deep dive](docs/PLUGIN_DEEP_DIVE.md)
-- [Hermes memory control and operational model](docs/HERMES_MEMORY_CONTROL.md)
+- [Hermes Control Center companion app](https://github.com/b7216309-jpg/hermes-memory-control)
 - [Plugin-bundle integration notes](plugins/memory/consolidating_local/README.md)
 - [Release history](CHANGELOG.md)
 

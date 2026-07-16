@@ -143,12 +143,6 @@ def _fact_temporal_label(row: Dict[str, Any]) -> str:
     return f"{kind}: {_fmt_ts_short(anchor) or 'unknown'}"
 
 
-def _imp_bar(importance: int) -> str:
-    """Render importance 1-10 as a compact visual bar."""
-    filled = min(max(int(importance), 0), 10)
-    return "█" * filled + "░" * (10 - filled)
-
-
 def _salience_tag(salience: float) -> str:
     """Render salience as a colored tag word."""
     if salience >= 0.90:
@@ -667,13 +661,9 @@ def export_compiled_wiki(
     contradictions = _redact_rows(store.recent_contradictions(limit=200), redact_sensitive)
     counts = store.counts()
 
-    # Gather all active facts grouped by category for the index page
+    # Gather all active facts grouped by category for the index page.
     facts_by_category: Dict[str, List[Dict[str, Any]]] = {}
-    try:
-        all_facts = _redact_rows(store.list_active_facts(limit=500), redact_sensitive)
-    except AttributeError:
-        # Fallback: query directly if list_active_facts doesn't exist
-        all_facts = []
+    all_facts = _redact_rows(store.list_active_facts(limit=500), redact_sensitive)
     for f in all_facts:
         cat = str(f.get("category") or "general")
         facts_by_category.setdefault(cat, []).append(f)
