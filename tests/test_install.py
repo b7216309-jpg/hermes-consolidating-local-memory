@@ -12,8 +12,7 @@ def test_fresh_install_enables_lifecycle_observer(tmp_path, monkeypatch):
     monkeypatch.setattr(
         subprocess,
         "run",
-        lambda args, **kwargs: calls.append((args, kwargs))
-        or subprocess.CompletedProcess(args, 0),
+        lambda args, **kwargs: calls.append((args, kwargs)) or subprocess.CompletedProcess(args, 0),
     )
     monkeypatch.setattr(
         sys,

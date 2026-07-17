@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.6.0 - 2026-07-17
+
+- Added an explicit assistant-origin turn class for Conscious Agency 1.2 heartbeat execution in
+  the real Hermes conversation.
+- Discarded the synthetic heartbeat trigger as user content while preserving the transformed final
+  assistant output as an episode, trace, and optional assistant-source extraction.
+- Kept assistant-initiated turns out of genuine-user prefetch and the `current-request` working
+  memory slot, preventing model speech from being reclassified as a user fact.
+- Removed disposable-heartbeat thread exclusions; ordinary sessions whose historical thread names
+  resemble the retired marker now use Memory normally.
+- Added regressions for same-session capture, assistant provenance, legacy-marker neutrality, and
+  the unchanged internal-turn fail-closed boundary.
+
 ## 3.5.0 - 2026-07-17
 
 - Made repeated installs preserve existing plugin enablement and grant settings instead of

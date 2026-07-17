@@ -4,6 +4,8 @@
 
 Hermes calls `sync_turn` after a completed turn. The provider adds a bounded task containing the user and assistant text plus the current structured message roles/tool names. Critical overflow is spooled to SQLite and replayed; optional prefetch work may be dropped under pressure. Companion-memory writes are always durably spooled before execution. If an extraction model and endpoint are configured, the completed turn is sent to that model after privacy admission; otherwise automatic extraction is disabled. With `llm_disable_thinking: true`, OpenAI-compatible chat requests carry `chat_template_kwargs.enable_thinking=false`. This mirrors Hermes compression while keeping the plugin's endpoint opt-in and independent.
 
+Conscious Agency 1.2 heartbeats are the one supported assistant-initiated turn class. They reuse the real conversation session, but their synthetic API trigger is removed before capture. Memory stores only the transformed assistant result, marks the trace `turn_origin: assistant`, and leaves genuine-user prefetch and `current-request` working memory untouched.
+
 Recall stays responsive: synchronous `prefetch` uses local FTS only. Hermes can call `queue_prefetch` after a turn to precompute an embedding-reranked result for the next turn. Cache entries expire and every mutation invalidates them. The recall header supplies localized current time and labels every recalled memory with its relevant absolute/relative time.
 
 Session IDs can rotate without process restart. `on_session_switch` changes the provider target immediately and records continuation lineage. Already queued writes retain their original explicit session ID.

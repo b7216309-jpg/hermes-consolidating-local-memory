@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
 [![Python 3.11–3.13](https://img.shields.io/badge/Python-3.11%E2%80%933.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Version 3.5.0](https://img.shields.io/badge/version-3.5.0-14b8a6)](CHANGELOG.md)
+[![Version 3.6.0](https://img.shields.io/badge/version-3.6.0-14b8a6)](CHANGELOG.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A local-first, durable memory provider for [Hermes Agent](https://github.com/NousResearch/hermes-agent). It gives Hermes isolated long-term memory, evidence-backed facts, working memory, procedures, intentions, autobiographical timelines, contradiction handling, spaced review, and auditable recovery—all in SQLite.
@@ -18,11 +18,11 @@ diagnostic, and export actions remain available through operator surfaces and co
 handlers. Disabling built-in snapshots now removes only plugin-owned marked blocks and preserves
 manual `USER.md` and `MEMORY.md` text.
 
-Version 3.5 hardens cross-process work recovery and the Memory–Agency boundary. Durable operations
-use renewable owner-bound leases; stale workers cannot finalize another worker's claim; transient
-claim failures do not kill the only worker. Conscious Agency 1.1 heartbeat runs use exact synthetic
-thread markers: Memory can still be read explicitly, but no Memory session, maintenance worker,
-prefetch, compression extraction, mirror, episode, or fact is created for the disposable turn.
+Version 3.5 hardens cross-process work recovery with renewable owner-bound leases. Version 3.6
+updates the Memory–Agency boundary for Conscious Agency 1.2: an assistant-initiated heartbeat uses
+the real conversation's Memory session, drops its synthetic API trigger, and stores the transformed
+assistant result with explicit assistant provenance. It never reclassifies that trigger as a user
+statement or replaces the user's current-request working memory.
 
 ![Hermes Consolidating Local Memory v3 architecture](docs/assets/architecture-v3.png)
 
@@ -41,7 +41,7 @@ prefetch, compression extraction, mirror, episode, or fact is created for the di
 
 | Component | Supported/tested |
 | --- | --- |
-| Hermes Agent | Tested with `0.18.2` and upstream commit `10b6d1a910411f293c9c2422da3b6df6ec66becc` |
+| Hermes Agent | Tested with `0.18.2` at qualified commit `e95d00f9107de79eb65b65d2c5bf6852a399c704` |
 | Python | `3.11`, `3.12`, and `3.13` |
 | Operating systems | Linux and Windows in CI |
 | Storage | SQLite with FTS5; optional SQLCipher |
@@ -49,7 +49,7 @@ prefetch, compression extraction, mirror, episode, or fact is created for the di
 
 The Hermes compatibility simulation covers plugin discovery, provider routing, all tool actions, a
 real HTTP model endpoint, transient endpoint failure and durable replay, scope isolation, built-in
-memory mirroring, redaction, abrupt and graceful restarts, native-heartbeat isolation, the native
+memory mirroring, redaction, abrupt and graceful restarts, assistant-heartbeat provenance, the native
 CLI, FTS content integrity, and reference integrity.
 
 ## Install
@@ -136,15 +136,16 @@ If `hermes` is already on the WSL `PATH`, the shorter `hermes ...` form is equiv
 There are two independent write paths:
 
 1. **Explicit memory writes:** a user or the primary Hermes agent calls the memory tool. The privacy gate checks the value, then writes the requested fact, preference, policy, procedure, intention, journal entry, or relationship exactly. No model is required.
-2. **Completed turns:** Hermes sends the completed conversation turn to the provider. It stores a bounded, redacted episode and trace. When both `llm_model` and `llm_base_url` are configured, the approved text is also sent to that endpoint for structured fact extraction.
+2. **Completed turns:** Hermes sends the completed conversation turn to the provider. It stores a bounded, redacted episode and trace. When both `llm_model` and `llm_base_url` are configured, the approved text is also sent to that endpoint for structured fact extraction. Conscious Agency heartbeat turns enter this path as assistant-originated turns: the hidden trigger is discarded, while the final assistant text may become assistant-supported memory evidence.
 
 System, developer, and tool messages are excluded from conversational fact extraction. The plugin
 also uses Hermes' `pre_gateway_dispatch` boundary to distinguish a genuine inbound gateway message
 from background-process notifications, delegation completions, recalled-message handoffs,
 background memory reviews, compression, kanban wakes, and other synthetic turns. Internal turns do
 not prefetch, create episodes or traces, update working memory, extract facts, or enter session
-summaries. Direct human CLI turns remain supported. Unknown gateway turns fail closed instead of
-being assumed human.
+summaries. The one explicit assistant-origin heartbeat class may create an episode, trace, and
+assistant-source extraction, but never a user fact or current request. Direct human CLI turns
+remain supported. Unknown gateway turns fail closed instead of being assumed human.
 
 This boundary is deterministic transport provenance, not a replacement text extractor. A small
 bounded in-process ledger carries the origin across Hermes' asynchronous memory worker; no message
@@ -594,6 +595,10 @@ Version 3 removes `consolidator.py` and every rule-based extraction path. The ob
 Version 3.3 adds the recorded `structured_temporal_context` migration. Existing facts are classified conservatively from durable metadata without inventing event dates: exclusive state facts become `current`, dated validity becomes `temporary`, autobiographical facts become `event`, and other facts remain `atemporal`. Reinstalling is sufficient; startup adds the columns and index atomically. Run `doctor` after the first start.
 
 Version 3.2 added the optional `llm_disable_thinking` extraction setting without changing the database schema. Reinstall the plugin bundle, then enable the option only if the configured OpenAI-compatible endpoint supports Qwen chat-template arguments. Version 3.1 added the onboarding module and scope-aware native CLI; running onboarding against an existing profile remains safe because unchanged entries do not create duplicate evidence/history.
+
+Version 3.6 has no database migration. Reinstalling updates only turn-origin routing: existing
+Memory data remains untouched, and new Agency 1.2 heartbeat output joins the real session with
+assistant provenance.
 
 ## Data locations
 

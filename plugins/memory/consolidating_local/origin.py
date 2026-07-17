@@ -37,6 +37,7 @@ _INTERNAL_MESSAGE_PREFIXES = (
     "[Session was just handed off from CLI",
     "[CRITICAL — MESSAGE RECALLED]",
 )
+_ASSISTANT_INITIATED_PREFIXES = ("[Hermes assistant-initiated heartbeat; no user message was sent.]",)
 _INTERNAL_ORIGINS = {
     "background",
     "background_review",
@@ -49,6 +50,7 @@ _INTERNAL_ORIGINS = {
     "system",
 }
 _USER_ORIGINS = {"human", "inbound", "user", "user_message"}
+_ASSISTANT_ORIGINS = {"assistant", "assistant_initiated", "heartbeat"}
 _MAX_RECORDS = 2048
 _RECORD_TTL_SECONDS = 6 * 3600
 
@@ -132,6 +134,11 @@ def is_internal_harness_message(message: Any) -> bool:
     return any(text.startswith(prefix) for prefix in _INTERNAL_MESSAGE_PREFIXES)
 
 
+def is_assistant_initiated_message(message: Any) -> bool:
+    text = str(message or "").lstrip()
+    return any(text.startswith(prefix) for prefix in _ASSISTANT_INITIATED_PREFIXES)
+
+
 def _explicit_origin(kwargs: dict[str, Any]) -> str:
     if kwargs.get("internal") is True or kwargs.get("is_internal") is True:
         return "internal"
@@ -148,6 +155,8 @@ def _explicit_origin(kwargs: dict[str, Any]) -> str:
         value = _clean_text(kwargs.get(key)).casefold()
         if value in _USER_ORIGINS:
             return "user"
+        if value in _ASSISTANT_ORIGINS:
+            return "assistant"
         if value in _INTERNAL_ORIGINS:
             return "internal"
     return ""
@@ -168,6 +177,8 @@ def classify_turn(*, session_id: Any, user_message: Any, platform: Any, kwargs: 
         marker = _gateway_user_dispatch.get()
         if marker and marker.consume():
             return "user"
+        if is_assistant_initiated_message(user_message):
+            return "assistant"
         return "internal"
     if is_internal_harness_message(user_message):
         return "internal"
@@ -239,11 +250,17 @@ def should_capture_memory(*, session_id: Any, user_message: Any, platform: Any) 
     return not is_internal_harness_message(user_message)
 
 
+def should_capture_assistant_memory(*, session_id: Any, user_message: Any) -> bool:
+    """Return whether a synthetic API trigger represents an assistant-authored turn."""
+
+    return recorded_origin(session_id, user_message) == "assistant"
+
+
 def message_was_internal(*, session_id: Any, user_message: Any) -> bool:
     origin = recorded_origin(session_id, user_message)
     if origin != "unknown":
-        return origin == "internal"
-    return is_internal_harness_message(user_message)
+        return origin != "user"
+    return is_internal_harness_message(user_message) or is_assistant_initiated_message(user_message)
 
 
 def reset_origin_state() -> None:

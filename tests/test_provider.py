@@ -114,6 +114,19 @@ def test_origin_state_is_shared_across_hermes_module_namespaces():
 
 def test_gateway_marker_is_single_use_across_copied_contexts():
     reset_origin_state()
+
+
+def test_cli_user_cannot_be_reclassified_by_typing_heartbeat_marker():
+    reset_origin_state()
+    prompt = "[Hermes assistant-initiated heartbeat; no user message was sent.]"
+    assert (
+        classify_turn(
+            session_id="cli-session",
+            user_message=prompt,
+            platform="cli",
+        )
+        == "user"
+    )
     mark_gateway_user_dispatch(SimpleNamespace(internal=False))
     copied = copy_context()
     assert (
@@ -407,9 +420,7 @@ def test_invalid_primary_message_timestamp_falls_back_to_valid_created_at(tmp_pa
 
 def test_mid_turn_gateway_compression_uses_recorded_user_origin(tmp_path, monkeypatch):
     reset_origin_state()
-    provider = ConsolidatingLocalMemoryProvider(
-        {"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"}
-    )
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "memory_scope": "global"})
     provider.initialize(
         "telegram-session",
         hermes_home=str(tmp_path),
@@ -501,16 +512,76 @@ def test_empty_or_internal_only_session_end_still_closes_session(tmp_path):
         provider.shutdown()
 
 
-def test_disposable_agency_heartbeat_does_not_create_memory_session(tmp_path):
+def test_assistant_initiated_heartbeat_uses_main_memory_session(tmp_path):
+    reset_origin_state()
     provider = ConsolidatingLocalMemoryProvider(
         {
             "db_path": str(tmp_path / "memory.db"),
             "llm_model": "",
             "embedding_model": "",
+            "memory_scope": "global",
         }
     )
     provider.initialize(
-        "heartbeat-work-session",
+        "telegram-main",
+        hermes_home=str(tmp_path),
+        platform="telegram",
+        agent_context="primary",
+        user_id="operator",
+    )
+    prompt = "[Hermes assistant-initiated heartbeat; no user message was sent.]"
+    try:
+        note_llm_turn(
+            session_id="telegram-main",
+            user_message=prompt,
+            platform="telegram",
+        )
+        provider.sync_turn(
+            prompt,
+            "An assistant-originated observation",
+            session_id="telegram-main",
+        )
+        provider.queue_prefetch(prompt, session_id="telegram-main")
+        provider._task_queue.join()
+
+        assert provider._session_tracking_enabled is True
+        assert provider._store.counts()["episodes"] == 1
+        episode = provider._store._fetchone(
+            "SELECT user_content, assistant_content FROM episodes ORDER BY id DESC LIMIT 1"
+        )
+        assert episode["user_content"] == ""
+        assert episode["assistant_content"] == "An assistant-originated observation"
+        assert provider.prefetch(prompt, session_id="telegram-main") == ""
+        assert message_was_internal(session_id="telegram-main", user_message=prompt)
+    finally:
+        provider.shutdown()
+
+
+def test_silent_assistant_heartbeat_creates_no_memory_episode(tmp_path):
+    provider = _provider(tmp_path)
+    prompt = "[Hermes assistant-initiated heartbeat; no user message was sent.]"
+    note_llm_turn(
+        session_id="telegram-main",
+        user_message=prompt,
+        platform="telegram",
+    )
+    try:
+        provider.sync_turn(
+            prompt,
+            "[SILENT]",
+            session_id="telegram-main",
+        )
+        provider._task_queue.join()
+        assert provider._store._fetchone("SELECT COUNT(*) AS total FROM episodes")["total"] == 0
+    finally:
+        provider.shutdown()
+        reset_origin_state()
+
+
+def test_legacy_heartbeat_thread_marker_no_longer_disables_memory(tmp_path):
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "llm_model": ""})
+    provider.initialize(
+        "normal-session",
         hermes_home=str(tmp_path),
         platform="telegram",
         agent_context="primary",
@@ -518,65 +589,16 @@ def test_disposable_agency_heartbeat_does_not_create_memory_session(tmp_path):
         thread_id="agency-heartbeat-" + "a" * 32,
     )
     try:
-        assert provider._session_tracking_enabled is False
-        assert provider._worker is None
-        assert provider._accepting_tasks is False
-        assert provider._store._fetchone(
-            "SELECT session_id FROM memory_sessions WHERE session_id=?",
-            ("heartbeat-work-session",),
-        ) is None
-        assert provider._store.get_state("memory_scope", "") == ""
-
-        provider.on_turn_start(1, "internal heartbeat")
-        provider.on_session_end([])
-        provider.sync_turn(
-            "This ordinary-looking synthetic sentence must not be captured",
-            "Nor should this generated answer",
-        )
-        provider.on_memory_write(
-            "add",
-            "memory",
-            "Synthetic heartbeat mirror must not be captured",
-        )
-        assert (
-            provider.on_pre_compress(
-                [
-                    {
-                        "role": "user",
-                        "content": "Synthetic heartbeat compression must not be captured",
-                    }
-                ]
-            )
-            == ""
-        )
-        provider._task_queue.join()
-        assert provider._store.counts()["sessions"] == 0
-        assert provider._store.counts()["facts"] == 0
-        assert provider._store.counts()["episodes"] == 0
-    finally:
-        provider.shutdown()
-
-
-def test_heartbeat_thread_lookalike_keeps_normal_session_tracking(tmp_path):
-    provider = ConsolidatingLocalMemoryProvider(
-        {"db_path": str(tmp_path / "memory.db"), "llm_model": ""}
-    )
-    provider.initialize(
-        "normal-session",
-        hermes_home=str(tmp_path),
-        platform="telegram",
-        agent_context="primary",
-        user_id="operator",
-        thread_id="agency-heartbeat-not-a-run-id",
-    )
-    try:
         provider._task_queue.join()
         assert provider._session_tracking_enabled is True
         assert provider._worker is not None and provider._worker.is_alive()
-        assert provider._store._fetchone(
-            "SELECT session_id FROM memory_sessions WHERE session_id=?",
-            ("normal-session",),
-        ) is not None
+        assert (
+            provider._store._fetchone(
+                "SELECT session_id FROM memory_sessions WHERE session_id=?",
+                ("normal-session",),
+            )
+            is not None
+        )
     finally:
         provider.shutdown()
 

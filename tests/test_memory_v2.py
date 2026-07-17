@@ -909,9 +909,7 @@ def test_idle_worker_wakes_durable_operations_without_a_new_turn(tmp_path):
 
 
 def test_idle_durable_claim_failure_does_not_kill_worker(tmp_path, monkeypatch):
-    provider = ConsolidatingLocalMemoryProvider(
-        {"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8}
-    )
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8})
     try:
         provider.initialize("idle-retry", hermes_home=str(tmp_path), platform="cli", agent_context="primary")
         provider._task_queue.join()
@@ -949,9 +947,7 @@ def test_idle_durable_claim_failure_does_not_kill_worker(tmp_path, monkeypatch):
 
 
 def test_lost_lease_during_completion_does_not_escape_durable_drain(tmp_path, monkeypatch):
-    provider = ConsolidatingLocalMemoryProvider(
-        {"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8}
-    )
+    provider = ConsolidatingLocalMemoryProvider({"db_path": str(tmp_path / "memory.db"), "queue_max_size": 8})
     provider._store = MemoryStore(tmp_path / "memory.db")
     try:
         operation_id = provider._store.enqueue_operation(

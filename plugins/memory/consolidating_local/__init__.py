@@ -39,6 +39,7 @@ from .origin import (
     mark_gateway_user_dispatch,
     message_was_internal,
     note_llm_turn,
+    should_capture_assistant_memory,
     should_capture_memory,
 )
 from .store import (
@@ -56,10 +57,9 @@ from .store import (
 from .wiki_export import export_compiled_wiki
 
 logger = logging.getLogger(__name__)
-__version__ = "3.5.0"
+__version__ = "3.6.0"
 RECALL_CONTEXT_CHAR_LIMIT = 4500
 RECALL_LINE_CHAR_LIMIT = 500
-_AGENCY_HEARTBEAT_THREAD_RE = re.compile(r"^agency-heartbeat-[0-9a-f]{32}$")
 
 
 def _flag(value: Any, default: bool = False) -> bool:
@@ -215,13 +215,6 @@ def _load_plugin_config() -> dict:
 
 
 class ConsolidatingLocalMemoryProvider(MemoryProvider):
-    @staticmethod
-    def tracks_session_thread(thread_id: str) -> bool:
-        """Return whether a Hermes thread represents a durable user memory session."""
-
-        normalized = normalize_whitespace(str(thread_id or ""))
-        return not bool(_AGENCY_HEARTBEAT_THREAD_RE.fullmatch(normalized))
-
     def __init__(self, config: dict | None = None):
         self._config = dict(config) if config is not None else _load_plugin_config()
         self._store: MemoryStore | None = None
@@ -685,8 +678,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         platform = str(kwargs.get("platform") or "cli").strip().lower()
         self._platform = platform
         self._write_enabled = agent_context == "primary" and platform != "cron"
-        thread_id = normalize_whitespace(str(kwargs.get("thread_id") or ""))
-        self._session_tracking_enabled = self.tracks_session_thread(thread_id)
+        self._session_tracking_enabled = True
         db_path = str(self._config.get("db_path", "$HERMES_HOME/consolidating_memory.db"))
         db_path = db_path.replace("$HERMES_HOME", str(hermes_home))
         base_db_path = Path(db_path).expanduser()
@@ -884,7 +876,17 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         if not self._write_enabled or not self._session_tracking_enabled:
             return
         key = session_id or self._session_id
-        if not should_capture_memory(
+        assistant_initiated = should_capture_assistant_memory(
+            session_id=key,
+            user_message=user_content,
+        )
+        if assistant_initiated and normalize_whitespace(assistant_content).casefold() in {
+            "",
+            "[silent]",
+            "heartbeat_ok",
+        }:
+            return
+        if not assistant_initiated and not should_capture_memory(
             session_id=key,
             user_message=user_content,
             platform=self._platform,
@@ -893,10 +895,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
         self._enqueue(
             "sync_turn",
             session_id=key,
-            user_content=user_content or "",
+            # The API needs a synthetic user-role trigger, but it is not a
+            # human statement and must never become personal memory.
+            user_content="" if assistant_initiated else user_content or "",
             assistant_content=assistant_content or "",
             messages=list(messages or []),
-            turn_origin="user",
+            turn_origin="assistant" if assistant_initiated else "user",
         )
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
@@ -951,8 +955,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
             (
                 message_content_text(message.get("content", ""))
                 for message in latest_turn
-                if str(message.get("role") or message.get("type") or "").strip().casefold()
-                in {"user", "human"}
+                if str(message.get("role") or message.get("type") or "").strip().casefold() in {"user", "human"}
             ),
             "",
         )
@@ -4270,9 +4273,7 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                         drained = self._drain_durable_operations(limit=1000)
                     except Exception:
                         self._queue_metrics["failed"] += 1
-                        logger.exception(
-                            "Final durable memory drain failed; rows remain recoverable"
-                        )
+                        logger.exception("Final durable memory drain failed; rows remain recoverable")
                         break
                     if drained == 0:
                         break
@@ -4350,7 +4351,8 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 self._prefetch_cache.pop(oldest, None)
 
     def _handle_sync_turn(self, payload: Dict[str, Any]) -> None:
-        if not self._store or payload.get("turn_origin") != "user":
+        turn_origin = str(payload.get("turn_origin") or "")
+        if not self._store or turn_origin not in {"user", "assistant"}:
             return
         self._invalidate_prefetch_cache()
         session_id = str(payload.get("session_id") or self._session_id)
@@ -4434,7 +4436,12 @@ class ConsolidatingLocalMemoryProvider(MemoryProvider):
                 trace_type="turn",
                 salience=0.48,
                 source_episode_id=int(episode.get("id") or 0),
-                metadata={"message_roles": roles, "tool_names": tool_names[:12], "facts_extracted": extracted},
+                metadata={
+                    "message_roles": roles,
+                    "tool_names": tool_names[:12],
+                    "facts_extracted": extracted,
+                    "turn_origin": turn_origin,
+                },
                 sensitivity=raw_sensitivity,
             )
 
