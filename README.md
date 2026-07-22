@@ -1,3 +1,5 @@
+# ⚠️ NOT WORKING, UNDER MAINTENANCE ⚠️
+
 # Hermes Consolidating Local Memory
 
 [![CI](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/b7216309-jpg/hermes-consolidating-local-memory/actions/workflows/ci.yml)
